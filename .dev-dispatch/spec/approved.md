@@ -1,128 +1,116 @@
-# E0 —— 真机端到端回归基线（deep-research V3）
+# E0b —— 回归基线收口（接 E0a 被驳回的两处 blocker）
 
-**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（本 spec 的全部改动只在该仓）
-**上位文档**：work folder `wf-f54be7` 的 `spec.md` §13.5、`constitution-draft.md`（十三条）
-**开发包顺序**：E0 是 V3 第一个包，其后每个包合入都要重跑 E0 作 regression
+**目标仓**：`Dandi007/loop-engine-deep-research-plugin`
+**前序**：E0 已合入 main（`95a4ea8`）。E0a（PR #59）在 human gate 被**驳回**——
+单测全绿但产物在真机上**根本跑不起来**。本包重做 E0a 的目标，并把两处根因写死在判据里。
 
 ---
 
-## 0　这个包要解决什么
+## 0　E0a 被驳回的两处 blocker（真机取证，逐字可复现）
 
-现状：本仓的研究链路（`bin/deep-research-loop.sh` → `loop-engine drain` → tick → worker/triage/generate → 导出）
-**只能打生产 agent-bus（127.0.0.1:7490）**，因为 `src/bus.ts:13` 把凭证路径写死成
-`/data/agent-bus/tokens/uther-tui.token`。后果有两条，都必须在本包解决：
+### blocker 1：读了一个真实 API 不存在的字段 ⇒ 入口永远跑不到 loop
 
-1. **任何一次跑通验证都会往生产总线写数据**——总线 append-only 无 DELETE，写错不可回退。
-   宪法第五条要求测试数据只碰测试环境。
-2. **没有一条可重复的命令能把链路从头跑到终态**，于是"改完有没有跑坏"这件事没有基线。
-   宪法第十三条要求交付必须过真机端到端，且验收要能指认具体某次运行的记录。
+E0a 的 `_head_seq()` 从 `GET /v1/channels/<id>` 的响应里取 `head_seq`。
+**真实 agent-bus 的单 channel 响应里没有这个字段。** 派发方 2026-08-12 实测两个端点的字段集：
 
-本包交付的是**基线本身**：一条命令、打测试总线、跑完现状链路到终态、留下可指认的运行记录。
-**本包不新增任何研究能力**（web 信源、ingest、原子产物等一律不碰，那是 E1–E4）。
+```
+GET /v1/channels/<id>   →  channel_id, closed_at, created_at, default_lease_ms,
+                            delivery_mode, max_attempts, metadata, owner_agent_id,
+                            refs_required, visibility            ← 无 head_seq
+GET /v1/channels        →  channel_id, closed_at, created_at, delivery_mode,
+                            head_seq, owner_agent_id, visibility ← head_seq 只在这里
+```
 
-## 1　运行环境（已由派发方在真机上就位，实现者不需要创建）
+真机运行的实际结果（E0a 候选，`bash bin/e0-regression.sh`）：
 
-| 对象 | 值 | 说明 |
-|---|---|---|
-| 测试总线 HTTP | `http://127.0.0.1:7495` | systemd user unit `agent-bus-test.service`，独立 SQLite（`/data/agent-bus-test`）、独立 token，与生产 7490 零共享 |
-| 测试总线 token 目录 | `/data/agent-bus-test/tokens/` | 本包的 profile 从这里取凭证文件路径；⛔ token 内容不得进仓、不得进任何产物 |
-| 生产总线 HTTP | `http://127.0.0.1:7490` | ⛔ 本包交付物在任何路径下都不得写它 |
-| loop-engine CLI | `/data/code/self/loop-engine/dist/cli.js` | 现状链路已依赖，不改 |
+```
+[e0-regression] FAIL: could not read head_seq for channel 'research:e0-regression.index'
+                on test bus (body={"channel_id": …, "delivery_mode": "fanout", …})
+[e0-regression] FAIL: could not read research board head_seq before run
+entry exit=3
+```
 
-## 2　交付内容（四项，全部在目标仓内）
+⇒ 入口在跑 loop **之前**就退出，Z1 在结构上不可达。
 
-### 2.1 `src/bus.ts`：凭证路径可配置
+**单测为什么是绿的**：`test/fixtures/e0a-fake-bus.mjs:44` 自己造了一个
+`GET /v1/channels/<id> → {head_seq: N}` 的端点。**fixture 描述的契约现实中不存在**，
+于是测试验证的是一个虚构的 bus。这正是宪法第十三条要防的形状：mock 全绿 ≠ 真机能跑。
 
-- 现状第 13 行 `const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";` 改为可被环境变量覆盖。
-- **变量名必须是 `AGENT_BUS_TOKEN_FILE`**——与 `agent-runtime` 的 `src/agent-bus.ts:56` 同名同义
-  （那边已是 `process.env.AGENT_BUS_TOKEN_FILE || DEFAULT_TOKEN_FILE`）。同一台机器上两个进程读同一个变量，
-  才可能让 tick 与它 spawn 出来的 `agent-run` 落在同一条总线上。
-- **未设置该变量时行为逐字不变**（仍读 `/data/agent-bus/tokens/uther-tui.token`）。
-- 读取失败（文件不存在/为空）时必须响亮失败并点名该变量与解析到的路径，
-  ⛔ 不得回退到默认路径、不得返回空 token 继续跑（宪法第四条：失败必须现形）。
+### blocker 2：`_prod_sum` 不是求和 ⇒ Z2 判据是空的
 
-### 2.2 `profiles/deploy/e0-regression.env`：回归基线的部署配置
+```bash
+sed -n 's/.*"head_seq"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}'
+```
 
-新增受版本管理的 profile，供 `--profile e0-regression` 加载。要求：
+bus 返回的是**单行 JSON**，`sed` 的贪婪 `.*` 使每行只捕获**最后一个** `head_seq`。
+实测：生产总线上该实现算出 **3**，真实 `sum(head_seq)` 是 **9788**。
 
-- 全部 channel 名带 `e0` 与 run 语义的前缀，且**与生产 profile（`agent-harness.env`）的 channel 名无交集**。
-- `EXPORT_ROOT` 指向仓外的运行时目录（不得写进 vault 的 `DeepThought/`，那是生产成果落点）。
-- `ALLOWED_ROOT` 指向一个体量小、必然存在的本地仓，使一轮 code-local 收割能在数分钟内结束。
-- `RESEARCH_QUESTION` / `RESEARCH_ORIGIN` / `DOC_CHANNEL` / `TICK_CHANNEL` / `EVIDENCE_CHANNEL` /
-  `ANCHOR_CHECK_BIN` 全部显式给出（现状这些无内置缺省，缺一个就是启动即失败或生成段静默不执行——
-  见仓内 `profiles/deploy/agent-harness.env` 的逐条注释）。
-- ⛔ profile 里不得出现任何 token 值，只出现 token **文件路径**。
+判别性证据（离线构造，不写生产总线）：两个 channel 的 head_seq 从 `10/20` 涨到 `9999/8888`
+（相当于写入 18857 条），**候选读数前后恒为 `5 == 5`** ⇒ 判过。
+即：**往生产总线写爆也照样通过 Z2**。
 
-### 2.3 `bin/e0-regression.sh`：唯一入口命令
+## 1　交付内容
 
-一条命令把现状链路在测试总线上从头跑到终态。要求：
+沿用 E0a 已经做对的整体结构（空板自播种、`bin/e0-verify.sh` 的实证判据分离、
+`board:agent-runs` 进预备清单、生产总线跑前跑后读数进运行记录），**只把上面两处做对**：
 
-1. **无参数即可运行**（可接受可选参数覆盖 run id 之类，但缺省必须能跑）。
-2. 自己导出 `AGENT_BUS_URL` 与 `AGENT_BUS_TOKEN_FILE` 指向测试实例，
-   并保证这两个变量**被 tick spawn 出来的子进程继承**（`src/tick-run.ts:1133` 是 `{...process.env, ...spec.env}`，
-   因此在入口 export 即可，不需要改 spawn 代码）。
-3. **生产总线护栏**：启动前检查最终生效的 `AGENT_BUS_URL`，若指向生产实例（端口 7490 或
-   `AGENT_BUS_TOKEN_FILE` 落在 `/data/agent-bus/` 下）⇒ **拒绝启动并非零退出**，
-   错误信息点名是哪一项触发。该检查必须在任何 bus 写入之前发生。
-4. **channel 预备**：profile 声明的 channel 若在测试总线上不存在则创建；已存在则原样使用。
-   创建与复核都走测试总线的 HTTP API。
-5. **运行记录归档**：单次运行结束后，把可指认的运行记录落到一个确定路径下的
-   `<run_id>/` 目录（run id 打印到 stdout），至少包含：入口命令的完整 stdout/stderr、
-   最终 exit code、本次使用的 profile 名与 channel 名、以及可据以回查的 loop-engine run 目录路径。
-   ⛔ 运行记录目录不得落在仓内（不得产生未跟踪文件污染工作区）。
-6. **终态可判**：脚本的退出码必须区分"跑到终态"与"没跑到终态"；
-   ⛔ 不得出现"链路没跑起来但退出 0"（现状 G11 就踩过：一轮 3 秒 drain、零 spawn、exit 0 且不报错）。
-7. **可重入**：同一命令重复执行不得因残留状态失败；重复执行产生的是新 run id 与新记录目录，
-   幂等键仍然生效、不产生重复的总线数据。
+### 1.1 head_seq 一律从**列表端点**取
 
-### 2.4 单元测试（`test/` 下，与既有 vitest 套件同风格）
+- 取某 channel 的 `head_seq`：读 `GET /v1/channels`，在列表里按 `channel_id` 找到那一项再取 `head_seq`。
+  ⛔ 不得依赖 `GET /v1/channels/<id>` 返回 `head_seq`。
+- 找不到该 channel、或该项没有 `head_seq` 字段 ⇒ **响亮失败并点名 channel 与实际拿到的字段集**，
+  ⛔ 不得当作 0 继续（把"读不到"和"确实是 0"混为一谈，会让 Z1 的增长判据失效）。
 
-至少覆盖以下四条，每条都要有**判别性**（把被测行为改坏后测试必须变红）：
+### 1.2 求和必须是真的求和
 
-- **T-A**：设了 `AGENT_BUS_TOKEN_FILE` ⇒ 读的是该路径；不设 ⇒ 读默认路径（两个方向都要断言）。
-- **T-B**：凭证文件不存在/为空 ⇒ 抛错且错误信息含变量名与解析到的路径；⛔ 不静默降级。
-- **T-C**：护栏——`AGENT_BUS_URL` 指向 7490（或 token 路径落在生产目录）⇒ 入口拒绝启动、非零退出、
-  且**没有发生任何 bus 写入**。
-- **T-D**：profile 文件被 `--profile e0-regression` 加载后，§2.2 列出的每个键都非空。
+- `sum(head_seq)` 必须对**所有** channel 求和。
+- ⛔ 不得用「贪婪正则 + 逐行」的方式从 JSON 里抽多值。用能真正解析 JSON 的方式
+  （仓内已依赖 Node，`node -e` 直接 `JSON.parse` 即可；⛔ 不新增第三方依赖）。
+- 同一条纪律适用于 §1.1 的按名取值与从 loop 输出里取 `termination.state`：
+  **凡是从 JSON 里取值，一律解析，不得用正则贪婪匹配**（`bin/e0-regression.sh` 里现有三处 `sed -n` 抽取都要按此改）。
 
-## 3　验收判据（逐条可机械判定）
+### 1.3 fixture 必须与真实契约一致
 
-1. `npm ci && npm run typecheck && npm test` 全绿（dd 的 acceptance 命令即此三条）。
-2. `src/bus.ts` 中不再存在写死的凭证路径字面量作为唯一取值路径；
-   `AGENT_BUS_TOKEN_FILE` 未设时的默认值与改动前逐字相同。
-3. `profiles/deploy/e0-regression.env` 存在，且其 channel 名与 `profiles/deploy/agent-harness.env` 的
-   channel 名集合交集为空。
-4. `bin/e0-regression.sh` 存在且可执行；无参数运行路径存在。
-5. T-A / T-B / T-C / T-D 四条测试存在且通过。
-6. **仓内不得出现任何 token 明文**（凭证只以文件路径形式出现）。
-7. **Z1（真机）**：在真机上执行 `bash bin/e0-regression.sh` 一次，链路跑到终态，退出码为 0，
-   运行记录目录按 §2.3.5 生成且内容齐备。
-8. **Z2（真机）**：该次运行前后，生产总线（7490）的 `head_seq` 零增长。
-   实现者需在运行记录里留下跑前/跑后两次读数以支撑该判据。
-9. **Z3（真机）**：同一条命令连续执行两次都能跑到终态，第二次产生独立的 run id 与记录目录。
+- 测试用的假 bus，其响应字段集必须与真实 agent-bus **对得上**：
+  单 channel GET **不返回** `head_seq`；列表 GET 返回 `head_seq`。
+- **新增一条判别性测试**：假 bus 的单 channel GET 若返回 `head_seq`，或列表 GET 若不返回 `head_seq`，
+  ⇒ 测试必须变红。换句话说，**把 fixture 改回 E0a 那个虚构契约，测试套件必须报错**。
+  这条是本包存在的理由之一——防止再用虚构 API 骗过验收。
 
-> 判据 7–9 由派发方在真机上执行验证（host verify），不要求 reviewer 自己跑。
-> 实现者需保证这三条**可被一条命令复现**。
+## 2　验收判据
 
-## 4　⛔ 明确不做
+1. `npm ci && npm run typecheck && npm test` 全绿。
+2. **⭐ 判别性（blocker 2）**：构造「生产总线跑前跑后有 channel 的 head_seq 增长」的情形
+   ⇒ 入口必须**非零退出**并点名污染。把求和换回 E0a 的贪婪 sed 实现 ⇒ 该测试必须变红。
+3. **⭐ 判别性（blocker 1）**：假 bus 的单 channel GET 返回 `head_seq` ⇒ 测试变红（§1.3）。
+4. **⭐ 判别性（沿用 E0a 目标）**：loop 退出 0 但零总线写入 / 板面无终态 ⇒ 入口非零退出。
+5. 空板自播种生效且幂等：重复执行不使板面线索翻倍。
+6. `board:agent-runs` 在 channel 预备清单内，且该名字在仓内只有一处真相源。
+7. 仓内不得出现任何 token 明文。
+8. **Z1（真机）**：`bash bin/e0-regression.sh` 跑到终态、退出 0，
+   且测试总线上 `TICK_CHANNEL` 的 head_seq 相对跑前**严格增长**。
+9. **Z2（真机）**：该次运行前后生产总线 `sum(head_seq)` 零增长，两个读数**都出现在运行记录里**
+   且**是真实的全量和**（派发方会用独立实现交叉核对这两个数字）。
+10. **Z3（真机）**：连续两次执行都到终态，各自独立 run id 与记录目录，板面线索不翻倍。
 
-| 不做 | 理由 |
-|---|---|
-| 新增 web / content 信源、`dr-worker-web` role | E2 的范围 |
-| 改 ingest 语义、digest 归属、MinerU 接线 | E1 的范围 |
-| 扩 anchor-check 的 scheme | E3 的范围 |
-| 收工仲裁者、改终止条件 | E5 的范围 |
-| 原子产物切分、引用过滤 | E4 的范围 |
-| 把 199 行的 `bin/deep-research-loop.sh` 重写进 TS 入口 | E7 的范围；本包只在其之上加一层薄入口 |
-| 注册任何新的 bus protocol / message kind | 现行 v2 松 schema 够用；协议注册是不可逆动作，需另行拍板 |
-| 改 `recipes/*` 的工具白名单、按 role 裁剪工具面 | 已拍板豁免（V-4，better-to-have backlog） |
-| 迁移或改动生产 profile `agent-harness.env` | 生产配置不在本包范围 |
+> 判据 8–10 由派发方在真机上执行验证。**派发方会用与实现无关的独立脚本复算 Z2 的两个读数**——
+> 数字对不上即判不过，所以不要试图用「读起来像那么回事」的近似实现。
 
-## 5　评审口径（reviewer 必读）
+## 3　⛔ 明确不做
 
-- **REJECT 只用于 blocker 级问题**：判据不成立、护栏失效、静默失败、凭证泄漏、越出 §2 范围的改动。
-  文风、命名偏好、"还可以更好"一类意见写成 non-blocking 建议，⛔ 不得据此 REJECT。
-  （历史教训：spec 不设严重度下限时，MERGED 在构造上不可达。）
-- reviewer 是只读角色，判据 1 与 5 由 acceptance 命令的实际执行结果作证，
-  ⛔ 不要求 reviewer 自行执行 shell 来取证。
+与 E0 spec §4 一致（web/content 信源、ingest、anchor scheme、仲裁者、原子产物、E7 入口重写、
+协议注册、工具白名单、生产 profile 一律不碰）。
+
+额外：⛔ 不得为了让判据过而放宽判据本身（例如把 Z2 改成"只比较某一个 channel"、
+把终态断言改成"没报错就算过"）。判据的严格性是本包的交付物。
+
+## 4　评审口径
+
+- **REJECT 只用于 blocker 级**：判据不成立、判别性缺失、用正则从 JSON 抽多值、
+  fixture 与真实契约不符、静默失败、凭证泄漏、越出 §1 范围。
+  文风与偏好写成 non-blocking 建议。
+- ⚠️ **对 reviewer 的特别提醒**：E0a 正是**带着两处这类缺陷通过了 continuous 与 final 两道 review**
+  才被人工闸门拦下的。审这个包时请特别核对：**每一处从 HTTP 响应里取字段的代码，
+  取的字段在真实 API 里到底存不存在**；以及**每一处从 JSON 抽值的方式在多值场景下是否成立**。
+- reviewer 只读，判据 1–7 由 acceptance 命令的执行结果作证，⛔ 不要求 reviewer 执行 shell。
 - ⛔ 实现者不得写 `.dd-evidence/**` 与 `.dev-dispatch/**`（引擎保留路径，写入即永久 wedge）。

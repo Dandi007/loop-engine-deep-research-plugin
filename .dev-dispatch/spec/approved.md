@@ -1,389 +1,189 @@
-# E0c2f —— 回归基线：终止语义域（第四次开）
+# E0c3b —— 解开 triage 死锁 + 消灭 acceptance 抖动
 
-> **前两版的下场**（都是**过了全部 review + acceptance、倒在派发方真机验证上**）：
-> - `dev_dr_e0c2_20260812_1254`：三轮 attempt 过闸，真机上跨 drain 循环一次没退避重来 ⇒ REJECT。根因见 **GT-6**。
-> - `dev_dr_e0c2b_20260812_1528`：一轮过闸，**GT-6 已做对**（`drain-attempts.jsonl` 第 1 轮
->   `{"exit":1,"reason":"max_rounds"}` 被正确判成「还没收敛」而非失败），但**倒在 §1.1 的终态读**上 ⇒ REJECT。
->   根因是**本 spec 上一版的 GT-2 不完整**（派发方的责任，已在下面 GT-2 里逐字补全）。
->
-> - `dev_dr_e0c2e_20260812_1912`：三轮 attempt，final review 最终 **APPROVE**，
->   但 **acceptance 的 `npm test` 挂了一条**（`test/a10b-convergence.test.ts` B2 超时）⇒ development FAILED。
->   根因见 **GT-10**（本包引入的语义变化让既有测试变慢，候选没相应放宽超时）。
->
-> ⇒ 下面每一条 GT 都是真机换来的。**全部实测、逐字照抄，不得推测、不得由 fixture 反推。**
-> ⛔ 最要命的两条是 **GT-2**（把 e0c2b 毙掉）与 **GT-6**（把 e0c2 毙掉）——单测永远看不见它们。
+> **前一版 `dev_dr_e0c3_20260812_2255` 的下场**：两轮 attempt 过审，`bin/e0-regression.sh` 的三项改动
+> **实现都是对的**，但 **acceptance 的 `npm test` 挂了一条** ⇒ development FAILED。
+> 派发方在**同一 commit** 上复跑：单测隔离跑 ✅、**全量 `npm test` 也全绿（37 files / 611 tests / 46s）**
+> ⇒ 那是**抖动**，不是缺陷。根因见 **GT-12**，本版把它一并修掉。
 
-**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（base = 含 E0c1 的 `main`，即 0445896 之后）
-**为什么是小包**：前一版把板面域与终止语义域一起做（14 文件 / 1120 insertions），
-final review **连续两次跑满 3000 秒硬超时**（`exit 93 / reason=timeout`）、零 verdict。
-本线顺利过审的包是 4 文件 523 行与 11 文件 391 行。
-⇒ 本包**只做终止语义域**。**⛔ 请保持改动面小**，顺手改动会把包撑大到审不完。
+**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（base = 含 E0c2f 的 `main`）
+**为什么存在**：E0c2f 已交付终止语义域并**已合并**——跨 drain 循环、退避、上限、GT-6 退出码分类、
+终态取真值、续投门对齐、失败轮回显、进度行，真机全部验过。**唯独判据 Z1（跑到非 null 终态）没达成**，
+原因不在 E0c2f 的实现，而在 `src/tick.ts` 的 triage 门限——本包只修这一件事。
 
-**前序**：E0c1 已交付板面与凭证域（head_seq 只从列表端点取、生产总线真实全量求和、
-per-run 独立研究板、种子带 `--source code-local`、生产护栏、运行记录归档）。
-⛔ **这些行为本包逐字不改**。
+**⛔ 请保持改动面小。** 本包**不碰**已交付的终止语义、入口循环、取证链路。
 
 ---
 
 ## 0　⛔ 地面真相（真机取证，照抄，不得推测、不得由 fixture 反推）
 
-本目标此前多轮被驳回，主因是**实现者为观察不到的产物发明契约、再写 fixture 满足它**。
-以下各条全部实测。
+### GT-12　⭐⭐ 假 bus 端口是「随机数不校验」，并发跑必然偶发撞车
 
-### GT-1　驱动 stdout 只有三行，⛔ 不含 termination
-
-`bin/deep-research-loop.sh` 的完整 stdout（真机实录）：
-
-```
-{"id":"a9-…","status":"open","body":{"seed":true}}
-[deep-research-loop] mode=deep-research run_root=/data/loop-engine/e0-runs/<run>/loop-run
-{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"…","drain_id":"…"}
-```
-
-第三行是 drain 摘要。⛔ `termination` **不在这里**。
-
-### GT-2　⭐⭐ journal 的 `result` 里是**两个首尾相接的 JSON 文档**，整串 `JSON.parse` 必抛
-
-`termination` 在 tick 自己的 stdout 里，由 loop-engine 收进 `<run_dir>/journal.jsonl`，
-每行形如 `{"run_id":"tick~1","identity":"tick","result":"<tick 的完整 stdout>","effects":[],…}`。
-⛔ `termination` **不是** journal 行的顶层键，必须先取 `result` 再解析。**但**——
-
-**真机实录**（派发方 2026-08-12 16:40，`/data/loop-engine/runs/2026-08-12T164008-83a18a5a/journal.jsonl`，
-唯一一行的 `result` 字段，逐字）：该字符串**共 36 行、1070 字符**，由**两个 JSON 文档拼接而成**：
-
-```
-第 1..35 行 = tick 输出（pretty-print，跨多行），char 0..958，含 termination：
-  {
-    "channelId": "research:e0-142fbba57906dec3.index",
-    "messageCount": 1,
-    "decisions": [ { "kind": "dispatch", "clueId": "msg_…", "role": "dr-worker-code-local", … } ],
-    …
-    "hasPendingWork": true,
-    "termination": { "state": null, "coverage": 0, "zeroGrowthRounds": 1, "capHit": false }
-  }
-第 36 行 = 续投 trigger 的 put 回显（单行），char 959..1069：
-  {"id":"a9-1786524011214625264-1934513","status":"open","body":{"tick":true,"coverage":0,"zeroGrowthRounds":1}}
-```
-
-⇒ 对整串做 `JSON.parse(result)` **必然抛** `Extra data: line 36 column 1 (char 960)`。
-⇒ **也不能按行 parse**：tick 输出是 pretty-print、跨 35 行，没有任何一行是完整 JSON。
-
-**正确取法**：取 `result` 里的**第一个完整 JSON 值**——用能返回结束位置的解析
-（Python `json.JSONDecoder().raw_decode`；Node 侧做**逐字符括号配对扫描**，
-需正确处理字符串字面量与 `\\` 转义，扫到深度归零即第一个文档结束），再从中取 `termination`。
-实测 `raw_decode` 在 char 959 结束、`termination` 取到
-`{"state": null, "coverage": 0, "zeroGrowthRounds": 1, "capHit": false}`。
-
-⛔ 不得用「找 `"termination"` 子串再手工截取」这类脆写法；⛔ 不得因为解析失败就回退成
-「用 drain 摘要的 reason 凑合」或把「读不到」当成任一方向的默认值（§1.1 原则不变）。
-
-> 取证路径整体不变（沿用仓内 `scripts/check-drain-failures.mjs` 同一条）：
-> `drain 摘要.drain_id → index.jsonl → run_dir → journal.jsonl → 最后一轮 tick 的 result
->  → **第一个 JSON 文档** → termination.state`。
-
-### GT-3　⭐ 单次 drain 不是「跑完一次研究」的单位
-
-真机实录（派发方 2026-08-12 06:20 在含 per-run 板与带 sources 种子的候选上跑）：
-
-```
-驱动 stdout 第三行：{"reason":"max_rounds","rounds":16,"ticksByLabel":{"tick":16}}
-drain.json：       墙钟 18.2 秒
-loop-events.jsonl：16 个 round_start，第 1→16 轮共 17.1 秒（约 1.1 秒/轮）
-板面：index head_seq=2（seed + CAS 到 in_flight）  evidence=0
-board:agent-runs：3 → 4（确实派出过 worker）
-```
-
-同一时刻那个 worker 的 run 记录：`dr-worker-code-local exit 0 duration_seconds=158.162`。
-
-⇒ **worker 要 158 秒，loop 把 16 轮全烧完只用 17 秒**——第一个 worker 还没返回，
-drain 就 `max_rounds` 退出了。
-
-**证明流水线本身没问题**：派发方在 worker 跑完后对同一块板**手工补跑一个 tick**：
-
-```
-decisions=[harvest]  writes=10
-harvestReports=[{evidencePublished: 7, cluesPublished: 2, casExplored: true}]
-```
-
-evidence 真发出来了、新 clue 也提出来了（BFS 扩展）。**缺的只是「等」。**
-（旁证：V2 生产那次跑出 64 条线索 / 55KB 报告，说明生产形态下驱动脚本本来就被**反复调用**。）
-
-### GT-4　续投门与终态判据差一拍
-
-- `src/tick.ts` 的 `decideTermination`：只有 `zeroGrowthRounds >= cfg.zeroGrowthThreshold`
-  （缺省 **2**）且 `inFlight === 0 && proposed === 0` 时，`state` 才非 null。
-- `workflows/deep-research/tick/templates/tick.md`：**续投门是 `hasPendingWork`**。
-
-板面排空的那一刻 `hasPendingWork` 立即为 false ⇒ 不再续投 ⇒ drain 退出，
-而此时 `zeroGrowthRounds` 往往才 1 ⇒ 攒不到 2。
-**佐证**：派发方遍历 `/data/loop-engine/runs/` 全部历史，从未出现过一次非 null 的 `termination.state`。
-
-> ⚠️ 注意 GT-3 与 GT-4 是**两个不同的**缺陷：GT-4 只在**最后排空那一刻**咬人；
-> GT-3 是全程性的（有真实研究时板面持续产出新工作，loop 会一直续投，
-> 但单次 drain 的 16 轮在十几秒内就烧完了）。两条都要修。
-
-### GT-5　⭐ loop-engine 的 bash 叶子实际用 **zsh** 执行 ⇒ `tick.md` 现有的 bash 数组语法必挂
-
-`loop-engine/src/lib/exec.ts:382-384` 逐字：
+`test/e0c2-termination.test.ts:259-262` 逐字：
 
 ```ts
-export function runScript(script: string, opts: ExecOpts): Promise<ExecResult> {
-  return run("zsh", ["-c", script], opts);
+const busPort = 18000 + Math.floor(Math.random() * 1000);
+const prodBusPort = 19000 + Math.floor(Math.random() * 1000);
+```
+
+**纯随机、不检测占用、不重试**。仓内有二十余处这样起假 bus 的用例，vitest 跨文件并行 ⇒
+生日悖论下撞车是常态；撞上之后 `startFakeBus` 不响亮失败，被测入口连到**别的用例的 bus**、
+读到别人的板面 ⇒ 断言莫名其妙地红。
+
+真机实录（派发方 2026-08-12 23:32 acceptance 现场 vs 23:48 同 commit 复跑）：
+
+```
+acceptance（dd 沙箱内）：
+  FAIL test/e0c2-termination.test.ts > 判据 6d (GT-8) … > progress line contains numeric head_seq (not '?')
+  AssertionError: expected 1 to be +0        （入口退出码 1，期望 0）
+  Test Files 1 failed | 36 passed    Tests 1 failed | 610 passed
+派发方同 commit 复跑：
+  隔离跑该用例：           ✓ 3131ms
+  全量 npm test：          Test Files 37 passed (37)   Tests 611 passed (611)   46.45s
+```
+
+⇒ **一条抖动的测试会整包毙掉 development**（acceptance 不区分 flake 与真失败），
+这是这个仓每个后续包都要交的税。本包顺手把它修掉。
+
+### GT-11　⭐⭐ 板上只有 1–2 条 `proposed` ⇒ **永久死锁**，终态永远为 null
+
+仓内逐字（`src/tick.ts`）：
+
+```ts
+// :298-311  §5 派 triage：count(proposed) >= K 且 triage 无在途。
+if (proposedClues.length >= cfg.triageThreshold && !state.triageInFlight) {
+  decisions.push({ kind: "triage", proposedClues, exploredSummaries });
 }
+
+// :82-89
+export const DEFAULT_TICK_CONFIG: TickConfig = {
+  triageThreshold: 3,
+  maxConcurrentWorkers: 4,
+  maxDepth: 3,
+  maxRetries: 2,
+  maxClues: 64,
+  zeroGrowthThreshold: 2,
+};
 ```
 
-非沙箱 bash 叶子（tick 走的就是这条）**恒用 `zsh -c`**，与宿主 shell 无关。
-而 `workflows/deep-research/tick/templates/tick.md:79` 是 bash-only 语法：
+而 `decideTermination`（`:369-388`）要求 `inFlight === 0 && open === 0 && proposed === 0`。
 
-```bash
-IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-```
+⇒ **`proposed` 数量落在 1..2 时：triage 不触发（1 < 3）⇒ proposed 永远清不掉 ⇒ 终态永远 null。**
+不是"慢"，是**结构上不可达**。
 
-zsh 的 `read` 没有 `-a`（zsh 用 `-A`）⇒ 真机实录（派发方 2026-08-12 12:48 在 E0c1 候选上跑
-`bash bin/e0-regression.sh`，逐字）：
+**真机实录**（派发方 2026-08-12 22:06–22:34 在 E0c2f 候选上跑 `bash bin/e0-regression.sh`，逐字）：
 
 ```
-[deep-research-loop] TICK FAILURE: run_dir=/data/loop-engine/runs/2026-08-12T124847-4475528a exit=1
-[deep-research-loop]   journal: {"run_id":"tick~1","identity":"tick",
-  "result":"[bash 非零退出 EXIT:1]\nzsh:read:83: bad option: -a","effects":[]}
-drain 摘要：{"reason":"drained","rounds":2,"ticksByLabel":{"tick":2}}
+[e0-regression] drain #1:  reason=max_rounds termination.state=null head_seq=2
+[e0-regression] drain #2:  reason=max_rounds termination.state=null head_seq=2
+[e0-regression] drain #3:  reason=max_rounds termination.state=null head_seq=4   ← worker 返回、收割发生
+[e0-regression] drain #4..#12: reason=max_rounds termination.state=null head_seq=4  ← 此后毫无变化
+[e0-regression] HIT ATTEMPT LIMIT: max_attempts=12 drain_attempts=13
+run.meta: drain_attempts=13  final_termination_state=null
+          prod_bus_sum_before=10263  prod_bus_sum_after=10263  prod_bus_delta=0  entry_exit_code=4
 ```
 
-该分支只在 `prev_line` 非空（= 有 G4b 续投 body，即**第二轮起**）才走到，所以
-**第一轮永远正常、第二轮起必死**——续投链从来就没真正跑通过。
-这与 GT-4 叠加，正是"历史上从未出现过非 null `termination.state`"的直接原因之一。
-
-⇒ 本包 §1.2 既然要重写这段续投判定（改用真 JSON 解析），**必须同时让它在 zsh 下真能跑**。
-⛔ 不得只在单测里用 bash 跑通就算数：单测里的 shell 与真机的 `zsh -c` 不是同一个。
-判别性要求见 §2 判据 7。
-
-### GT-6　⭐⭐ `max_rounds` 的 drain 会以 **exit 1** 结束——它是「还没收敛」，不是「失败」
-
-`loop-engine/src/drain-cli.ts:39` 逐字：
-
-```ts
-process.exit(result.reason === "drained" ? 0 : 1);
-```
-
-`src/lib/resident.ts:36-37` 逐字：`reason: "drained" | "max_rounds"`，
-其中 `max_rounds` 的注释是「护栏触顶(pending 永不归零的 runaway 兜底,绝不静默死循环)」。
-`bin/deep-research-loop.sh:221-223` 原样透传这个退出码：
-
-```bash
-if [ "$DRAIN_EXIT_CODE" -ne 0 ]; then
-  exit "$DRAIN_EXIT_CODE"
-fi
-```
-
-⇒ **GT-3 描述的那种「worker 还没回来、16 轮已烧完」的 drain，退出码就是 1。**
-
-真机实录（派发方 2026-08-12 14:58 在前一版候选上跑 `bash bin/e0-regression.sh`，逐字）：
+同一块板的实况（测试总线 7495，`research:e0-a692fcbd9fe2632d.*`）：
 
 ```
-drain-1.stdout.log 第三行：
-  {"reason":"max_rounds","rounds":16,"ticksByLabel":{"tick":16},
-   "runs_root":"/data/loop-engine/runs/2026-08-12T145854-73793ada","drain_id":"…"}
-loop-events.jsonl：16 个 round_start / round_end，每个 round_end 都是 "errors":0
-drain.json：started 1786517934522 → ended 1786517952534   ⇒ 墙钟 18.0 秒
-drain-attempts.jsonl（全文，只有一行）：
-  {"attempt":1,"exit":1,"reason":"drain_failed","termination_state":null,"elapsed_seconds":0}
-入口：exit=1，elapsed=0s
+index    4 条： seq1 open(depth0) → seq2 in_flight → seq4 explored ；seq3 = 新 clue，status=proposed, depth=1
+evidence 3 条 research.evidence.v2      ← 证据确实被收割出来了
+docs     2 条
+board:agent-runs  24 → 27（worker 真跑过，agent.run.exited.v2 exit=0）
 ```
 
-前一版的 `bin/e0-regression.sh:439-446` 把**任何**非零 drain 退出码判成 `DRAIN_FAILED` 并 `break`，
-于是**跨 drain 循环在第 1 轮就退出，一次都没退避重来过**——本包唯一的交付物形同虚设，
-而全部单测仍然全绿（假 loop 的退出码是测试自己造的）。
+只读复核（`vite-node src/tick-entry.ts -- --inspect <index>`，逐字）：
 
-**本包必须区分三类**：
-
-| drain 结果 | 含义 | 入口该做什么 |
-|---|---|---|
-| 摘要 `reason=="drained"` 且终态仍 null | 排空了但没收敛 | **退避后重来**（不是失败） |
-| 摘要 `reason=="max_rounds"`（退出码 1） | 轮次护栏触顶、worker 还在跑 | **退避后重来**（⛔ 不是失败） |
-| 拿不到可解析的摘要，或其它非零退出码 | 真失败 | 响亮失败、非零退出、点名退出码与 stderr |
-
-⛔ 不得用「非零即失败」一刀切；⛔ 也不得反过来把一切非零都当成「还没收敛」而无限重试
-（那会把真失败吞掉）——判据见 §2。
-
-### GT-7　drain 摘要是**含嵌套对象**的单行 JSON，brace-free 正则永远抓不到
-
-真实摘要里有 `"ticksByLabel":{"tick":16}`。前一版 attempt 1 用
-`grep -oE '\{[^{}]*"drain_id"[^{}]*\}'` 抽摘要，在真机上恒抓空 ⇒ 每轮 reason 退化成 `parse_error`。
-⛔ 取摘要一律**逐行 `JSON.parse`**（stdout 每行一个 JSON 或非 JSON，取能解析且含 `drain_id` 的那行），
-⛔ 禁止任何形式的花括号正则。
-
-### GT-8　板面 `head_seq` 只能从**列表端点**取（E0c1 已交付的契约，⛔ 不得再犯）
-
-`GET /v1/channels/<id>`（单 channel）**不返回 `head_seq`**；只有 `GET /v1/channels`（列表）有。
-本仓 `src/bus.ts:102-110` 与 `src/bus.ts:202-210` 已经把这条写成代码与注释。
-前一版 attempt 2 的 blocker 正是 `_read_tick_head_seq` 又去单 channel 端点读 `head_seq`，
-而它的假 bus 对任意单 channel GET 一律返回 `{ok:true,head_seq:0}` 把这个错误盖住了。
-⛔ 本包一切 head_seq 读取复用 E0c1 已交付的列表端点实现，⛔ 假 bus 必须照 GT-8 实现
-（单 channel GET 的响应里**不许**出现 `head_seq`）。
-
-### GT-9　⭐ GT-5 的修法已被真机证明有效（本包沿用，⛔ 不得退回）
-
-前一版把 `tick.md` 的 bash 数组语法改掉后，真机跑出 **16 个 round_end 全是 `"errors":0`**——
-在此之前第二轮起必死。这是续投链第一次真正连续跑起来。
-⛔ 本包必须保住这个结果（判据 7 的 `zsh -c` 真跑用例照留）。
-
-### GT-10　⭐⭐ 续投门放宽会让既有的 a10b 端到端用例变慢，必须相应放宽它们的超时
-
-`test/a10b-convergence.test.ts` 的 B1/B2 用**真驱动**跑一次 drain。§1.2 放宽续投门之后，
-板面排空的那一刻不再停，要一直 tick 到终态或 max_rounds ⇒ 这两条必然变慢。
-
-派发方逐字实测（同一台机、同一条命令 `npx vitest run test/a10b-convergence.test.ts`）：
-
-```
-base（含 E0c1 的 main，1a1de8d）：
-  B1 empty terminal board … drains with reason=drained            1419ms
-  B2 drains and leaves research.evidence.v2 in the evidence channel 1399ms
-候选（e0c2e 分支，续投门已放宽）：
-  B1  2459ms
-  B2  4413ms          ← vitest 缺省 testTimeout 是 5000ms，只剩 12% 余量
-acceptance 真机现场（并发负载下）：
-  FAIL test/a10b-convergence.test.ts > B2 … Error: Test timed out in 5000ms.
-  Test Files 1 failed | 36 passed   Tests 1 failed | 606 passed
+```json
+{ "messageCount": 4, "clueEntities": 2,
+  "statusDistribution": { "explored": 1, "proposed": 1 },
+  "coverage": 0,
+  "decisions": [],
+  "termination": { "state": null, "coverage": 0, "zeroGrowthRounds": 1, "capHit": false } }
 ```
 
-⇒ **本包必须把 B1/B2（以及任何被本改动拖慢的既有端到端用例）的 timeout 放宽到与新语义相称**
-（建议 ≥30000ms），并在该处写一行注释说明"续投门放宽后要跑到终态，故耗时上升"。
+**`decisions: []` —— 板上有活儿，但这一轮什么决定都不做。** 这就是死锁的样子。
 
-⛔ 不得为了压回耗时而把续投门改回只看 `hasPendingWork`；
-⛔ 不得删除或 skip 这两条用例；
-⛔ 不得只把缺省 `testTimeout` 全局调大而不写明理由（全局调大会掩盖别处真正的卡死）。
+> 种子只有 1 条线索、一个 worker 大约提 1 条新线索 ⇒ 这条回归基线**结构上永远到不了终态**。
 
-## 1　交付内容（只此三项）
+## 1　交付内容（只此四项）
 
-### 1.1 终态取真值
-按 GT-2 的路径读 `termination.state`。
-读取链路任一步失败（拿不到 drain 摘要 / 无 `drain_id` / 找不到 run_dir / 无 journal /
-没有 `identity=="tick"` 的条目 / `result` 解析失败）⇒ **响亮失败并点名是哪一步**；
-⛔ 不得回退成「用 drain 摘要的 reason 凑合」，⛔ 不得把「读不到」当成任一方向的默认值。
+### 1.1 让回归基线结构上能收敛
 
-### 1.2 续投门对齐终态判据（GT-4）
-`tick.md` 的续投条件从 `hasPendingWork == true`
-改为 `hasPendingWork == true  或  (termination.state 仍为 null 且未触顶)`。
-- 触顶（`capHit`）时按既有语义走（`capped` 需等在途排空），⛔ 不得因本改动绕过熔断。
-- 拿到非 null 终态后**必须停止续投**，⛔ 不得无限空转。
-- 判定必须用**真 JSON 解析**读 `run_output`（现状是 `grep -q '"hasPendingWork": *true'` 正则，一并改掉）。
-- ⭐ **改完的这段必须在 `zsh -c` 下真能跑**（GT-5）：`tick.md` 由 loop-engine 用 `zsh -c` 执行，
-  现有的 `read -r -a` 从第二轮起必死。⛔ 不得引入任何 bash-only 语法
-  （`read -a`、`mapfile`/`readarray`、`declare -A`、`${arr[@]:1}` 之外的 bashism 等）；
-  能不用数组就不用（把解析放进已有的 Node/TS 侧更稳）。
+必须让"1–2 条 proposed"不再是死路。**实现方式二选一或都做**：
 
-### 1.3 入口反复 drain 直到终态（GT-3）
-`bin/e0-regression.sh` 从「调一次 `deep-research-loop.sh`」改为循环：
+- **(a)** `triageThreshold` 由 profile 声明（**缺省仍是 3，⛔ 不得改缺省**），回归 profile 显式设为 **1**；
+- **(b)** profile 声明 **≥3 条**种子线索（`bin/tick-entry.sh --seed` 支持重复 `--clue`），
+  使 proposed 能自然攒到阈值。
 
-```
-重复：
-  跑一次 deep-research-loop.sh（一次 drain），记下退出码与 stdout
-  按 GT-6 分类：
-    拿不到可解析摘要 / 非 max_rounds 的非零退出码 ⇒ 真失败，响亮收尾（非零退出、点名退出码与 stderr）
-    reason==drained 或 reason==max_rounds        ⇒ 继续往下判终态（⛔ max_rounds 的 exit 1 不算失败）
-  按 §1.1 读本次的 termination.state
-  非 null            ⇒ 成功收尾，退出循环
-  撞墙钟或次数上限    ⇒ 失败收尾（响亮，非零退出，点名撞的是哪个上限、实测值多少）
-  否则               ⇒ 退避后再来一轮
-```
+⛔ **不得改 `decideTermination` 的 `proposed === 0`**（那是把温度计砸了）。
+⛔ 不得把 proposed 直接判成终态、不得在 tick 里"自动丢弃"低于阈值的 proposed。
+若选 (a)：该配置项要与仓内既有 profile 键同一套读法，缺省行为对其它 profile **逐字不变**。
 
-- **退避**时长与**墙钟上限**、**drain 次数上限**三者都由 profile 声明，⛔ 不写死在脚本里。
-  退避量级要与 worker 真实耗时相称（实测 `dr-worker-code-local` ≈ 158 秒），⛔ 不得零间隔空转。
-  ⚠️ 上一版把退避设成 **30 秒**——比 worker 耗时小 5 倍，12 次上限合计不到 10 分钟，
-  **不足以跑完一次真实研究**（worker 返回 → harvest → BFS 出新线索 → 再派 worker）。
-  本版 profile 取值须满足：退避 ≥ 120 秒、次数上限 ≥ 12、墙钟上限 ≥ 2400 秒。
-- ⚠️ **每轮进度行必须真的带「板面 head_seq」**（上一版 final review 的 major：只打了
-  attempt/reason/state/coverage/zeroGrowthRounds/drain_id，head_seq 缺）。
-  取法复用 E0c1 已交付的列表端点读法（`src/bus.ts` 的 readChannelHeadSeqFromList），⛔ 见 GT-8。
-- 每轮 drain 在 stdout 打一行进度（第几轮 / 本轮 drain reason / 当前 `termination.state` /
-  板面 head_seq），并把每轮的 `runs_root`/reason/终态追加进运行记录，⛔ 不得只留最后一轮。
-- ⭐ **失败收尾时必须回显并归档那一轮 drain 的 stdout 与 stderr**（上一版 final review 的 major：
-  三条真失败分支与两条 §1.1 读取失败分支都在 `break` 前只打印退出码与步骤名，
-  而追加进运行记录的语句位于 `break` 之后 ⇒ **失败那一轮的输出既不回显也不落盘**）。
-  真机上最有价值的恰是这一行：`[deep-research-loop] TICK FAILURE: run_dir=… exit=…`。
-  ⛔ 失败轮的 drain 输出不得丢失。
-- profile 的三个键（退避 / 次数上限 / 墙钟上限）**缺失即响亮失败**，
-  ⛔ 不得静默套用脚本内置缺省——与仓内 `SEED_CLUE` / `SEED_SOURCES` / `RESEARCH_PROFILE_BASE`
-  的"无缺省、缺失即拒绝启动"范式一致。
-- `max_rounds` 分支同样要校验退出码：真机上 `max_rounds` **恒等于 exit 1**
-  （`drain-cli.ts:39` 判定 + `deep-research-loop.sh:211-213` 原样透传后直接 exit，不再跑 check-drain-failures）。
-  出现 `reason=max_rounds` 配非 1 的退出码 ⇒ 按 GT-6 归入「其它非零退出码 ⇒ 真失败」，
-  ⛔ 不得当成「还没收敛」去退避重试。
-- ⛔ 不得靠改 `max_passes`（单次 drain 的轮次上限）来"解决"——那只是放慢烧轮次的速度，
-  worker 该等还是要等；本包要的是**跨 drain 的循环与退避**。
+### 1.2 以「proposed 未清空」收尾必须响亮
+
+撞上限退出时，错误信息除了点名撞的是哪个上限，**还必须打印板面构成**：
+`proposed=<n> open=<m> in_flight=<k> explored=<x> blocked=<y>`，
+并在 `proposed > 0 且 proposed < triageThreshold` 时**显式点名这是 triage 门限死锁**
+（给出该轮的 threshold 实测值）。⛔ 不得只报"撞了哪个上限"——那让 GT-11 这种死锁看起来像"跑得慢"。
+
+### 1.3 消灭假 bus 端口撞车（GT-12）
+
+起假 bus 一律改成**由内核分配端口**（`listen(0)` 后读回实际端口）或**占用即重试**，
+使并发跑不可能撞车；`startFakeBus` 在起不来时必须**响亮失败**（⛔ 不得静默继续，
+那正是"连到别人的 bus"的成因）。仓内**所有**这样起假 bus 的用例都要改到同一条路径上，
+⛔ 不得只改本包新加的那几条。
+
+### 1.4 修 `drain_attempts` 报数
+
+实测：`max_attempts=12` 却报 `drain_attempts=13`（`run.meta` 与 stdout 两处一致地多 1）。
+按"实际执行过的 drain 次数"报，⛔ 不得只改文案掩盖差 1。
 
 ## 2　验收判据
 
-1. `npm ci && npm run typecheck && npm test` 全绿。
-2. **⭐ 判别性**：`termination.state` 为 `null` ⇒ 入口非零退出；
-   把终态判据换成「用 drain 摘要的 reason」⇒ 测试变红。
-3. **⭐ 判别性**：journal 里没有 `identity=="tick"` 的条目 ⇒ 响亮失败并点名该步，
-   ⛔ 不得当作任一方向的默认值。
-4. **⭐ 判别性（GT-4）**：构造「板面已排空但 `termination.state` 仍为 null 且未触顶」⇒ **仍然续投**；
-   把续投门改回只看 `hasPendingWork` ⇒ 测试变红。
-5. **⭐ 判别性（GT-3）**：构造「第一次 drain 后仍 null、第二次后非 null」⇒
-   入口**继续跑第二轮并最终退出 0**；改回只跑一次 drain ⇒ 测试变红。
-   ⛔ **判据 5 与 6 的测试必须真正执行 `bin/e0-regression.sh` 本身**（前一版 attempt 1 的 blocker：
-   测试在自己内部重实现了一遍循环、对入口只做源码 grep，于是入口怎么错都是绿的）。
-   假 loop 用可执行桩替身注入（让入口去调它），⛔ 不得把被测逻辑搬进测试里。
-6. **⭐ 判别性（上限）**：`termination.state` 永远为 null ⇒ 撞到 profile 声明的上限时非零退出，
-   且点名撞的是哪个上限。⛔ 不得无限循环（测试须能在有限时间内跑完）。
-6b. **⭐⭐ 判别性（GT-6 / max_rounds 不是失败）**：构造「第一次 drain 以 `reason=max_rounds` + **退出码 1** 结束、
-   终态仍 null，第二次才收敛」⇒ 入口**必须退避后跑第二轮并最终退出 0**；
-   把分类改回「非零即 DRAIN_FAILED 并 break」⇒ 该测试变红。
-   反向一条也要有：drain 以**其它**非零退出码（如 3）或吐不出可解析摘要 ⇒ 入口**立刻响亮失败**，
-   ⛔ 不得当成「还没收敛」去重试。
-6bb. **⭐⭐ 判别性（GT-2 / result 是两个文档）**：喂一个 `result` **逐字等于 GT-2 那个形状**的 journal
-   （pretty-print 的 tick 输出 + 紧接着一行续投 trigger 回显）⇒ 终态必须被正确读出；
-   把读法换成整串 `JSON.parse` 或按行 parse ⇒ 该测试变红。
-   ⛔ fixture 里的 `result` **必须**是双文档拼接，单文档的 fixture 视为判别性缺失。
-6c. **⭐ 判别性（GT-7 / 嵌套 JSON）**：喂一条含 `"ticksByLabel":{"tick":16}` 的**真实形状**摘要，
-   摘要抽取必须成功；把抽取换成花括号正则 ⇒ 变红。
-6d. **⭐ 判别性（GT-8 / head_seq）**：假 bus 的单 channel GET **不返回** `head_seq`；
-   任何从单 channel 端点读 `head_seq` 的实现 ⇒ 变红。
-7. **⭐ 判别性（GT-5 / zsh）**：`tick.md` 里被本包改动的那段，必须有一条测试**用 `zsh -c` 真跑**
-   （不是 bash、不是 `sh`）并断言它在"有续投 body"的第二轮上成功；
-   把其中任一处换成 bash-only 语法（如 `read -r -a`）⇒ 该测试变红。
-   ⛔ 不得用"在 bash 下跑通"替代这条。
-7b. **⭐⭐ 判据（GT-10 / 既有用例不得因本改动而挂）**：`npm test` **全绿**，
-   其中 `test/a10b-convergence.test.ts` 的 B1/B2 必须通过且有充裕余量
-   （实测候选上 B2 ≈ 4.4 秒，缺省 5 秒必然在并发负载下 flaky）。
-   ⛔ 通过手段只能是"放宽这两条的 timeout 并注明理由"，不得改回续投门、不得 skip/删用例。
-8. **回归 ⛔**：E0c1 的全部行为逐字不变（head_seq 取法、真实求和、per-run 板、种子带 sources、
-   生产护栏、运行记录归档）。⛔ 本包只加终止语义，不得顺手改动或放宽上述任何一条。
-9. **Z1（真机）**：`bash bin/e0-regression.sh` 跑到**非 null 终态**、退出 0，
-   `board:agent-runs` head_seq 相对跑前严格增长，**且证据 channel head_seq > 0**（真收割到 evidence）。
-10. **Z2（真机）**：运行前后生产总线 `sum(head_seq)` 零增长（派发方独立复算）。
-11. **Z3（真机）**：连续两次执行都退出 0、各自独立 run id 与独立研究板、两次都满足判据 9。
+1. `npm ci && npm run typecheck && npm test` 全绿；**`test/a10b-convergence.test.ts` 的 B1/B2 仍绿且余量充足**
+   （E0c2f 已把它们的 timeout 放宽，⛔ 本包不得改回）。
+2. **⭐ 判别性（GT-11 核心）**：构造「板上恰好 1 条 proposed、无在途、未触顶」⇒
+   在回归 profile 下**必须能推进**（triage 被派出 / 或该形态在本 profile 下不可能出现）；
+   把 §1.1 的改动撤回（threshold 回到 3 且种子回到 1 条）⇒ 该测试**变红**。
+3. **⭐ 判别性**：其它 profile（未声明 threshold）行为逐字不变——缺省仍是 3。
+4. **⭐ 判别性**：撞上限且 `proposed > 0` ⇒ 错误信息**同时**含板面构成与"triage 门限死锁"点名；
+   去掉板面构成 ⇒ 测试变红。
+5. `drain_attempts` 与实际 drain 次数一致（上限 12 ⇒ 最多报 12）。
+5b. **⭐ 判别性（GT-12）**：仓内不再出现 `Math.random()` 派生的假 bus 端口；
+   端口来自内核分配或占用重试，且起不来时响亮失败。
+   把端口改回随机常量范围 ⇒ 该检查变红。
+   **⛔ `npm test` 连跑两次都必须全绿**（抖动一次即视为未交付）。
+6. **回归 ⛔**：E0c2f 与 E0c1 的全部行为逐字不变（跨 drain 循环与退避、GT-6 三分类、
+   终态取真值、续投门、失败轮回显、进度行、per-run 板、种子带 sources、head_seq 只从列表端点取、
+   生产总线真实全量求和与护栏、运行记录归档）。
+7. **Z1（真机）**：`bash bin/e0-regression.sh` 跑到**非 null 终态**、**退出 0**，
+   `board:agent-runs` head_seq 相对跑前严格增长，**且证据 channel head_seq > 0**。
+8. **Z2（真机）**：运行前后生产总线 `sum(head_seq)` 零增长（派发方独立复算）。
+9. **Z3（真机）**：连续两次执行都退出 0、各自独立 run id 与独立研究板、两次都满足判据 7。
 
-> 判据 9–11 由派发方在真机上验证。⚠️ 真机跑通预计需**若干分钟到几十分钟**
-> （单个 code-local worker ≈ 158 秒，一次研究要多轮）——这是正常的；
-> ⛔ 不得为求快把研究范围缩到秒级，那会让基线失去回归意义。
+> 判据 7–9 由派发方在真机上验证。⚠️ 一次真机跑预计**若干分钟到几十分钟**
+> （单个 code-local worker ≈ 158 秒，退避 120 秒）——这是正常的；
+> ⛔ 不得为求快把研究范围缩到秒级，⛔ 不得为让判据过而放宽判据本身。
 
 ## 3　⛔ 明确不做
 
-web/content 接线（E2b）、ingest（E1）、anchor scheme（E3）、收工仲裁者（E5）、
-原子产物（E4）、驱动脚本重写进 TS 入口（E7）、协议注册、`recipes/*` 工具白名单、
-生产 profile `agent-harness.env`。
-
-额外：⛔ 不得为了让判据过而放宽判据本身（把终态断言改回看 drain reason、
-把 Z1 的 evidence 判据删掉、伪造 worker 派发等）。判据的严格性就是本包的交付物。
+web/content 接线（E2b）、ingest（E1）、anchor scheme（E3）、收工仲裁者（E5）、原子产物（E4）、
+驱动脚本重写进 TS 入口（E7）、协议注册、`recipes/*` 工具白名单、生产 profile `agent-harness.env`。
+⛔ 不重写 E0c2f 已交付的任何东西。
 
 ## 4　运行环境前提（派发方已就位，⛔ 实现者不需要做也不得与之冲突）
 
-测试总线 `http://127.0.0.1:7495`（独立 SQLite，与生产 7490 零共享）：
-三个 agent 已注册、token 落 `/data/agent-bus-test/tokens/`；`board:agent-runs` 已建；
-协议已用 `agent-run register-bus-protocols` 供给齐全（14 个 kind，含
-`research.clue.v2` 与 `agent.run.{started,exited}.{v1,v2}`——缺后者时 worker 会以
-`CONTRACT_ERROR`(exit 91) 死在发生命周期事件那步）。
+测试总线 `http://127.0.0.1:7495`（独立 SQLite，与生产 7490 零共享）：三个 agent 已注册、
+token 落 `/data/agent-bus-test/tokens/`；`board:agent-runs` 已建；协议已用
+`agent-run register-bus-protocols` 供给齐全（14 个 kind）。
 ⛔ 实现者不得在代码里自动注册 protocol：协议注册不可逆，是拍板级动作。
 
 ## 5　评审口径
 
-- **REJECT 只用于 blocker 级**：判据不成立、判别性缺失、自造契约（见 §0）、
-  放宽或删除 E0c1 已有行为、无限循环、把撞上限伪装成成功、越出 §1 范围。
-  文风与偏好写成 non-blocking 建议。
-- ⚠️ 逐处核对：**每一处从落盘产物里取字段的代码，取的字段在真实产物里到底存不存在**
-  （尤其 journal 行的 `termination` 是嵌套在 `result` 字符串里的，不是顶层键）。
-- reviewer 只读，判据 1–7 由 acceptance 命令的执行结果作证，⛔ 不要求 reviewer 执行 shell。
+- **REJECT 只用于 blocker 级**：判据不成立、判别性缺失、自造契约、放宽终态判据、
+  改坏 E0c2f/E0c1 已有行为、越出 §1 范围。文风与偏好写成 non-blocking 建议。
+- ⚠️ 本线累计因「为观察不到的产物发明契约、再写 fixture 迎合它」被驳回 7 次，
+  另有 2 次因「测试绕开被测入口、在测试内部重实现一遍逻辑」被驳回。
+  **判据 2 与 4 的测试必须真正驱动被测对象**，⛔ 不得在测试内部重实现 triage 判定。
+- reviewer 只读，判据 1–6 由 acceptance 命令的执行结果作证，⛔ 不要求 reviewer 执行 shell。
 - ⛔ 实现者不得写 `.dd-evidence/**` 与 `.dev-dispatch/**`（引擎保留路径，写入即永久 wedge）。

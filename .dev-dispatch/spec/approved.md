@@ -1,150 +1,128 @@
-# G15 —— tick 失败在驱动层不可见：`deep-research-loop.sh` 恒 exit 0
+# E0 —— 真机端到端回归基线（deep-research V3）
 
-> 派发方：`line-deep-research`。仓库：`loop-engine-deep-research-plugin`。基线：main `090f92d`。
-> **Phase 6 收尾时受控实验抓到，证据全部实测逐字。**
-
----
-
-## 0　生产实况（受控实验，可复现）
-
-把 `TICK_CHANNEL` 指向一个**不存在的 channel**（只读不写，必然失败），跑完整 `bin/deep-research-loop.sh`：
-
-**前提已单独坐实** —— 同参数直接调生产入口：
-
-```
-$ ./bin/tick-entry.sh --run research:definitely-does-not-exist-probe …
-bus GET …/messages?limit=100: 404 {"code":"NOT_FOUND","message":"Channel … not found"}
-exit=2
-```
-
-**而驱动脚本侧**：
-
-```
-loop 脚本            exit 0
-round_end            {"round": 1, "ticked": ["tick"], "errors": 0}
-pipeline_drained     {"round": 1}
-trigger              {"status": "done", "claimed_by": "tick"}
-```
-
-## 0.1　⛔ 根因**不是** loop-engine 的缺陷（这条必须先说清，避免把修复派到错的地方）
-
-派发方一路查到底，失败**有留痕**，且引擎行为**符合其成文契约**：
-
-**(a) 失败被完整记录**，在 per-tick 的 lane run 目录（**不是** drain 的 `runs_root`）：
-
-```
-/data/loop-engine/runs/2026-08-10T132109-fb74a8a8/journal.jsonl
-{"run_id":"tick~1","identity":"tick",
- "result":"[bash 非零退出 EXIT:2]\nbus GET …404 NOT_FOUND…"}
-
-同目录 events.jsonl:  {"status":"EXIT:2"}  {"reason":"drained"}
-同目录 STATUS.md:     # loop-engine [drained] · 已完成 1/64 · node_errors: 0
-```
-
-**(b) 引擎这样做是有意的、成文的** —— `loop-engine/src/adapters/bash.ts:64-65` 逐字：
-
-> 归因边界(exec-failure spec)：叶子正常跑完——无论 OK 还是**干净非零退出(如测试 fail)**——
-> 都给信封，result=stdout 是下游 judge 要读的**正常工作流数据**（"非零退出 + 有信封 = 正常数据投递"）。
-
-`fatal` 只覆盖 `TIMEOUT` / `SIGNAL:` / `ERROR`（进程被杀或起不来）。
-⇒ **在该契约下，bash 叶子无法上报「我失败了」；干净非零退出永远是数据。**
-
-**(c) 于是链条内每一环都"正确"**：`reason=drained` ⇒ `fleet.ts` 的
-`clean = reason==="halt"||reason==="drained"` 为真 ⇒ trigger 留在 `complete.success_status: done`
-（不退回 `failure_status: open`）⇒ `resident.ts` 只统计 `w.tick()` 抛错 ⇒ `errors: 0` ⇒ 脚本 exit 0。
-
-> ### ⛔ 因此：**不要改 loop-engine**
-> 把「bash 叶子非零退出」改判成 `node_error` 会**破坏该成文契约**，波及所有依赖
-> 「跑测试 → 非零退出 → 交下游 judge 读」的 workflow。**错配在本仓：`tick.md` 用非零退出表达失败，
-> 而这不是引擎契约里的失败表达。**
-
-## 0.2　后果
-
-Phase 6 的驱动脚本跑了 **19+ 轮，每轮 `errors:0` / `drained` / `exit 0`**，而底下的 tick 一直在失败。
-**最外层的成功信号在结构上不可能报告失败** —— 这是本线多个缺陷得以静默数小时的直接原因。
+**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（本 spec 的全部改动只在该仓）
+**上位文档**：work folder `wf-f54be7` 的 `spec.md` §13.5、`constitution-draft.md`（十三条）
+**开发包顺序**：E0 是 V3 第一个包，其后每个包合入都要重跑 E0 作 regression
 
 ---
 
-## 1　要做什么：驱动层去痕迹所在的地方读结果
+## 0　这个包要解决什么
 
-`bin/deep-research-loop.sh` 在 drain 返回**之后**，自行判定本次 drain 里是否有 tick 非零退出，有则**响亮失败**。
+现状：本仓的研究链路（`bin/deep-research-loop.sh` → `loop-engine drain` → tick → worker/triage/generate → 导出）
+**只能打生产 agent-bus（127.0.0.1:7490）**，因为 `src/bus.ts:13` 把凭证路径写死成
+`/data/agent-bus/tokens/uther-tui.token`。后果有两条，都必须在本包解决：
 
-**遍历路径（派发方已在真实数据上逐步实测通过）**：
+1. **任何一次跑通验证都会往生产总线写数据**——总线 append-only 无 DELETE，写错不可回退。
+   宪法第五条要求测试数据只碰测试环境。
+2. **没有一条可重复的命令能把链路从头跑到终态**，于是"改完有没有跑坏"这件事没有基线。
+   宪法第十三条要求交付必须过真机端到端，且验收要能指认具体某次运行的记录。
 
-1. drain 的输出/`drain.json` 里拿 **`drain_id`**；
-2. 在 `/data/loop-engine/index.jsonl` 里找 `drain_id` 匹配**且带 `lane`** 的 `run.start` 条目 ⇒ 得每个 lane tick 的 **`run_dir`**；
-3. 每个 `run_dir/journal.jsonl` 里 grep **`[bash 非零退出 EXIT:<n>]`**；
-4. 命中 ⇒ 向 stderr 打印**该 run_dir、退出码、以及 journal 里记录的失败正文摘要**，并**以非零退出**结束脚本。
+本包交付的是**基线本身**：一条命令、打测试总线、跑完现状链路到终态、留下可指认的运行记录。
+**本包不新增任何研究能力**（web 信源、ingest、原子产物等一律不碰，那是 E1–E4）。
 
-实测（真实探针数据，逐字）：
+## 1　运行环境（已由派发方在真机上就位，实现者不需要创建）
 
-```
-drain_id = 2026-08-10T132109-ff12b3d5-1786339269400-2035597
-→ index.jsonl: run.start | lane tick | tick 1 | run_dir /data/loop-engine/runs/2026-08-10T132109-fb74a8a8
-→ journal.jsonl 命中 1 条: [bash 非零退出 EXIT:2]
-```
-
-### ⛔ 必须保住 / 不得做
-
-- ⛔ **不得改 `loop-engine`**（§0.1）。本包只动本仓。
-- ⛔ **不得改 `tick.md` 的 `set -euo pipefail` 或它的非零退出语义** —— 那是对的，是驱动层没读。
-- ⛔ **无 tick 失败时，脚本的既有行为与退出码逐字不变**（含 `--dry-run` 路径）。
-- ⛔ **`index.jsonl` / `journal.jsonl` 不存在或不可读 ⇒ 响亮失败并点名**，⛔ 不得静默当成"没有失败"
-  （那正是本包要消灭的形态）。
-- ⛔ 不得吞掉 drain 自身的非零退出：drain 已非零时保持其退出码。
-
----
-
-## 2　硬验收（缺一不可）
-
-| # | 判据 | 怎么验 |
+| 对象 | 值 | 说明 |
 |---|---|---|
-| **Y1** | ⭐ **判别性**：tick 非零退出 ⇒ **脚本非零退出**，且 stderr **点名 run_dir 与退出码** | 用 stub 覆盖 `TICK_ENTRY`（`bin/deep-research-loop.sh:73` 支持 env 覆盖，派发方已确认）：stub 对 `--parse-trigger-body` 输出空串并 exit 0，对 `--run` exit 2。**完全离线，不碰 bus** |
-| **Y2** | ⛔ **tick 成功时行为逐字不变**：stub 全部 exit 0 ⇒ 脚本 exit 0，且既有 stdout 摘要不变 | 回归断言 |
-| **Y3** | ⛔ **多 tick 中任一失败即失败**，且报告**全部**失败的 run_dir（非只报第一个） | 构造两轮、第二轮失败 |
-| **Y4** | ⛔ **痕迹不可读 ⇒ 响亮失败**：`index.jsonl` 缺失/无匹配条目 ⇒ 非零退出并点名，⛔ 不得静默通过 | 判别性用例 |
-| **Y5** | ⛔ **不改 loop-engine**：`git diff` 只触及本仓 | 贴 `git diff --stat` |
-| **Y6** | 全量 `npx vitest run` 干净环境真绿。基线：main `090f92d` **派发方实测 539 tests**，终值不得低于基线 | ⛔ 贴本次运行完整尾部（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
-| **Y7** | **可达性声明**：Y1–Y4 每条指名唯一会失败的用例 + 一两句「为什么缺该行为就不可能通过」 | dev-note |
-| **Y8** | 工作树干净 | ⛔ 贴 `git status --porcelain \| wc -l` 的输出（应为 `0`）。⛔ 不要贴 `git status --porcelain` 本身——干净时它无输出，空块与遗漏不可区分 |
+| 测试总线 HTTP | `http://127.0.0.1:7495` | systemd user unit `agent-bus-test.service`，独立 SQLite（`/data/agent-bus-test`）、独立 token，与生产 7490 零共享 |
+| 测试总线 token 目录 | `/data/agent-bus-test/tokens/` | 本包的 profile 从这里取凭证文件路径；⛔ token 内容不得进仓、不得进任何产物 |
+| 生产总线 HTTP | `http://127.0.0.1:7490` | ⛔ 本包交付物在任何路径下都不得写它 |
+| loop-engine CLI | `/data/code/self/loop-engine/dist/cli.js` | 现状链路已依赖，不改 |
 
----
+## 2　交付内容（四项，全部在目标仓内）
 
-## 3　⛔ 关于变异自检：本包不要求你自报，也不要编造
+### 2.1 `src/bus.ts`：凭证路径可配置
 
-**实测变异由派发方在 gate 亲手施加。** 你只需给 Y7 的**可达性声明**（可被评审读代码核实）。
-⛔ 不要写「实测 / 被杀 ✓」，除非你真做了并能贴出被改行与失败输出。
-**写不出就如实写「未实测，理由：见可达性声明」——这不扣分。**
+- 现状第 13 行 `const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";` 改为可被环境变量覆盖。
+- **变量名必须是 `AGENT_BUS_TOKEN_FILE`**——与 `agent-runtime` 的 `src/agent-bus.ts:56` 同名同义
+  （那边已是 `process.env.AGENT_BUS_TOKEN_FILE || DEFAULT_TOKEN_FILE`）。同一台机器上两个进程读同一个变量，
+  才可能让 tick 与它 spawn 出来的 `agent-run` 落在同一条总线上。
+- **未设置该变量时行为逐字不变**（仍读 `/data/agent-bus/tokens/uther-tui.token`）。
+- 读取失败（文件不存在/为空）时必须响亮失败并点名该变量与解析到的路径，
+  ⛔ 不得回退到默认路径、不得返回空 token 继续跑（宪法第四条：失败必须现形）。
 
----
+### 2.2 `profiles/deploy/e0-regression.env`：回归基线的部署配置
 
-## 4　⛔ 派发方已付的学费
+新增受版本管理的 profile，供 `--profile e0-regression` 加载。要求：
 
-**判据必须先被证明「在验收环境里可满足」才能写进硬验收。** 本线已为此付过五次代价。
-⇒ 本包 Y1–Y4 派发方已逐条确认可满足：`TICK_ENTRY` 可 env 覆盖（`bin/deep-research-loop.sh:73`），
-stub 使全流程**离线可控**；`drain_id → index.jsonl(lane) → run_dir → journal.jsonl` 四步遍历
-已在**真实探针数据**上逐步跑通（见 §1 实测块）。
+- 全部 channel 名带 `e0` 与 run 语义的前缀，且**与生产 profile（`agent-harness.env`）的 channel 名无交集**。
+- `EXPORT_ROOT` 指向仓外的运行时目录（不得写进 vault 的 `DeepThought/`，那是生产成果落点）。
+- `ALLOWED_ROOT` 指向一个体量小、必然存在的本地仓，使一轮 code-local 收割能在数分钟内结束。
+- `RESEARCH_QUESTION` / `RESEARCH_ORIGIN` / `DOC_CHANNEL` / `TICK_CHANNEL` / `EVIDENCE_CHANNEL` /
+  `ANCHOR_CHECK_BIN` 全部显式给出（现状这些无内置缺省，缺一个就是启动即失败或生成段静默不执行——
+  见仓内 `profiles/deploy/agent-harness.env` 的逐条注释）。
+- ⛔ profile 里不得出现任何 token 值，只出现 token **文件路径**。
 
-其余：⛔ 源码字符串匹配不构成证据；⛔ 测试里重写一份被测逻辑再断言等于没测；
-dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit，不是 H0 提交。
+### 2.3 `bin/e0-regression.sh`：唯一入口命令
 
----
+一条命令把现状链路在测试总线上从头跑到终态。要求：
 
-## 5　显式不做
+1. **无参数即可运行**（可接受可选参数覆盖 run id 之类，但缺省必须能跑）。
+2. 自己导出 `AGENT_BUS_URL` 与 `AGENT_BUS_TOKEN_FILE` 指向测试实例，
+   并保证这两个变量**被 tick spawn 出来的子进程继承**（`src/tick-run.ts:1133` 是 `{...process.env, ...spec.env}`，
+   因此在入口 export 即可，不需要改 spawn 代码）。
+3. **生产总线护栏**：启动前检查最终生效的 `AGENT_BUS_URL`，若指向生产实例（端口 7490 或
+   `AGENT_BUS_TOKEN_FILE` 落在 `/data/agent-bus/` 下）⇒ **拒绝启动并非零退出**，
+   错误信息点名是哪一项触发。该检查必须在任何 bus 写入之前发生。
+4. **channel 预备**：profile 声明的 channel 若在测试总线上不存在则创建；已存在则原样使用。
+   创建与复核都走测试总线的 HTTP API。
+5. **运行记录归档**：单次运行结束后，把可指认的运行记录落到一个确定路径下的
+   `<run_id>/` 目录（run id 打印到 stdout），至少包含：入口命令的完整 stdout/stderr、
+   最终 exit code、本次使用的 profile 名与 channel 名、以及可据以回查的 loop-engine run 目录路径。
+   ⛔ 运行记录目录不得落在仓内（不得产生未跟踪文件污染工作区）。
+6. **终态可判**：脚本的退出码必须区分"跑到终态"与"没跑到终态"；
+   ⛔ 不得出现"链路没跑起来但退出 0"（现状 G11 就踩过：一轮 3 秒 drain、零 spawn、exit 0 且不报错）。
+7. **可重入**：同一命令重复执行不得因残留状态失败；重复执行产生的是新 run id 与新记录目录，
+   幂等键仍然生效、不产生重复的总线数据。
+
+### 2.4 单元测试（`test/` 下，与既有 vitest 套件同风格）
+
+至少覆盖以下四条，每条都要有**判别性**（把被测行为改坏后测试必须变红）：
+
+- **T-A**：设了 `AGENT_BUS_TOKEN_FILE` ⇒ 读的是该路径；不设 ⇒ 读默认路径（两个方向都要断言）。
+- **T-B**：凭证文件不存在/为空 ⇒ 抛错且错误信息含变量名与解析到的路径；⛔ 不静默降级。
+- **T-C**：护栏——`AGENT_BUS_URL` 指向 7490（或 token 路径落在生产目录）⇒ 入口拒绝启动、非零退出、
+  且**没有发生任何 bus 写入**。
+- **T-D**：profile 文件被 `--profile e0-regression` 加载后，§2.2 列出的每个键都非空。
+
+## 3　验收判据（逐条可机械判定）
+
+1. `npm ci && npm run typecheck && npm test` 全绿（dd 的 acceptance 命令即此三条）。
+2. `src/bus.ts` 中不再存在写死的凭证路径字面量作为唯一取值路径；
+   `AGENT_BUS_TOKEN_FILE` 未设时的默认值与改动前逐字相同。
+3. `profiles/deploy/e0-regression.env` 存在，且其 channel 名与 `profiles/deploy/agent-harness.env` 的
+   channel 名集合交集为空。
+4. `bin/e0-regression.sh` 存在且可执行；无参数运行路径存在。
+5. T-A / T-B / T-C / T-D 四条测试存在且通过。
+6. **仓内不得出现任何 token 明文**（凭证只以文件路径形式出现）。
+7. **Z1（真机）**：在真机上执行 `bash bin/e0-regression.sh` 一次，链路跑到终态，退出码为 0，
+   运行记录目录按 §2.3.5 生成且内容齐备。
+8. **Z2（真机）**：该次运行前后，生产总线（7490）的 `head_seq` 零增长。
+   实现者需在运行记录里留下跑前/跑后两次读数以支撑该判据。
+9. **Z3（真机）**：同一条命令连续执行两次都能跑到终态，第二次产生独立的 run id 与记录目录。
+
+> 判据 7–9 由派发方在真机上执行验证（host verify），不要求 reviewer 自己跑。
+> 实现者需保证这三条**可被一条命令复现**。
+
+## 4　⛔ 明确不做
 
 | 不做 | 理由 |
 |---|---|
-| 改 `loop-engine` 任何文件 | §0.1：其行为符合成文契约，改判会波及所有依赖该契约的 workflow |
-| 改 `tick.md` 的失败语义 | 它是对的 |
-| 用 Envelope 让 bash 叶子"上报失败" | `fatal` 只覆盖 TIMEOUT/SIGNAL/ERROR，envelope 的 effects 只有 spawn/halt，表达不了失败 |
-| 改 fleet 的 `complete.success_status/failure_status` | 那是 claim 状态路由，不是操作者可见信号；且改它会重演 workflow.yaml 注释里记载的 max_nodes 失败循环 |
-| 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错 |
+| 新增 web / content 信源、`dr-worker-web` role | E2 的范围 |
+| 改 ingest 语义、digest 归属、MinerU 接线 | E1 的范围 |
+| 扩 anchor-check 的 scheme | E3 的范围 |
+| 收工仲裁者、改终止条件 | E5 的范围 |
+| 原子产物切分、引用过滤 | E4 的范围 |
+| 把 199 行的 `bin/deep-research-loop.sh` 重写进 TS 入口 | E7 的范围；本包只在其之上加一层薄入口 |
+| 注册任何新的 bus protocol / message kind | 现行 v2 松 schema 够用；协议注册是不可逆动作，需另行拍板 |
+| 改 `recipes/*` 的工具白名单、按 role 裁剪工具面 | 已拍板豁免（V-4，better-to-have backlog） |
+| 迁移或改动生产 profile `agent-harness.env` | 生产配置不在本包范围 |
 
----
+## 5　评审口径（reviewer 必读）
 
-## 6　交付物落点
-
-- 实现：`bin/deep-research-loop.sh`（drain 后的 tick 失败判定与响亮退出）
-- 测试：`test/g15-drain-failure-visible.test.ts`（Y1–Y4）
-- 证据：`docs/dev-notes/dev_ledr_g15_drain_failure_visible_01.md`（Y1–Y8 逐条 + §3 可达性声明 +
-  本次运行的全量测试尾部 + `git status --porcelain | wc -l` 输出）
+- **REJECT 只用于 blocker 级问题**：判据不成立、护栏失效、静默失败、凭证泄漏、越出 §2 范围的改动。
+  文风、命名偏好、"还可以更好"一类意见写成 non-blocking 建议，⛔ 不得据此 REJECT。
+  （历史教训：spec 不设严重度下限时，MERGED 在构造上不可达。）
+- reviewer 是只读角色，判据 1 与 5 由 acceptance 命令的实际执行结果作证，
+  ⛔ 不要求 reviewer 自行执行 shell 来取证。
+- ⛔ 实现者不得写 `.dd-evidence/**` 与 `.dev-dispatch/**`（引擎保留路径，写入即永久 wedge）。

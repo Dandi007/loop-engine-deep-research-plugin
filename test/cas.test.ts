@@ -101,10 +101,15 @@ describe("claimClue / casUpdateClue (real src/bus.ts)", () => {
     expect(calls[0].url).toContain("after_seq=0");
   });
 
-  it("A6: supersedes equals the message_id read from the same head", async () => {
+  it("A6: supersedes comes from the single head read (mutual exclusion, M4)", async () => {
+    let entityReads = 0;
     const calls = stubFetch(async (url) => {
       if (url.includes("/entities/")) {
-        return { status: 200, json: async () => headOpen() };
+        entityReads += 1;
+        // second read would expose a *different* head; a correct CAS must not
+        // supersede on a fresh independent read (spec §4 A6 / §6 M4).
+        const head = entityReads === 1 ? headOpen() : { ...headOpen(), message_id: "msg_003" };
+        return { status: 200, json: async () => head };
       }
       if (url.includes("/publish")) {
         return {
@@ -116,9 +121,12 @@ describe("claimClue / casUpdateClue (real src/bus.ts)", () => {
     });
     const result = await claimClue("ch", "ent", "dr", "run", "key3");
     expect(result.success).toBe(true);
+    // mutual exclusion: claimClue must perform exactly one entity read
+    expect(entityReads).toBe(1);
     const publishCall = calls.find((c) => c.url.includes("/publish"));
     expect(publishCall).toBeTruthy();
     const body = JSON.parse(publishCall!.init!.body as string);
+    // supersedes must equal the message_id of the head from that single read
     expect(body.supersedes).toBe("msg_001");
   });
 

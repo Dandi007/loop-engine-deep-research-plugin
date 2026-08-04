@@ -37,10 +37,10 @@ afterEach(() => {
 });
 
 describe("bus D1–D3 hardening", () => {
-  it("A1: error classification relies on numeric status, not message text", async () => {
+  it("A1: a non-409 failure whose body contains \"409\" is NOT classified as conflict (M1)", async () => {
     stubFetch(async () => ({
-      status: 409,
-      text: async () => "bus POST /x: 409 something",
+      status: 422,
+      text: async () => "bus POST /x: 422 request body contains 409 in the payload",
       json: async () => ({}),
     }));
     const result = await casUpdateClue(
@@ -59,7 +59,10 @@ describe("bus D1–D3 hardening", () => {
       { status: "in_flight" },
       "k",
     );
-    expect(result).toEqual({ success: false, error: "conflict" });
+    // classification must come from the numeric status (422), not the body
+    // text (which happens to contain "409"). A reverted msg.includes("409")
+    // implementation would return { error: "conflict" } here and fail.
+    expect(result).toEqual({ success: false, error: "invalid_payload" });
   });
 
   it("A3: getEntity rethrows on 500 (read failure is not null)", async () => {

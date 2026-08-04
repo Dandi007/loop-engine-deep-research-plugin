@@ -1,232 +1,174 @@
-# S1b(v2) —— CAS 认领原语硬化 + 测试功率补齐 + 冒烟真跑
+# S2 —— 调度 tick：回收 → 派 worker → 派 triage
 
-> **本包是 `dev_ledr_s1b_cas_hardening_01` 的重派。** 上一条 development 的 attempt 2
-> 产品代码**已被 gate 逐条验证为正确**（四条变异逐断言归因全对），
-> 唯一死因是冒烟脚本从未真跑、gate 首跑即 400。
->
-> **参考实现（不作为交付，但强烈建议照搬其正确部分）**：
-> 分支 `loopdev/dev_ledr_s1b_cas_hardening_01/attempt-context-v1`，commit `473dbe3`。
-> 其 `src/bus.ts`、`test/bus.test.ts`、`test/cas.test.ts` 的做法已通过 gate 的执行级验证；
-> **需要改的只有 `scripts/smoke-cas.ts` 的 entity_id 语义，外加本 spec 新增的 A9 / A10。**
+> 上游依据：work folder `wf-dc0c15` 的 `spec.md`(rev7) §3.1–§3.6，`plan.md` §2「链 A · S2」。
+> 前置包 S1b 已合入 main（`72562f6`）：`src/protocol.ts`（三协议类型 + 状态机）、
+> `src/bus.ts`（bus 客户端 + CAS 认领原语）可直接使用。
 
-> 上游依据：work folder `wf-dc0c15` 的 `spec.md`(rev7) §3.2 / §2.2，`plan.md` §2「链 A · S1」。
-> 本包收口 S1 的剩余 DoD，并修掉 S1 首版落地时带进来的四处缺陷。
+## 1　本包要建什么
 
-## 1　背景与本包存在的理由
+deep-research 调度器的**一个 tick**。调度器是 loop-engine plugin，**零 LLM**——
+它的输入全是整数与枚举，输出只有几种动作。
 
-`src/bus.ts` + `src/protocol.ts` 于 commit `b8c4a3a` 落地，是 deep-research 调度层与 agent-bus
-之间**唯一的读写面**。其中 `claimClue()` 是**线索认领的互斥原语**——整个调度器「先 CAS 改卡、
-再 spawn job」的正确性完全压在它身上。
+本包实现 `spec.md §3.2` 的**第 1–4 步**：增量读板 → 回收在途 → 派 worker → 派 triage。
+第 5–6 步（覆盖度与终止判定）属 S3，**本包不做**。
 
-该 commit 未经任何第二方评审。本包把它送进评审，并修掉复核中查出的四处缺陷。
+### 1.1 强制的结构切分：纯决策函数 + 薄执行壳
 
-**为什么这四处必须现在修**：本项目发生过真实事故——两条线各自认为持有同一个槽、**无人拿到 409**。
-根因就是认领原语的前置条件求值出了问题。同类缺陷在 deep-research 上的后果是**两个 worker 领走
-同一条线索**，而 agent-bus 是 append-only 无 DELETE 的，写进去的重复证据清不掉。
-
-## 2　要修的四处缺陷（全部实测于 `b8c4a3a`）
-
-### D1　冲突判定靠字符串匹配，会误判
-
-`src/bus.ts:189-197`：
-
-```ts
-} catch (err: any) {
-  const msg = err.message ?? "";
-  if (msg.includes("409")) {
-    return { success: false, error: "conflict" };
-  }
+```
+decideTick(state: BoardState, cfg: TickConfig): Decision[]     // 纯函数，无 IO
+runTick(deps): Promise<void>                                    // 读板 → decideTick → 执行副作用
 ```
 
-而错误消息由 `busFetch`（`src/bus.ts:34-38`）拼成，**含响应体前 200 字节**：
+**`decideTick` 必须是纯函数**：同样的入参永远给同样的出参，不碰网络/时钟/随机。
+这不是风格偏好——它是「可重放、可单测」这条 DoD 的唯一实现方式，
+也是让状态机的每条分支都能被**廉价地**构造出来的前提。
 
-```ts
-throw new Error(`bus ${method} ${path}: ${resp.status} ${body.slice(0, 200)}`);
-```
+副作用（CAS、spawn）只允许发生在 `runTick` 里，且必须严格按 `decideTick` 返回的顺序执行。
 
-⇒ 响应体里**任何位置**出现 `409` 三个字符（message_id、channel_seq、时间戳、被回显的
-payload 正文）都会让一次**非冲突的失败**被判成 `conflict`。
+## 2　⛔ 本包唯一的硬不变量：先 CAS，后 spawn
 
-对互斥原语而言这是**把失败判成"别人抢先了"**——调度器会据此放弃认领并去处理别的线索，
-而真正的故障（比如 payload 不合法）被永久掩盖。
+> **必须先在 bus 上把卡从 `open` CAS 到 `in_flight`，成功之后才 `spawn` job。**
+> **顺序反了会产生孤儿 job。**
 
-**要求**：错误分类必须依据 **HTTP 数值状态码**，不得依赖对错误文本的子串匹配。
+三条补偿规则（`spec.md §3.2` 第 3 步）：
 
-### D2　`getEntity` 把一切异常压成"卡不存在"
-
-`src/bus.ts:86-93`：
-
-```ts
-try {
-  const resp = await busFetch(`/v1/entities/${entityId}`);
-  return await resp.json();
-} catch {
-  return null;
-}
-```
-
-catch-all ⇒ **403（无 channel 读权限）、500（bus 故障）、网络不可达**全部返回 `null`，
-`claimClue` 于是返回 `error: "entity_not_found"`。
-
-调度器读到"这张卡不存在"会当成正常状态推进；实际是基建挂了。
-
-> 本线已在**「静默降级」**上栽过八次，最狠的一次是一个 `rc=0`、输出 125KB 的错误命令
-> 被读成正常空结果。**判据：不报错、退出码为 0、还给你一个看起来合理的返回值的错误，
-> 比报错的危险得多。**
-
-**要求**：`claimClue` 必须能把「卡真的不存在」与「读取失败」区分开，且后者**不得**
-被表达成一个看起来正常的状态。
-
-### D3　`afterSeq` 用 falsy 判断，`0` 会被丢掉
-
-`src/bus.ts:77`：
-
-```ts
-if (opts.afterSeq) params.set("after_seq", String(opts.afterSeq));
-```
-
-`afterSeq === 0` 为 falsy ⇒ 参数不发 ⇒ 服务端按默认行为**返回最早 100 条**。
-
-> 这正是本线踩过的实测坑：`GET /v1/channels/<id>/messages` 默认 `limit=100` 且返回
-> **最早**的 100 条。本线曾因此得出「chat 消息数 = 0」的错误结论。
-> **凡是恰好返回 100 条的，先怀疑截断。**
-
-**要求**：显式传入的 `afterSeq`（含 `0`）必须原样进 query string。
-
-### D4　⛔ `test/cas.test.ts` 对产品代码零功率
-
-**整个文件不 import `src/bus.ts`。** 它在测试文件内部（`test/cas.test.ts:24-48`）
-自己重写了一份 `casClaim()` 副本，四条断言全部打在这份副本上。
-
-后果：`src/bus.ts` 的 `claimClue` / `casUpdateClue` **一行都没有被测到**。
-D1/D2/D3 三处缺陷能在 15/15 全绿的情况下存在，正是因为这个。
-
-更糟的是那条自称「常驻断言」的用例（`test/cas.test.ts:93-102`）：
-
-```ts
-const head = headOpen;
-const status = head.payload.status;
-const supersedes = head.message_id;
-expect(status).toBe("open");
-expect(supersedes).toBe("msg_001");
-```
-
-它断言的是**同一个文件里五行之前刚定义的字面量常量**。
-**两个操作数同源 ⇒ 结构上不可能失败。** 它在代码里长得像检查，语义上是恒等式。
-
-> **零功率的检查比没有检查更坏**——它制造一个「看起来被验证过」的空位。
-> 判据：**它的缺席会不会被读成证据？** 会，就不能留。
-
-**要求**：CAS 测试必须**导入并调用 `src/bus.ts` 的真实导出**，靠打桩 `fetch` 构造场景。
-「同源读」判据要么用真实调用路径验证，要么删掉——**不允许保留一个恒真断言冒充它**。
-
-## 3　交付范围
-
-| 允许改 | 说明 |
+| 情形 | 处置 |
 |---|---|
-| `src/bus.ts` | 修 D1 / D2 / D3 |
-| `test/cas.test.ts` | 按 D4 重写为对 `src/bus.ts` 的真测试 |
-| `test/bus.test.ts` | 可新建，放 D1–D3 的针对性用例 |
-| `scripts/smoke-cas.ts`（新建） | 真机冒烟脚本，见 §5 |
-| `package.json` | 允许新增 script 条目；**允许新增 devDependency**（见下） |
-| `vitest.smoke.config.ts` | 允许新建，用于让 `smoke:cas` 只收 `scripts/smoke-cas.ts` |
+| CAS 失败（409 = 别人抢先） | **跳过该卡，不得 spawn** |
+| CAS 成功但 spawn 同步失败 | **当场 CAS 回 `open`** |
+| 引擎在两步之间崩溃 | 由回收步兜底（见 §3），本包不额外处理 |
 
-> **上一版本 spec 把 `package.json` 锁成「仅允许新增 script 条目」，导致实现方无权引入
-> 跑得起来的 runner —— 我一边要求交付可执行脚本、一边禁止它引入依赖。该边界已放开。
-> 这张表的立法意图是保护下面两个冻结件，不是禁止新增配置。**
+**背景**：本项目发生过真实事故——两条线各自认为持有同一个槽、**无人拿到 409**。
+认领原语的正确性是整条流程的地基。S1b 已把 `claimClue` 的「同源读」守住
+（`test/cas.test.ts` 的 A6，变异 M4 可杀），**本包要守的是它的调用顺序**。
 
-**不得改**：`src/protocol.ts`（协议类型已按 `research.*.v2` 注册态定稿，改它等于改已冻结契约）、
-`test/protocol.test.ts` 的既有 11 条用例。
+## 3　回收：遍历 `status=in_flight` 的卡
 
-## 4　硬验收（逐条可机械核验）
+依据 `board:agent-runs` 上的 `agent.run.*` 事件（`spec.md §3.2` 第 2 步）：
+
+| 观察到 | 动作 |
+|---|---|
+| 无对应 `agent.run.started` | CAS 回 `open`（崩溃恢复） |
+| `exited` 且 `exit_code === 0` | CAS 到 `explored` |
+| `exited` 且 `exit_code !== 0`，重试 < 2 | CAS 回 `open`，重试 +1 |
+| `exited` 且 `exit_code !== 0`，重试 = 2 | CAS 到 `blocked` |
+
+> ⛔ **不得引入 lease / 超时猜测机制。** `spec.md §3.3` 已明确删除租约：
+> 「worker 死没死」由 `agent.run.exited` 从**猜**变成**被观察到的事实**。
+> **少一个靠阈值猜的机制，比多一个测过的机制强。**
+> 若你发现需要「超过 N 分钟没动静就认为死了」，那是设计回退，不是补强。
+
+## 4　派 worker
+
+```
+n = min(maxConcurrentWorkers - 在途数, open 数)
+```
+
+逐条 `open → in_flight`，按 §2 的顺序与补偿规则。
+
+**`sources` 校验**：`sources` 是**封闭枚举**的子集，取值只能来自
+`code-local` / `code-remote` / `wiki` / `feishu` / `web-search`。
+**出现枚举外的取值 ⇒ 该卡 CAS 到 `blocked`，研究继续，不整体停机**（`spec.md §3.5`）。
+
+> ⛔ **不加 LLM 兜底。** 确定性调度的真风险是「超出状态机时不会想办法」，
+> 正确缓解是让它**响亮失败**，不是给它加智能。调度器查表，不理解。
+
+## 5　派 triage
+
+`count(proposed) ≥ K` 且 triage 无在途 → spawn 一个 triage。
+
+`K = 3`（08-02 实跑值）。「无在途」由 loop-engine 的命名 `lock` 保证；
+本包只需在决策层表达该条件，**lock 的接线属 S4**。
+
+## 6　参数（全部来自 `spec.md §3.4`，不得自行取值）
+
+| 参数 | 取值 |
+|---|---|
+| `K`（triage 触发阈值） | 3 |
+| `maxConcurrentWorkers` | 4 |
+| `maxDepth` | 3 |
+| 重试上限 | 2 |
+
+参数以 `TickConfig` 传入并给出上述缺省值，**不得硬编码在逻辑里**。
+
+## 7　硬验收（逐条可机械核验）
 
 | # | 断言 | 怎么验 |
 |---|---|---|
-| **A1** | 冲突/非冲突分类依据数值状态码 | `grep -nE 'includes\("?4[0-9]{2}' src/bus.ts` **零命中**；错误对象带数值字段（如 `status: number`） |
-| **A2** | 响应体含 `409` 字样但 HTTP 200 的 publish → **判为成功** | 打桩 fetch 返回 `{ok:true, status:200, json:()=>({message_id:"msg_409abc"})}`，断言 `casUpdateClue` 返回 `success:true` |
-| **A3** | `getEntity` 遇 HTTP 500 时，`claimClue` 的结果**不是** `entity_not_found` | 打桩 fetch 返回 500，断言 error 值可与真·404 区分 |
-| **A4** | `getMessages(ch, {afterSeq: 0})` 把 `after_seq=0` 带进 URL | 打桩 fetch 捕获入参 URL，断言含 `after_seq=0` |
-| **A5** | CAS 测试**导入 `src/bus.ts`** | `grep -n 'from "\.\./src/bus"' test/cas.test.ts` 命中；且文件内**不再定义**本地 `casClaim` 副本（`grep -c 'function casClaim' test/cas.test.ts` == 0） |
-| **A6** | 同源读判据由**真实调用路径**验证 | 打桩：首次 `getEntity` 返回 status=open 的 head，断言发出的 publish 请求里 `supersedes` **恰等于该 head 的 `message_id`** —— 即前置条件与 supersedes 出自同一次读 |
-| **A7** | `test/protocol.test.ts` 的 11 条用例**一行未删** | `git diff -- test/protocol.test.ts` 为空 |
-| **A8** | 全量测试通过 | `npm test` exit 0 |
-| **A9** | 400/422 分支的数值分类也有判别性测试 | 构造 **HTTP 500 且响应体文本含 `"422"`** 的桩：数值版应 rethrow，字符串版会返回 `invalid_payload`。断言 rethrow |
-| **A10** | 不留恒真断言 | 删除或改写 `test/cas.test.ts` 里 `A2: publish returns 200 with body containing 409 → success` —— 它在新旧两版实现下都通过（旧版的 `includes("409")` 只在 catch 分支，HTTP 200 不进 catch），是**恒真**的。真守卫是 `test/bus.test.ts` 的 A1 |
+| **B1** | `decideTick` 是纯函数 | 其模块不 import `./bus`，且函数体内无 `fetch` / `Date` / `Math.random`（grep 零命中） |
+| **B2** | 同一入参重复调用结果深相等 | 同一 `state` 调 3 次，`expect(r1).toEqual(r2)` 且 `toEqual(r3)` |
+| **B3** | ⛔ CAS 失败时**不得发生 spawn** | 打桩令 CAS 返回 `conflict`，断言 spawn 的调用次数 **=== 0** |
+| **B4** | ⛔ spawn 与 CAS 的**实际发生顺序** | 记录一条共享调用序列，断言该卡的 `cas` 索引 **<** 其 `spawn` 索引 |
+| **B5** | spawn 同步失败 → 当场 CAS 回 `open` | 打桩令 spawn 抛错，断言随后发生一次把该卡写回 `open` 的 CAS |
+| **B6** | 回收四分支各有独立用例 | 无 started / exit 0 / exit≠0 重试<2 / exit≠0 重试=2 |
+| **B7** | 并发上限生效 | 在途 3、open 5、`maxConcurrentWorkers=4` ⇒ 只派 1 |
+| **B8** | `sources` 含枚举外取值 ⇒ 该卡 `blocked` 且**其余卡照常派发** | 一张坏卡 + 两张好卡，断言 1 blocked + 2 dispatched |
+| **B9** | triage 阈值 | proposed=2 不派；proposed=3 且无在途 → 派；proposed=3 但有在途 → 不派 |
+| **B10** | 不存在 lease / 超时机制 | `grep -riE "lease\|timeout.*(stale\|dead)\|超时.*僵死" src/` 零命中 |
+| **B11** | 参数不得硬编码 | 传入 `TickConfig{K:1}` 时 proposed=1 即触发 triage |
+| **B12** | 全量测试与类型检查通过 | `npm run typecheck` 与 `npm test` 均 exit 0 |
+| **B13** | S1b 既有 26 条用例**一行未删** | `git diff -- test/protocol.test.ts test/bus.test.ts test/cas.test.ts` 中无 `it(` 净减少 |
 
-## 5　真机冒烟（⛔ 本次必须真跑，且只跑一次）
+## 8　变异自检（必须逐断言归因）
 
-### 5.1 上一次派发死在这里 —— 请先读
+| 变异 | 必须杀死 |
+|---|---|
+| **N1** 把「先 CAS 后 spawn」改成「先 spawn 后 CAS」 | **B4** |
+| **N2** CAS 返回 conflict 时不跳过、照常 spawn | **B3** |
+| **N3** 删掉 spawn 失败后的回滚 CAS | **B5** |
+| **N4** 并发上限改成不减在途数（`n = open 数`） | **B7** |
+| **N5** `sources` 枚举校验改为放行 | **B8** |
+| **N6** triage 阈值判定改成 `> K` | **B9** |
 
-上一版 `scripts/smoke-cas.ts` 通过了 implementer、continuous review、final review 三关，
-**gate 第一次真跑就 400 失败**：
-
-```
-bus POST /v1/channels/research:p02-smoke-1dce60/publish: 400
-{"code":"VALIDATION_ERROR","message":"Invalid entity_id format"}
-```
-
-根因：脚本自造 `const ENTITY = "smoke-1dce60"` 并在**创建**时当 entity_id 传入。
-
-> **agent-bus 的 `entity_id` 是首版消息自身的 `message_id`，由服务端回赋，创建时不可指定。**
-> 实测：publish 不带 `entity_id` → 响应体 `entity_id == message_id`（`msg_01KZ6C66378JW7W91708EBG5T9`）。
-> `casUpdateClue` 在**修订**时传 `entity_id + supersedes` 是正确的 —— 产品代码无需改动，
-> 错的是冒烟脚本把「修订语义」用在了「创建」上。
-
-**正确形状**：步骤① publish **不传** `entity_id`，从响应体读回它，再传给步骤②③。
-
-### 5.2 本次的硬要求：实现期必须真跑一次
-
-上一版把冒烟设为「只在 gate 执行」，结果它在被合入前**从未接触过现实**，
-而 gate 拒绝是终态 ⇒ 一次失败就报废整条 development。**本次改为实现期必须真跑。**
-
-`scripts/smoke-cas.ts` 对测试 channel `research:p02-smoke-1dce60` 依次：
-① publish 一条 `research.clue.v2`（status=open，**不传 entity_id**），从响应读回 `entity_id`
-② `claimClue(该 entity_id)` → 断言 `success === true`
-③ 再次 `claimClue` 同一 entity → 断言 `error === "conflict"`（**必须断言到 error 值，不能只断言 !success**）
-④ 打印三步的 `message_id` / `channel_seq`
-
-**幂等键必须是固定确定性常量**（不得用 `Date.now()` 派生）。这是「不要反复运行」这句散文
-背后**唯一的机械保障**：重跑会 bus 侧去重，写不进新消息。
-
-⛔ **agent-bus append-only、无 DELETE 路由，写入不可回退。** 本线曾写进 5.3MB 清不掉的垃圾。
-**总写入量硬上限 3 条消息；不得循环、不得批量、不得改 channel。**
-
-⛔ **仍然不得接进 `acceptance_commands`**（那会在每次 attempt 上重复触发）。
-只经 `npm run smoke:cas` 显式调用，且 `scripts/` 不得被 `npm test` 的默认 include 匹配到。
-
-**交付时请在 IMPLEMENTATION_SUMMARY 或 commit message 里贴出你那一次真跑的实际输出**
-（三步的 message_id 与 channel_seq）。gate 会再跑一次：
-**届时应命中 `deduplicated: true`、channel 消息数不再增加** —— 这同时证明脚本可用与幂等守卫有效。
-
-## 6　变异自检（必须逐断言归因）
-
-| 变异 | 必须杀死 | 上一版实测 |
-|---|---|---|
-| M1 把 409 分支的数值判定改回 `msg.includes("409")` | 「非 409 失败但响应体含 409 不得判为 conflict」那条 | ✅ 已有守卫 |
-| **M1b** 把 400/422 分支也改回 `msg.includes(...)` | **A9** | ❌ **零功率，无任何断言挂掉** |
-| M2 把 `getEntity` 的错误区分改回 catch-all `return null` | **A3** | ✅ 已有守卫 |
-| M3 把 `afterSeq` 判断改回 falsy（`if (opts.afterSeq)`） | **A4** | ✅ 已有守卫 |
-| M4 把 `casUpdateClue` 的 `supersedes` 改成来自第二次独立读的 head | **A6** | ✅ 已有守卫 |
-
-> ⚠️ **M1 的目标断言不是 `A2`。** `A2`（publish 返回 200 且响应体含 `409` → success）
-> 在新旧两版实现下**都通过** —— 旧版的 `includes("409")` 只在 catch 分支里，HTTP 200 不进 catch。
-> 它是**恒真**的，已由 **A10** 要求删除/改写。M1 的真守卫在 `test/bus.test.ts`。
-
-> **只报「N/N 挂了」不算数。** 本线曾第一次变异跑出 10/10 差点签字，去看挂的是哪几条才发现
-> **核心那条断言全程存活**——而它才是那个包存在的理由。
+> **只报「N/N 挂了」不算数。** 本线曾第一次变异跑出 10/10 差点签字，
+> 去看挂的是哪几条才发现**核心那条断言全程存活**——而它才是那个包存在的理由。
 > **变异杀死的断言集合，必须与该变异所模拟的缺陷对得上。**
 >
-> 且**破坏后必须回显被改的那一行**，不能只信脚本说改了——曾有正则命中注释行而非真代码，
+> **破坏后必须回显被改的那一行**，不能只信脚本说改了——曾有正则命中注释行而非真代码，
 > 脚本打印 `patched: True`、测试全绿。
 
-## 7　非目标
+### 8.1 ⚠️ 关于打桩：本包最容易踩的坑
 
-- 不实现调度 tick（S2）、覆盖度与终止条件（S3）——那是后续包
-- 不改 `research.*.v2` 协议 schema（已在 agent-bus 上**不可逆注册**）
-- 不接 MinerU、不做导出
+前一个包（S1b）连续两次交付出**零功率的守卫**，两次都是同一个指纹：
 
-## 8　环境
+> **打桩让两次读返回了相同的值，于是「读了一次」与「读了两次」产出完全相同的结果，
+> 断言无法区分。** 测的是 stub 的确定性，不是被测代码的行为。
 
-- `setup_commands` 必须含 `npm ci`（本仓 `vitest` 走 devDependencies，不装则 `vitest: not found`）
-- `tsconfig.json` 的 `include` 已包含 `test/`，`npm run typecheck` 会覆盖测试文件
-- agent-bus：`http://127.0.0.1:7490`，token 在 `/data/agent-bus/tokens/`，Bearer 认证
+⇒ 写 B3 / B4 时，**必须让「顺序错了」这件事在你的桩上产生可观测的差异**：
+用一条**共享的调用序列**记录 `cas` 与 `spawn` 的发生次序并断言其相对位置，
+而不是分别断言「cas 被调用过」和「spawn 被调用过」——后者对调换顺序完全无感。
+
+**自检方法：把 N1 变异真打进去跑一遍，确认 B4 挂掉。** 若不挂，你的桩就是无效的。
+
+## 9　顺带清理
+
+**删除仓根的 `IMPLEMENTATION_SUMMARY.md`。**
+
+它是 S1b 的一次性交付证据（冒烟输出），已随该包合入并完成使命。留着它的代价是实测过的：
+本项目另一个仓的同名文件**横跨 8+ 个 development、被 18 处评审提及、一次也没被修**——
+因为每个 reviewer 都**正确地**判定它不在自己包的 scope 内。
+
+> **局部各自正确，全局持续失败。** reviewer 反复标记同一个「note, not blocker」时，
+> 那不是噪音，是无归属的公共债；这类债只能由专包清，而现在清最便宜。
+
+若本包仍需留下运行证据，写进 commit message **与** 一个随包新增的文件二者皆可，
+但**不要复用 `IMPLEMENTATION_SUMMARY.md` 这个名字**。
+
+## 10　非目标
+
+- 不做覆盖度计算与终止判定（S3）
+- 不做生成阶段编排、不接 loop-engine `lock`（S4）
+- 不实现 ingest / 导出节点（N1 / N3）
+- 不写 role 定义（链 C）
+- **不改 `src/protocol.ts`**（协议已在 agent-bus 上不可逆注册）
+- 不改 `src/bus.ts` 的既有导出签名；确需新增能力则**新增函数**，不改既有的
+
+## 11　环境
+
+- `setup_commands` 必须含 `npm ci`
+- `tsconfig.json` 的 `include` 已含 `test/`
+- agent-bus：`http://127.0.0.1:7490`，Bearer 认证，token 在 `/data/agent-bus/tokens/`
+- ⛔ **agent-bus 是 append-only、无 DELETE 路由，任何写入不可回退。**
+  **本包不需要、也不得对真实 bus 发起写入**——全部用打桩单测。
+- `GET /v1/channels/<id>/messages` 默认 `limit=100` 且返回**最早**100 条；
+  增量读必须带 `after_seq`（`getMessages` 已支持，`afterSeq=0` 亦被正确携带）

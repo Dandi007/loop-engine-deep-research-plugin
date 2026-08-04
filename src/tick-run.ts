@@ -1,16 +1,17 @@
 /**
- * A8b —— tick 写侧执行：CAS 认领 / 回收（**不含 spawn**）
+ * A8b/A8c —— tick 写侧执行：CAS 认领 / 回收 + spawn（接线判别）
  *
  * 对已交付的 Decision 执行写动作（spec §1.2 / §3.2 第 2–3 步）：
  *   reclaim  → CAS 该卡到目标 status（open / explored / blocked）
- *   dispatch → CAS open → in_flight，并把 `run_id` 写进卡（M7）
- *   block    → CAS 到 blocked
+ *   dispatch → CAS open → in_flight，把 `run_id` 写进卡（M7），CAS 成功后按 role 真正 spawn（A8c）
+ *   block    → CAS 到 blocked（invalid_sources / web_unimplemented / unmapped_source）
  *
- * ⛔ 本包不 spawn：`dispatch` CAS 成功后只记录**待 spawn**（pendingSpawns），
- *    spawn 的实际执行属 A8c。spawn dep 由调用方注入，A8b 传显式 no-op 并记录（M9）。
- * ⛔ 先 CAS 成功才算认领；CAS 失败（409）跳过该卡（M8，spec §2/S2）。
- * ⛔ 写入不可回退：`--max-writes` 默认 5，超限立即停止并响亮报错（M10）。
+ * ⛔ 先 CAS 成功才算认领；CAS 失败（409）跳过该卡且不 spawn（M8 / N4）。
+ * ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿，N5）。
+ * ⛔ 写入不可回退：`--max-writes` 默认 5，超限立即停止并响亮报错（M10）；
+ *    spawn 本身不写 bus、不计入预算，但每次 spawn 前的 CAS 计入（spec §2）。
  * ⛔ 只对显式传入的 channel 操作（M11）；拒绝写 v1 冻结 channel（M12）。
+ * ⛔ CAS 一律走 A8b 的 `realCas`，不得绕过另写 CAS（spec §4.1 纪律 8）。
  */
 import { randomUUID } from "node:crypto";
 import type { ClueV2 } from "./protocol";
@@ -85,15 +86,23 @@ export interface WriteCasInput {
 /** 写侧依赖注入面：所有副作用（CAS / spawn）都从这里走。 */
 export interface WriteDeps {
   cas(input: WriteCasInput): Promise<CasDecision>;
-  /** ⛔ 注入的 spawn dep：A8b 传入 no-op，本包只记录待 spawn，不真正调用（M9）。 */
-  spawnWorker(clueId: string): Promise<void>;
+  /** ⛔ 注入的 spawn dep：CAS 成功后才调用，带 role/runId（A8c 真实兑现 S2 的 spawn）。 */
+  spawnWorker(clueId: string, role: string, runId: string): Promise<void>;
 }
 
-/** runWrite 的观察输出：已执行写数 + 待 spawn 记录（安全性 + 活性配对，M9）。 */
+/** 一次 spawn 的观察记录：role/runId 由决策注入，spawned 表示 spawnWorker 是否成功返回。 */
+export interface SpawnRecord {
+  clueId: string;
+  role: string;
+  runId: string;
+  spawned: boolean;
+}
+
+/** runWrite 的观察输出：已执行写数 + spawn 记录（安全性 + 活性配对）。 */
 export interface WriteResult {
   /** 已实际发起的 CAS 写次数（含失败尝试）。 */
   writes: number;
-  /** 未产生写的决策数（triage / CAS 冲突跳过的 dispatch，M8）。 */
+  /** 未产生写的决策数（triage / CAS 冲突跳过的 dispatch）。 */
   skipped: number;
   casResults: {
     clueId: string;
@@ -101,9 +110,9 @@ export interface WriteResult {
     success: boolean;
     error?: CasDecision["error"];
   }[];
-  /** 待 spawn 记录：dispatch CAS 成功后登记（A8b 不真正 spawn，M9）。 */
-  pendingSpawns: { clueId: string; runId: string }[];
-  /** spawn dep 被调用的次数（A8b 必须为 0，M9）。 */
+  /** spawn 记录：dispatch CAS 成功后真正调用 spawnWorker（A8c）。 */
+  spawns: SpawnRecord[];
+  /** spawn dep 被调用的次数。 */
   spawnCalls: number;
 }
 
@@ -113,8 +122,9 @@ function generateRunId(): string {
 
 /**
  * 纯副作用执行：按决策序执行写动作（先 CAS 后 spawn；CAS 失败跳过不 spawn，S2）。
- * ⛔ 本函数不真正 spawn——只登记 pendingSpawns（spec §1.2）。
- * ⛔ 每次写前检查 max-writes 上限，超限立即抛错（M10）。
+ * ⛔ 先 CAS 成功才 spawn；spawn 同步失败 → 当场 CAS 回 open（spec §1.2 / S2 补偿）。
+ * ⛔ 每次写前检查 max-writes 上限，超限立即抛错（M10）。spawn 本身不写 bus、不计入预算；
+ *    但每次 spawn 前的 CAS 计入（spec §2）。
  */
 export async function runWrite(
   deps: WriteDeps,
@@ -124,13 +134,12 @@ export async function runWrite(
   let writes = 0;
   let skipped = 0;
   const casResults: WriteResult["casResults"] = [];
-  const pendingSpawns: WriteResult["pendingSpawns"] = [];
-  // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增，
-  //    若本包将来误调 spawnWorker，spawnCalls 会如实反映（M9 判别性）。
+  const spawns: WriteResult["spawns"] = [];
+  // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增。
   let spawnCalls = 0;
-  const spawnWorker = async (clueId: string): Promise<void> => {
+  const spawnWorker = async (clueId: string, role: string, runId: string): Promise<void> => {
     spawnCalls += 1;
-    await deps.spawnWorker(clueId);
+    await deps.spawnWorker(clueId, role, runId);
   };
 
   const perform = async (input: WriteCasInput): Promise<CasDecision> => {
@@ -175,16 +184,44 @@ export async function runWrite(
           error: result.error,
         });
         if (result.success) {
-          // CAS 成功才算认领：只登记待 spawn，不真正 spawn（M7 / M9）。
-          pendingSpawns.push({ clueId: decision.clueId, runId });
+          // CAS 成功才算认领：按决策注入的 role 真正 spawn（A8c 兑现 spec §1.2）。
+          try {
+            await spawnWorker(decision.clueId, decision.role, runId);
+            spawns.push({
+              clueId: decision.clueId,
+              role: decision.role,
+              runId,
+              spawned: true,
+            });
+          } catch {
+            // ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿规则，真实路径兑现 N5）。
+            const rollback = await perform({
+              clueId: decision.clueId,
+              to: "open",
+              from: "in_flight",
+              runId,
+            });
+            casResults.push({
+              clueId: decision.clueId,
+              to: "open",
+              success: rollback.success,
+              error: rollback.error,
+            });
+            spawns.push({
+              clueId: decision.clueId,
+              role: decision.role,
+              runId,
+              spawned: false,
+            });
+          }
         } else {
-          // CAS 失败（409）→ 跳过该卡，无后续动作（M8）。
+          // CAS 失败（409）→ 跳过该卡，无后续动作、不 spawn（M8 / N4）。
           skipped += 1;
         }
         break;
       }
       case "block": {
-        // block 决策源自 open 卡（invalid_sources）⇒ 前置条件为 open。
+        // block 决策源自 open 卡（invalid_sources / web_unimplemented / unmapped_source）⇒ 前置条件为 open。
         const result = await perform({
           clueId: decision.clueId,
           to: "blocked",
@@ -209,7 +246,7 @@ export async function runWrite(
     writes,
     skipped,
     casResults,
-    pendingSpawns,
+    spawns,
     spawnCalls,
   };
 }
@@ -228,7 +265,7 @@ export interface RunWriteOutcome {
   decisions: Decision[];
   writes: number;
   skipped: number;
-  pendingSpawns: { clueId: string; runId: string }[];
+  spawns: SpawnRecord[];
 }
 
 /**
@@ -259,8 +296,10 @@ export async function realCas(
 }
 
 /**
- * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写。
- * spawn dep 传显式 no-op（A8b 不 spawn，M9）。
+ * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写 + spawn。
+ * ⛔ CAS 一律走 A8b 的 `realCas`（不得绕过另写 CAS，spec §4.1 纪律 8）。
+ * spawn dep 为真实路径实现：CAS 成功后调用（带 role/runId）；本包真机验证只到「spawn 被调用」
+ * 为止，worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
  */
 export async function runChannelWrite(
   opts: RunWriteOptions,
@@ -276,7 +315,8 @@ export async function runChannelWrite(
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker: async () => {
-      // A8b no-op：spawn 属 A8c；这里不假装 spawn 成功，只记录待 spawn。
+      // 真实 spawn 动作：A8c 只证明「CAS 成功 ⇒ spawn 被调用」（带 role/runId）。
+      // worker 实际产出需注册 worker.result.v1（属 V1，本包不注册，spec §6/§7）。
     },
   };
   const result = await runWrite(
@@ -290,7 +330,7 @@ export async function runChannelWrite(
     decisions,
     writes: result.writes,
     skipped: result.skipped,
-    pendingSpawns: result.pendingSpawns,
+    spawns: result.spawns,
   };
 }
 

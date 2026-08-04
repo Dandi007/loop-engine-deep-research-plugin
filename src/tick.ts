@@ -18,6 +18,43 @@ export const SOURCE_ENUM = [
   "web-search",
 ] as const;
 
+/**
+ * A8c —— R1a 的 4 个 worker role 的 sources→role 映射（spec §1.2）。
+ * ⛔ `web` 暂无对应 role（`dr-worker-web` 未做，spec §4.3 机制未定）；
+ *    枚举内但无 role 的 source（如 `web` / `web-search`）⇒ 卡 blocked，不得派给别的 role。
+ */
+export const SOURCE_TO_ROLE: Record<string, string> = {
+  "code-local": "dr-worker-code-local",
+  "code-remote": "dr-worker-code-remote",
+  "wiki": "dr-worker-wiki",
+  "feishu": "dr-worker-feishu",
+};
+
+/** `web` source 的识别 token（spec §1.2：枚举内但暂无 role）。 */
+export const WEB_SOURCE = "web";
+
+/** `web` 卡 blocked 时的明确 rationale（N7：非空）。 */
+export const WEB_BLOCK_RATIONALE =
+  "source 'web' has no worker role (dr-worker-web not implemented; spec §4.3 mechanism undecided)";
+
+/** `web` 是否出现在 sources 中（spec §1.2：必须走 blocked 分支，不得静默跳过/派给别的 role）。 */
+export function isWebSource(sources: string[]): boolean {
+  return sources.includes(WEB_SOURCE);
+}
+
+/**
+ * 把 clue 的 `sources` 映射到唯一 role（spec §1.2）。
+ * 命中任一已映射 source 即返回其 role；无任何已映射 source（如 `web` / `web-search`）⇒ null，
+ * 由调用方决定该卡 blocked。⛔ 不得把一个无 role 的 source 静默派给别的 role。
+ */
+export function roleForSources(sources: string[]): string | null {
+  for (const s of sources) {
+    const role = SOURCE_TO_ROLE[s];
+    if (role) return role;
+  }
+  return null;
+}
+
 /** 参数全部来自 spec §3.4，不得硬编码在逻辑里（spec §6）。 */
 export interface TickConfig {
   /** K：triage 触发阈值 */
@@ -70,8 +107,12 @@ export interface BoardState {
 /** 决策——纯函数输出，副作用执行权归 runTick。 */
 export type Decision =
   | { kind: "reclaim"; clueId: string; to: ClueV2["status"]; retries: number }
-  | { kind: "dispatch"; clueId: string }
-  | { kind: "block"; clueId: string; reason: "invalid_sources" }
+  | { kind: "dispatch"; clueId: string; role: string }
+  | {
+      kind: "block";
+      clueId: string;
+      reason: "invalid_sources" | "web_unimplemented" | "unmapped_source";
+    }
   | { kind: "triage" };
 
 /** CAS 结果（与 bus 层语义对齐：conflict = 别人抢先）。 */
@@ -84,7 +125,7 @@ export interface CasDecision {
 export interface TickDeps {
   readBoard(): Promise<BoardState>;
   cas(clueId: string, to: ClueV2["status"], retries?: number): Promise<CasDecision>;
-  spawnWorker(clueId: string): Promise<void>;
+  spawnWorker(clueId: string, role: string, runId?: string): Promise<void>;
   spawnTriage(): Promise<void>;
 }
 
@@ -131,12 +172,27 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
   let dispatched = 0;
   for (const card of open) {
     if (dispatched >= n) break;
+    if (isWebSource(card.sources)) {
+      // V5 mutation: web goes normal dispatch instead of blocked.
+      decisions.push({
+        kind: "block",
+        clueId: card.clueId,
+        reason: "web_unimplemented",
+      });
+      continue;
+    }
     if (!isValidSources(card.sources)) {
-      // 枚举外取值 → 该卡 blocked，研究继续，不整体停机。
+      // V6 mutation: out-of-enum silently skipped instead of blocked.
       decisions.push({ kind: "block", clueId: card.clueId, reason: "invalid_sources" });
       continue;
     }
-    decisions.push({ kind: "dispatch", clueId: card.clueId });
+    const role = roleForSources(card.sources);
+    if (!role) {
+      // 枚举内但无任何已映射 role 的 source（如 `web-search`）⇒ blocked（不 spawn）。
+      decisions.push({ kind: "block", clueId: card.clueId, reason: "unmapped_source" });
+      continue;
+    }
+    decisions.push({ kind: "dispatch", clueId: card.clueId, role });
     dispatched += 1;
   }
 
@@ -247,7 +303,7 @@ export async function runTick(deps: TickDeps, cfg: TickConfig = DEFAULT_TICK_CON
           break;
         }
         try {
-          await deps.spawnWorker(decision.clueId);
+          await deps.spawnWorker(decision.clueId, decision.role);
         } catch {
           // CAS 成功但 spawn 同步失败 → 当场 CAS 回 open。
           await deps.cas(decision.clueId, "open");

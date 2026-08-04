@@ -38,12 +38,12 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
-  ... --run <channel_id> [--max-writes <n>]  写侧：执行 reclaim/dispatch/block 的 CAS，exit 0
+  ... --run <channel_id> [--max-writes <n>]  写侧：CAS + spawn（reclaim/dispatch/block），exit 0
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
---run 对显式传入的 channel 执行 CAS 认领/回收（不 spawn）；单次写入上限默认 5（--max-writes）；
-     拒绝写 v1 冻结 channel；真实启动（连 bus 跑完整 tick）属 V1，不在本包范围。
+--run 对显式传入的 channel 执行 CAS 认领/回收 + spawn（接线判别）：先 CAS 成功才按 role spawn，
+     spawn 同步失败当场 CAS 回 open；单次写入上限默认 5（--max-writes）；拒绝写 v1 冻结 channel。
 `;
 
 interface SelfCheckOutput {

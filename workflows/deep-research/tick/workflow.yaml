@@ -8,3 +8,4 @@ seed:
     harness: sh
     payload:
       tick_entry: "{{tick_entry}}"
+      tick_channel: "{{tick_channel}}"

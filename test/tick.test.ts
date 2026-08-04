@@ -7,6 +7,10 @@ import {
   isValidSources,
   DEFAULT_TICK_CONFIG,
   SOURCE_ENUM,
+  roleForSources,
+  SOURCE_TO_ROLE,
+  WEB_BLOCK_RATIONALE,
+  isWebSource,
 } from "../src/tick";
 import type {
   BoardState,
@@ -190,7 +194,11 @@ describe("B7: concurrency cap applies", () => {
     const d = decideTick(s, cfg);
     const dispatched = d.filter((x) => x.kind === "dispatch");
     expect(dispatched).toHaveLength(1);
-    expect(dispatched[0]).toEqual({ kind: "dispatch", clueId: "open_0" });
+    expect(dispatched[0]).toEqual({
+      kind: "dispatch",
+      clueId: "open_0",
+      role: "dr-worker-code-local",
+    });
   });
 });
 
@@ -257,5 +265,78 @@ describe("source enum sanity", () => {
       "feishu",
       "web-search",
     ]);
+  });
+});
+
+// ── N6：枚举外 sources ⇒ 该卡 blocked，不 spawn ────────────────────
+
+describe("N6: out-of-enum sources ⇒ card blocked, no dispatch", () => {
+  it("open card with out-of-enum source ⇒ block(invalid_sources), not dispatched", () => {
+    const s = state({ cards: [card({ clueId: "bad", status: "open", sources: ["not-a-source"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([
+      { kind: "block", clueId: "bad", reason: "invalid_sources" },
+    ]);
+    expect(d.some((x) => x.kind === "dispatch")).toBe(false);
+  });
+});
+
+// ── N7：sources 含 web ⇒ blocked 且 rationale 非空，不 spawn（与 N6 分开）──
+
+describe("N7: sources contains web ⇒ blocked with non-empty rationale, no dispatch", () => {
+  it("open card with sources ['web'] ⇒ block(web_unimplemented), no dispatch", () => {
+    expect(isWebSource(["web"])).toBe(true);
+    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([
+      { kind: "block", clueId: "w", reason: "web_unimplemented" },
+    ]);
+    expect(d.some((x) => x.kind === "dispatch")).toBe(false);
+  });
+
+  it("WEB_BLOCK_RATIONALE is non-empty and explicit", () => {
+    expect(typeof WEB_BLOCK_RATIONALE).toBe("string");
+    expect(WEB_BLOCK_RATIONALE.length).toBeGreaterThan(0);
+    expect(WEB_BLOCK_RATIONALE).toMatch(/web/);
+  });
+});
+
+// ── N8：role 映射正确（四条各一例）────────────────────────────────
+
+describe("N8: sources→role mapping is correct for the four roles", () => {
+  it("code-local → dr-worker-code-local", () => {
+    expect(roleForSources(["code-local"])).toBe("dr-worker-code-local");
+  });
+  it("code-remote → dr-worker-code-remote", () => {
+    expect(roleForSources(["code-remote"])).toBe("dr-worker-code-remote");
+  });
+  it("wiki → dr-worker-wiki", () => {
+    expect(roleForSources(["wiki"])).toBe("dr-worker-wiki");
+  });
+  it("feishu → dr-worker-feishu", () => {
+    expect(roleForSources(["feishu"])).toBe("dr-worker-feishu");
+  });
+  it("SOURCE_TO_ROLE contains exactly the four roles", () => {
+    expect(Object.keys(SOURCE_TO_ROLE).sort()).toEqual([
+      "code-local",
+      "code-remote",
+      "feishu",
+      "wiki",
+    ]);
+  });
+  it("dispatch decision carries the mapped role", () => {
+    const s = state({ cards: [card({ clueId: "a", status: "open", sources: ["wiki"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([{ kind: "dispatch", clueId: "a", role: "dr-worker-wiki" }]);
+  });
+});
+
+describe("no-role enum member (web-search) ⇒ blocked (unmapped_source)", () => {
+  it("web-search is in-enum but has no role ⇒ block, no dispatch", () => {
+    expect(roleForSources(["web-search"])).toBeNull();
+    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web-search"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([{ kind: "block", clueId: "w", reason: "unmapped_source" }]);
+    expect(d.some((x) => x.kind === "dispatch")).toBe(false);
   });
 });

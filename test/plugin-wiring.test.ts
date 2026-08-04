@@ -157,3 +157,24 @@ describe("G11 running evidence is written under docs/dev-notes", () => {
     expect(existsSync(join(ROOT, "IMPLEMENTATION_SUMMARY.md"))).toBe(false);
   });
 });
+
+// ── N9：节点模板已切到真实 tick 入口，且 --selfcheck 仍保留 ──
+
+describe("N9 template switched to real tick entry, selfcheck preserved", () => {
+  it("tick.md invokes --run (real entry) and still references --selfcheck", () => {
+    const tpl = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md"),
+      "utf8",
+    );
+    // 新入口：真实 tick 用 --run。
+    expect(tpl).toMatch(/\-\-run/);
+    // --selfcheck 仍保留（A7 G6/G7 需要它做无副作用自检）。
+    expect(tpl).toMatch(/\-\-selfcheck/);
+  });
+
+  it("--selfcheck still exits 0 with a self-check (no side effects)", () => {
+    const out = run([join(ROOT, "bin", "tick-entry.sh"), "--selfcheck"]);
+    const obj = JSON.parse(out);
+    expect(obj.ok).toBe(true);
+  });
+});

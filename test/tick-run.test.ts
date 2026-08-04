@@ -184,7 +184,9 @@ describe("M7: dispatch CAS success writes run_id into card", () => {
       },
       spawnWorker: vi.fn(async () => {}),
     };
-    const decisions: Decision[] = [{ kind: "dispatch", clueId: "x" }];
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "x", role: "dr-worker-code-local" },
+    ];
     await runWrite(deps, decisions, 5);
     expect(captured).toHaveLength(1);
     expect(captured[0].to).toBe("in_flight");
@@ -347,35 +349,45 @@ describe("M8: CAS conflict skips the card", () => {
       },
       spawnWorker,
     };
-    const decisions: Decision[] = [{ kind: "dispatch", clueId: "x" }];
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "x", role: "dr-worker-code-local" },
+    ];
     const result = await runWrite(deps, decisions, 5);
     expect(casInputs).toHaveLength(1);
     expect(result.skipped).toBe(1);
-    expect(result.pendingSpawns).toHaveLength(0);
+    expect(result.spawns).toHaveLength(0);
     expect(spawnWorker).toHaveBeenCalledTimes(0);
   });
 });
 
-// ── M9：本包不 spawn，注入的 spawn dep 是 no-op 且被记录 ──────────
+// ── M9：A8c 真正 spawn —— CAS 成功后按 role/runId 调用 spawn dep ──
 
-describe("M9: no spawn — injected spawn dep is no-op and recorded", () => {
-  it("spawn dep called 0 times yet pendingSpawns records the dispatch", async () => {
-    const spawnWorker = vi.fn(async () => {});
+describe("M9: spawn after CAS success with role/runId", () => {
+  it("two successful dispatches spawn twice with role+runId, recorded in spawns", async () => {
+    const spawnCalls: Array<[string, string, string]> = [];
+    const spawnWorker = vi.fn(async (clueId: string, role: string, runId: string) => {
+      spawnCalls.push([clueId, role, runId]);
+    });
     const deps: WriteDeps = {
       cas: async () => ({ success: true }),
       spawnWorker,
     };
     const decisions: Decision[] = [
-      { kind: "dispatch", clueId: "a" },
-      { kind: "dispatch", clueId: "b" },
+      { kind: "dispatch", clueId: "a", role: "dr-worker-wiki" },
+      { kind: "dispatch", clueId: "b", role: "dr-worker-feishu" },
     ];
     const result = await runWrite(deps, decisions, 5);
-    // 安全性：spawn dep 一次都没被调用
-    expect(spawnWorker).toHaveBeenCalledTimes(0);
-    // 活性：两个 dispatch 都被登记为待 spawn
-    expect(result.pendingSpawns).toHaveLength(2);
-    expect(result.pendingSpawns.map((p) => p.clueId)).toEqual(["a", "b"]);
-    expect(result.spawnCalls).toBe(0);
+    // 活性：两个 dispatch 都真正 spawn 了
+    expect(spawnWorker).toHaveBeenCalledTimes(2);
+    expect(spawnCalls[0][0]).toBe("a");
+    expect(spawnCalls[0][1]).toBe("dr-worker-wiki");
+    expect(spawnCalls[0][2]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(spawnCalls[1][0]).toBe("b");
+    expect(spawnCalls[1][1]).toBe("dr-worker-feishu");
+    expect(result.spawns).toHaveLength(2);
+    expect(result.spawns.map((p) => p.clueId)).toEqual(["a", "b"]);
+    expect(result.spawns.every((p) => p.spawned === true)).toBe(true);
+    expect(result.spawnCalls).toBe(2);
   });
 });
 
@@ -444,5 +456,175 @@ describe("M12: refuse writes to v1 frozen channels, zero requests", () => {
       runChannelWrite({ channelId: "research:loop-mcp-semantics.index" }),
     ).rejects.toBeInstanceOf(FrozenChannelError);
     expect(fetchCalls).toBe(0);
+  });
+});
+
+// ── A8c §1.1 接线判别：W1/W2 只差 board:agent-runs 的内容 ──────────
+//
+// 打桩 HTTP 层：clue channel 返回完全相同（同一条 in_flight 卡，run_id=run-1），
+// 唯一差别是 `board:agent-runs` channel 返回的内容（W1：有 started；W2：空）。
+// 这就是「两个只差一项输入的用例才构成判别性证据」（spec §4.1 第 7 条）。
+
+const WIRE_CLUE_CHANNEL = "research:p02-smoke-1dce60";
+
+const wireClueMsg = {
+  message_id: "msg_clue_1",
+  channel_id: WIRE_CLUE_CHANNEL,
+  channel_seq: 1,
+  kind: "research.clue.v2",
+  payload: {
+    status: "in_flight",
+    text: "t",
+    depth: 0,
+    sources: ["code-local"],
+    run_id: "run-1",
+  },
+  entity_id: "clue_x",
+  supersedes: null,
+  created_at: "2026-01-01T00:00:00Z",
+};
+
+const wireEntityHead = { ...wireClueMsg, message_id: "msg_clue_1" };
+
+function wiringStub(
+  runsMessages: unknown[],
+  publishes: Array<Record<string, unknown>>,
+  runsResponses: number[],
+): void {
+  let clueCalls = 0;
+  let runsCalls = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) {
+        return jsonResponse({ head: wireEntityHead });
+      }
+      if (u.includes("/publish")) {
+        publishes.push(JSON.parse(String(init?.body)));
+        return jsonResponse({ message_id: `p_${publishes.length}`, channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+        clueCalls += 1;
+        return jsonResponse({ messages: clueCalls === 1 ? [wireClueMsg] : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        runsCalls += 1;
+        runsResponses.push(runsMessages.length);
+        return jsonResponse({ messages: runsCalls === 1 ? runsMessages : [] });
+      }
+      return jsonResponse({ messages: [] });
+    }),
+  );
+}
+
+describe("N1: W1 — bus has agent.run.started ⇒ no reclaim, no CAS", () => {
+  it("only difference from N2 is board:agent-runs containing a started event", async () => {
+    const publishes: Array<Record<string, unknown>> = [];
+    const runsResponses: number[] = [];
+    wiringStub(
+      [
+        {
+          message_id: "run_started_1",
+          channel_id: "board:agent-runs",
+          channel_seq: 1,
+          kind: "agent.run.started.v1",
+          payload: { run_id: "run-1" },
+          entity_id: "run-1",
+          supersedes: null,
+          created_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+      publishes,
+      runsResponses,
+    );
+    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+    // 板上有 started ⇒ 不 reclaim、不发 CAS（N1：assert CAS 调用 0 次）。
+    expect(publishes).toHaveLength(0);
+    expect(outcome.writes).toBe(0);
+    expect(outcome.spawns).toHaveLength(0);
+    // 判别性核验：runs 读确实返回了 1 条（非空），与 N2 不同。
+    expect(runsResponses[0]).toBe(1);
+  });
+});
+
+describe("N2: W2 — no started ⇒ reclaim→open and CAS", () => {
+  it("only difference from N1 is board:agent-runs empty", async () => {
+    const publishes: Array<Record<string, unknown>> = [];
+    const runsResponses: number[] = [];
+    wiringStub([], publishes, runsResponses);
+    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+    // 无 started ⇒ reclaim→open，恰好一次 to=open 的 CAS。
+    expect(publishes).toHaveLength(1);
+    const body = publishes[0].payload as Record<string, unknown>;
+    expect(body.status).toBe("open");
+    expect(outcome.writes).toBe(1);
+    // 判别性核验：runs 读确实返回了 0 条（空），与 N1 不同。
+    expect(runsResponses[0]).toBe(0);
+  });
+});
+
+// ── N3/N4/N5：spawn 接线（runWrite 层，注入依赖）─────────────────
+
+describe("N3: CAS success ⇒ spawn called once with clueId/role/runId", () => {
+  it("spawnWorker receives the mapped role and the generated runId", async () => {
+    const spawnWorker = vi.fn(async () => {});
+    const deps: WriteDeps = {
+      cas: async () => ({ success: true }),
+      spawnWorker,
+    };
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "x", role: "dr-worker-code-local" },
+    ];
+    const result = await runWrite(deps, decisions, 5);
+    expect(spawnWorker).toHaveBeenCalledTimes(1);
+    const [clueId, role, runId] = spawnWorker.mock.calls[0] as unknown as [string, string, string];
+    expect(clueId).toBe("x");
+    expect(role).toBe("dr-worker-code-local");
+    expect(runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(result.spawns).toHaveLength(1);
+    expect(result.spawns[0].spawned).toBe(true);
+  });
+});
+
+describe("N4: CAS conflict (409) ⇒ spawn called 0 times", () => {
+  it("dispatch CAS conflict ⇒ no spawn", async () => {
+    const spawnWorker = vi.fn(async () => {});
+    const deps: WriteDeps = {
+      cas: async () => ({ success: false, error: "conflict" }),
+      spawnWorker,
+    };
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "x", role: "dr-worker-code-local" },
+    ];
+    const result = await runWrite(deps, decisions, 5);
+    expect(spawnWorker).toHaveBeenCalledTimes(0);
+    expect(result.spawns).toHaveLength(0);
+    expect(result.skipped).toBe(1);
+  });
+});
+
+describe("N5: spawn sync throw ⇒ immediate CAS back to open", () => {
+  it("after spawn throws, a to=open CAS (from in_flight) is performed", async () => {
+    const casInputs: WriteCasInput[] = [];
+    const deps: WriteDeps = {
+      cas: async (input) => {
+        casInputs.push(input);
+        return { success: true };
+      },
+      spawnWorker: async () => {
+        throw new Error("spawn failed");
+      },
+    };
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "x", role: "dr-worker-code-local" },
+    ];
+    const result = await runWrite(deps, decisions, 5);
+    // 第一次 CAS：open→in_flight；第二次 CAS：in_flight→open（回滚）。
+    expect(casInputs).toHaveLength(2);
+    expect(casInputs[0]).toMatchObject({ clueId: "x", to: "in_flight", from: "open" });
+    expect(casInputs[1]).toMatchObject({ clueId: "x", to: "open", from: "in_flight" });
+    expect(result.spawns).toHaveLength(1);
+    expect(result.spawns[0].spawned).toBe(false);
   });
 });

@@ -1,0 +1,10 @@
+limits: { max_nodes: 1, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+harness:
+  sh: { runtime: bash, write: false }
+seed:
+  - identity: tick
+    mode: fresh
+    template: tick
+    harness: sh
+    payload:
+      tick_entry: "{{tick_entry}}"

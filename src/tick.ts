@@ -28,6 +28,10 @@ export interface TickConfig {
   maxDepth: number;
   /** 重试上限 */
   maxRetries: number;
+  /** 最大 clue 数（条件 2：count(clue) >= maxClues 即触顶） */
+  maxClues: number;
+  /** 零增长轮数阈值（条件 1：zeroGrowthRounds >= 阈值） */
+  zeroGrowthThreshold: number;
 }
 
 export const DEFAULT_TICK_CONFIG: TickConfig = {
@@ -35,6 +39,8 @@ export const DEFAULT_TICK_CONFIG: TickConfig = {
   maxConcurrentWorkers: 4,
   maxDepth: 3,
   maxRetries: 2,
+  maxClues: 64,
+  zeroGrowthThreshold: 2,
 };
 
 /** agent.run.* 事件（spec §3）——「worker 死没死」由 exited 变为被观察到的事实。 */
@@ -141,6 +147,72 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
   }
 
   return decisions;
+}
+
+/** 终态封闭枚举：三值互斥可判别（spec §3.1 / §3.4）。 */
+export const TERMINAL_STATES = ["converged", "capped", "partial"] as const;
+export type TerminalState = (typeof TERMINAL_STATES)[number];
+
+/** 终止判定的纯输入。 */
+export interface TerminationInput {
+  cards: BoardCard[];
+  /** 有 ≥1 条 evidence 的 clue_id 全集（内部去重）。 */
+  coveredClueIds: string[];
+  /** 上一 tick 的覆盖值（用于零增长判定）。 */
+  prevCoverage: number;
+  /** 上一 tick 结束时的零增长轮数。 */
+  prevZeroGrowthRounds: number;
+}
+
+/** 终止判定的纯输出。state 为 null 表示继续，未终止。 */
+export interface TerminationState {
+  state: TerminalState | null;
+  coverage: number;
+  zeroGrowthRounds: number;
+}
+
+/** 覆盖度 = 有至少一条 evidence 的 clue_id 的集合大小（spec §2，非 evidence 条数）。 */
+export function computeCoverage(coveredClueIds: string[]): number {
+  return new Set(coveredClueIds).size;
+}
+
+/**
+ * 纯函数：算覆盖 → 判终止 → 给可区分终态（spec §3.2/§3.4）。
+ * 不碰 IO：无时钟 / 无随机 / 无网络 / 不 import ./bus（spec B1）。
+ *
+ * 终止性（spec §4）：每个 tick 使 zeroGrowthRounds 在零增长时严格单增，
+ * 或由条件 2/3 触顶，二者之一有上界，保证可终止。
+ */
+export function decideTermination(
+  input: TerminationInput,
+  cfg: TickConfig,
+): TerminationState {
+  const coverage = computeCoverage(input.coveredClueIds);
+  const zeroGrowthRounds =
+    coverage > input.prevCoverage ? 0 : input.prevZeroGrowthRounds + 1;
+
+  const count = input.cards.length;
+  const maxDepth = input.cards.reduce((m, c) => Math.max(m, c.depth), 0);
+  const inFlight = input.cards.filter((c) => c.status === "in_flight").length;
+  const proposed = input.cards.filter((c) => c.status === "proposed").length;
+  const blocked = input.cards.filter((c) => c.status === "blocked").length;
+
+  // 条件 2/3：触顶 → 终态 capped（触顶 ≠ 收敛，报告不得宣称完备，§3.1）。
+  const capped = count >= cfg.maxClues || maxDepth >= cfg.maxDepth;
+
+  let state: TerminalState | null = null;
+  if (capped) {
+    state = "capped";
+  } else if (
+    zeroGrowthRounds >= cfg.zeroGrowthThreshold &&
+    inFlight === 0 &&
+    proposed === 0
+  ) {
+    // 条件 1：零增长达标且无在途/proposed。blocked>0 一律降级为 partial（§3.2）。
+    state = blocked > 0 ? "partial" : "converged";
+  }
+
+  return { state, coverage, zeroGrowthRounds };
 }
 
 /**

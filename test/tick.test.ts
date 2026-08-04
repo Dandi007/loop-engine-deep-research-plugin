@@ -48,7 +48,7 @@ describe("B1: decideTick is a pure function", () => {
     const source = readFileSync(srcPath, "utf-8");
     expect(source).not.toMatch(/from\s+["']\.\/bus["']/);
     expect(source).not.toMatch(/fetch\s*\(/);
-    expect(source).not.toMatch(/new\s+Date\b/);
+    expect(source).not.toMatch(/\bDate\b/);
     expect(source).not.toMatch(/Math\.random/);
   });
 });

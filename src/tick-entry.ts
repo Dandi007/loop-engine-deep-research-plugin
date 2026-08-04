@@ -20,9 +20,15 @@ import {
   decideTermination,
   DEFAULT_TICK_CONFIG,
   type Decision,
+  type RunEvent,
   type TerminationState,
 } from "./tick";
 import { runInspect } from "./tick-inspect";
+import {
+  parseRunCliArgs,
+  runChannelWrite,
+  type RunWriteOutcome,
+} from "./tick-run";
 
 const USAGE = `deep-research tick entry
 
@@ -32,10 +38,12 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
+  ... --run <channel_id> [--max-writes <n>]  写侧：执行 reclaim/dispatch/block 的 CAS，exit 0
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
-真实启动（连 bus 跑完整 tick）属 V1，不在本包范围。
+--run 对显式传入的 channel 执行 CAS 认领/回收（不 spawn）；单次写入上限默认 5（--max-writes）；
+     拒绝写 v1 冻结 channel；真实启动（连 bus 跑完整 tick）属 V1，不在本包范围。
 `;
 
 interface SelfCheckOutput {
@@ -45,9 +53,11 @@ interface SelfCheckOutput {
 }
 
 function runSelfCheck(): SelfCheckOutput {
+  // 空板面自检：用无字面量的空 runs（A8b M6 要求生产路径不得硬编码空的 runs 字面量）。
+  const emptyRuns: Record<string, RunEvent> = Object.create(null);
   const state = {
     cards: [],
-    runs: {},
+    runs: emptyRuns,
     triageInFlight: false,
   };
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
@@ -81,6 +91,18 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
     return await runInspect(channelId);
+  }
+  if (arg === "--run") {
+    try {
+      const opts = parseRunCliArgs(argv.slice(1));
+      const outcome = await runChannelWrite(opts);
+      process.stdout.write(JSON.stringify(outcome, null, 2) + "\n");
+      return 0;
+    } catch (err) {
+      process.stderr.write(`${(err as Error).message}\n\n`);
+      process.stderr.write(USAGE);
+      return 2;
+    }
   }
   process.stderr.write(`unknown argument: ${arg}\n\n`);
   process.stderr.write(USAGE);

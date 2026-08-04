@@ -83,7 +83,7 @@ describe("H1: version chain taken by head", () => {
       clueMsg(2, "e1", { status: "in_flight", depth: 0, sources: [] }),
       clueMsg(3, "e1", { status: "explored", depth: 0, sources: [] }),
     ];
-    const a = assembleBoard(msgs);
+    const a = assembleBoard(msgs, {});
     expect(a.cards).toHaveLength(1);
     expect(a.clueEntities).toBe(1);
     expect(a.cards[0].status).toBe("explored");
@@ -97,7 +97,7 @@ describe("H2: v1 messages explicitly skipped and counted", () => {
       v1Msg(2, "research.finding.v1"),
       clueMsg(3, "e2", { status: "open", depth: 0, sources: [] }),
     ];
-    const a = assembleBoard(msgs);
+    const a = assembleBoard(msgs, {});
     expect(a.skippedV1).toBe(2);
     expect(a.cards).toHaveLength(1);
     expect(a.cards[0].clueId).toBe("e2");
@@ -129,7 +129,7 @@ describe("H3: paginated read until empty", () => {
 describe("H4: coverage is unique clue_id set size", () => {
   it("two evidence with the same clue_id → coverage 1", () => {
     const msgs = [evMsg(1, "c1"), evMsg(2, "c1")];
-    const a = assembleBoard(msgs);
+    const a = assembleBoard(msgs, {});
     expect(a.coveredClueIds).toEqual(["c1"]);
     expect(a.coverage).toBe(1);
   });
@@ -201,7 +201,7 @@ describe("H10: terminal state any value → exit 0", () => {
       first = false;
       return jsonResponse({ messages: cur });
     });
-    const out = computeInspect("research:test", msgs);
+    const out = computeInspect("research:test", msgs, {});
     expect(out.termination.state).toBe("capped");
     const code = await runInspect("research:test", () => {});
     expect(code).toBe(0);
@@ -214,10 +214,10 @@ describe("H10: terminal state any value → exit 0", () => {
   });
 
   it("computeInspect carries termination state through the same exit-0 path", () => {
-    const nullOut = computeInspect("research:test", []);
+    const nullOut = computeInspect("research:test", [], {});
     const cappedOut = computeInspect("research:test", [
       clueMsg(1, "e1", { status: "explored", depth: 3, sources: [] }),
-    ]);
+    ], {});
     expect([nullOut.termination.state, cappedOut.termination.state]).toEqual([null, "capped"]);
   });
 });

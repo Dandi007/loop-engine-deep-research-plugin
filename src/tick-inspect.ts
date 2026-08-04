@@ -16,6 +16,7 @@ import {
   type BoardCard,
   type BoardState,
   type Decision,
+  type RunEvent,
   type TerminationInput,
   type TerminationState,
 } from "./tick";
@@ -53,12 +54,19 @@ export interface InspectAssembled {
  * 纯函数：把原始消息数组组装成 BoardState / TerminationInput（spec §1 step 2–4）。
  * 不碰 IO，可直接喂消息数组做 H1/H2/H4 断言。
  *
+ * ⛔ A8b：`runs` 不再硬编码为空——由调用方从 `board:agent-runs` 真实读取后传入
+ * （spec §1.1），本函数只负责组装，不产生空的 runs 字面量。
+ *
  * 规则：
  *   1. research.*.v1 消息 → 显式跳过并计数（skippedV1），不得当成 v2 解析。
- *   2. research.clue.v2 → 按 entity_id 取 channel_seq 最大的一条（版本链 head）。
+ *   2. research.clue.v2 → 按 entity_id 取 channel_seq 最大的一条（版本链 head）；
+ *      卡上的 `runId` 取 payload 的 `run_id`（引擎在 CAS 时写进卡，spec §1.1 退路）。
  *   3. research.evidence.v2 → 收集 payload.clue_id 为覆盖集合。
  */
-export function assembleBoard(messages: InspectMessage[]): InspectAssembled {
+export function assembleBoard(
+  messages: InspectMessage[],
+  runs: Record<string, RunEvent>,
+): InspectAssembled {
   let skippedV1 = 0;
   const clueHeads = new Map<string, InspectMessage>();
   const covered = new Set<string>();
@@ -89,13 +97,14 @@ export function assembleBoard(messages: InspectMessage[]): InspectAssembled {
       depth: p.depth,
       sources: p.sources,
       retries: 0,
+      runId: p.run_id ?? null,
     };
     cards.push(card);
     statusDistribution[p.status] = (statusDistribution[p.status] ?? 0) + 1;
   }
 
   const coveredClueIds = [...covered];
-  const state: BoardState = { cards, runs: {}, triageInFlight: false };
+  const state: BoardState = { cards, runs, triageInFlight: false };
   const termInput: TerminationInput = {
     cards,
     coveredClueIds,
@@ -149,8 +158,12 @@ export async function readChannelMessages(channelId: string): Promise<InspectMes
 }
 
 /** 组装 + 决策（纯逻辑，供 runInspect 与测试直接复用）。 */
-export function computeInspect(channelId: string, messages: InspectMessage[]): InspectOutput {
-  const a = assembleBoard(messages);
+export function computeInspect(
+  channelId: string,
+  messages: InspectMessage[],
+  runs: Record<string, RunEvent>,
+): InspectOutput {
+  const a = assembleBoard(messages, runs);
   const decisions = decideTick(a.state, DEFAULT_TICK_CONFIG);
   const termination = decideTermination(a.termInput, DEFAULT_TICK_CONFIG);
   return {
@@ -166,7 +179,55 @@ export function computeInspect(channelId: string, messages: InspectMessage[]): I
 }
 
 /**
- * 只读跑一次 --inspect：分页读 channel → 决策 → 打印 JSON → 返回 0。
+ * 从一条 `agent.run.*` 消息解析出 (run_id, RunEvent)。
+ * kind 形如 `agent.run.started.v1` / `agent.run.exited.v1`，run_id 在 payload；
+ * 兼容 run_id 直接拼在 kind 后缀的形态（spec §1.1：按 run_id 归集）。
+ * 非 `agent.run.*` 消息返回 null（跳过）。
+ */
+export function parseRunEvent(
+  msg: InspectMessage,
+): { runId: string; event: RunEvent } | null {
+  const m = /^agent\.run\.(started|exited)(?:\.(.*))?$/.exec(msg.kind);
+  if (!m) return null;
+  const state = m[1] as "started" | "exited";
+  const suffixRunId = m[2];
+  const payload = (msg.payload ?? {}) as Record<string, unknown>;
+  const payloadRunId =
+    typeof payload.run_id === "string" ? payload.run_id : undefined;
+  // 优先 payload 的 run_id（真实 bus kind 为 `agent.run.started.v1`，后缀是协议版本）；
+  // 仅当 payload 无 run_id 时才退到 kind 后缀（兼容 `agent.run.started.<run_id>` 形态）。
+  const runId = payloadRunId || suffixRunId;
+  if (!runId) return null;
+  const exitCode =
+    state === "exited" && typeof payload.exit_code === "number"
+      ? payload.exit_code
+      : undefined;
+  return {
+    runId,
+    event: exitCode !== undefined ? { state, exitCode } : { state },
+  };
+}
+
+/**
+ * A8b —— 真实 `runs`：分页读 `board:agent-runs`，按 run_id 归集
+ * `agent.run.started.*` / `agent.run.exited.*`（spec §1.1）。
+ * 同一 run_id 多事件取最后一次（分页返回最早在前，后来的覆盖）。
+ * ⛔ 不硬编码空的 runs 字面量。
+ */
+export async function readAgentRuns(
+  channelId = "board:agent-runs",
+): Promise<Record<string, RunEvent>> {
+  const messages = await readChannelMessages(channelId);
+  const runs: Record<string, RunEvent> = {};
+  for (const msg of messages) {
+    const parsed = parseRunEvent(msg);
+    if (parsed) runs[parsed.runId] = parsed.event;
+  }
+  return runs;
+}
+
+/**
+ * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */
 export async function runInspect(
@@ -174,7 +235,8 @@ export async function runInspect(
   write: (s: string) => void = (s) => process.stdout.write(s),
 ): Promise<number> {
   const messages = await readChannelMessages(channelId);
-  const output = computeInspect(channelId, messages);
+  const runs = await readAgentRuns();
+  const output = computeInspect(channelId, messages, runs);
   write(JSON.stringify(output, null, 2) + "\n");
   return 0;
 }

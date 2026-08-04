@@ -4,6 +4,7 @@
  * 所有 mutation 必带 idempotency_key（否则 400）。
  * 读写 agent-bus 的 HTTP API (127.0.0.1:7490)。
  */
+import { readFileSync } from "node:fs";
 import type { ClueV2, EvidenceV2, DocV2 } from "./protocol";
 
 const BASE_URL = "http://127.0.0.1:7490";
@@ -12,10 +13,8 @@ const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 let _cachedToken: string | null = null;
 
 function token(): string {
-  if (!_cachedToken) {
-    _cachedToken = require("node:fs")
-      .readFileSync(TOKEN_PATH, "utf-8")
-      .trim();
+  if (_cachedToken === null) {
+    _cachedToken = readFileSync(TOKEN_PATH, "utf-8").trim();
   }
   return _cachedToken;
 }
@@ -33,7 +32,11 @@ async function busFetch(
   const resp = await fetch(url, { ...options, headers });
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`bus ${options.method ?? "GET"} ${path}: ${resp.status} ${body.slice(0, 200)}`);
+    const err = new Error(
+      `bus ${options.method ?? "GET"} ${path}: ${resp.status} ${body.slice(0, 200)}`,
+    ) as Error & { status: number };
+    err.status = resp.status;
+    throw err;
   }
   return resp;
 }
@@ -50,6 +53,7 @@ interface BusMessage {
   supersedes: string | null;
   created_at: string;
 }
+export type { BusMessage };
 
 interface PublishRequest {
   kind: string;
@@ -74,7 +78,7 @@ export async function getMessages(
 ): Promise<BusMessage[]> {
   const params = new URLSearchParams();
   params.set("limit", String(opts.limit ?? 100));
-  if (opts.afterSeq) params.set("after_seq", String(opts.afterSeq));
+  if (opts.afterSeq !== undefined) params.set("after_seq", String(opts.afterSeq));
   const resp = await busFetch(
     `/v1/channels/${channelId}/messages?${params}`,
   );
@@ -87,8 +91,11 @@ export async function getEntity(entityId: string): Promise<BusMessage | null> {
   try {
     const resp = await busFetch(`/v1/entities/${entityId}`);
     return await resp.json();
-  } catch {
-    return null;
+  } catch (err: any) {
+    if (err?.status === 404) {
+      return null;
+    }
+    throw err;
   }
 }
 
@@ -187,11 +194,11 @@ export async function casUpdateClue(
     });
     return { success: true, messageId: result.message_id };
   } catch (err: any) {
-    const msg = err.message ?? "";
-    if (msg.includes("409")) {
+    const status = err?.status;
+    if (status === 409) {
       return { success: false, error: "conflict" };
     }
-    if (msg.includes("400") || msg.includes("422")) {
+    if (status === 400 || status === 422) {
       return { success: false, error: "invalid_payload" };
     }
     throw err;

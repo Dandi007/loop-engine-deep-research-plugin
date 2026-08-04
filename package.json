@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:cas": "tsx scripts/smoke-cas.ts"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

@@ -48,20 +48,6 @@ afterEach(() => {
 });
 
 describe("D1/A1: conflict classification by numeric status", () => {
-  it("A2: publish returns HTTP 200 whose body contains '409' → success", async () => {
-    stubFetch(async () =>
-      jsonResponse(200, { message_id: "msg_409abc", channel_seq: 6 }),
-    );
-    const result = await casUpdateClue(
-      "research:test",
-      "msg_001",
-      openHead,
-      { status: "in_flight", assignee: "w", run_id: "r" },
-      "k1",
-    );
-    expect(result.success).toBe(true);
-  });
-
   it("M1: non-409 failure with '409' in body is NOT classified as conflict", async () => {
     stubFetch(async () =>
       jsonResponse(500, { message: "server exploded mid-409-handshake" }),

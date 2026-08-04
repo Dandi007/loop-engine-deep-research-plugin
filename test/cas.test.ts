@@ -46,18 +46,29 @@ afterEach(() => {
 });
 
 describe("CAS claim against src/bus.ts", () => {
-  it("A6: same-source read — supersedes equals the read head's message_id", async () => {
+  it("A6: same-source read — supersedes equals the first read's message_id", async () => {
     const publishBodies: Array<Record<string, unknown>> = [];
+    let entityReads = 0;
+    // 第二次独立读返回一个「更先进」的 head（不同 message_id）。
+    // 若 casUpdateClue 的 supersedes 改成来自第二次独立读（M4），
+    // 这里就会读到 advancedHead → supersedes === "msg_002" → 断言失败。
+    const advancedHead = {
+      ...openHead,
+      message_id: "msg_002",
+      channel_seq: 6,
+      payload: { ...openHead.payload, status: "open" },
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
         if (u.includes("/entities/")) {
-          return jsonResponse(200, { head: openHead });
+          entityReads += 1;
+          return jsonResponse(200, { head: entityReads === 1 ? openHead : advancedHead });
         }
         if (u.includes("/publish")) {
           publishBodies.push(JSON.parse(String(init?.body)));
-          return jsonResponse(200, { message_id: "msg_002", channel_seq: 6 });
+          return jsonResponse(200, { message_id: "msg_003", channel_seq: 7 });
         }
         return jsonResponse(404, { message: "unexpected" });
       }),
@@ -74,12 +85,16 @@ describe("CAS claim against src/bus.ts", () => {
     expect(result.success).toBe(true);
     expect(publishBodies).toHaveLength(1);
     const publish = publishBodies[0];
-    // 前置条件与 supersedes 出自同一次读：supersedes 必须等于读到的 head.message_id
+    // 前置条件与 supersedes 出自同一次读：supersedes 必须等于第一次读到的 head.message_id，
+    // 且绝不得等于第二次独立读的 advancedHead.message_id。
     expect(publish.supersedes).toBe(openHead.message_id);
+    expect(publish.supersedes).not.toBe(advancedHead.message_id);
     expect(publish.entity_id).toBe("msg_001");
     expect((publish.payload as Record<string, unknown>).status).toBe("in_flight");
     expect((publish.payload as Record<string, unknown>).assignee).toBe("w-1");
     expect((publish.payload as Record<string, unknown>).run_id).toBe("run_002");
+    // 正确实现只读一次 head；若发生第二次独立读（M4），entityReads === 2 → 失败。
+    expect(entityReads).toBe(1);
   });
 
   it("CAS success returns messageId from the bus", async () => {

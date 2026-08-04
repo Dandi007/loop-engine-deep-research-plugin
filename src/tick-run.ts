@@ -26,7 +26,7 @@ import {
   readAgentRuns,
   readChannelMessages,
 } from "./tick-inspect";
-import { casUpdateClue, getEntity } from "./bus";
+import { casUpdateClue, getEntity, publish } from "./bus";
 
 /** --max-writes 默认值（spec §2：单次运行写入上限默认很小）。 */
 export const DEFAULT_MAX_WRITES = 5;
@@ -296,10 +296,34 @@ export async function realCas(
 }
 
 /**
+ * 真实 spawn 动作（spec §1.2 / A8c）：CAS 成功后在 `board:agent-runs` 上登记一次
+ * `agent.run.started`，把该 run_id 标记为已起。这是 spawn 的真实可观察效果——
+ * 下一次 tick 的 `readAgentRuns` 会读到它，从而不再把这张在飞卡 reclaim 回 open
+ * （堵掉 spec §0 的「open→in_flight、无 started、下轮回收」churn）。
+ *
+ * ⛔ spawn 本身写的是 run 生命周期 channel（board:agent-runs），不是 clue 板 channel，
+ *    不触碰 `--max-writes` 的 CAS 预算（spec §2：spawn 不计入写入预算）；
+ *    worker 的实际产出（worker.result.v1）属 V1，本包不注册（spec §7）。
+ */
+export async function spawnAgentRun(
+  runsChannelId: string,
+  clueId: string,
+  role: string,
+  runId: string,
+): Promise<void> {
+  await publish(runsChannelId, {
+    kind: "agent.run.started.v1",
+    payload: { run_id: runId, role, clue_id: clueId },
+    idempotency_key: `a8c-spawn:${runsChannelId}:${clueId}:${runId}`,
+    entity_id: runId,
+  });
+}
+
+/**
  * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写 + spawn。
  * ⛔ CAS 一律走 A8b 的 `realCas`（不得绕过另写 CAS，spec §4.1 纪律 8）。
- * spawn dep 为真实路径实现：CAS 成功后调用（带 role/runId）；本包真机验证只到「spawn 被调用」
- * 为止，worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
+ * spawn 为真实路径实现：CAS 成功后调用（带 role/runId）登记 agent.run.started（spec §1.2）；
+ * 本包真机验证只到「spawn 被调用」为止，worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
  */
 export async function runChannelWrite(
   opts: RunWriteOptions,
@@ -308,16 +332,15 @@ export async function runChannelWrite(
     throw new FrozenChannelError(opts.channelId);
   }
   const nonce = randomUUID();
+  const runsChannelId = opts.runsChannelId ?? "board:agent-runs";
   const messages = await readChannelMessages(opts.channelId);
-  const runs = await readAgentRuns(opts.runsChannelId ?? "board:agent-runs");
+  const runs = await readAgentRuns(runsChannelId);
   const state = assembleBoard(messages, runs).state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
-    spawnWorker: async () => {
-      // 真实 spawn 动作：A8c 只证明「CAS 成功 ⇒ spawn 被调用」（带 role/runId）。
-      // worker 实际产出需注册 worker.result.v1（属 V1，本包不注册，spec §6/§7）。
-    },
+    spawnWorker: (clueId, role, runId) =>
+      spawnAgentRun(runsChannelId, clueId, role, runId),
   };
   const result = await runWrite(
     deps,

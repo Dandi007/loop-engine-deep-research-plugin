@@ -628,3 +628,74 @@ describe("N5: spawn sync throw ⇒ immediate CAS back to open", () => {
     expect(result.spawns[0].spawned).toBe(false);
   });
 });
+
+// ── A8c §1.2 真实 spawn 动作：runChannelWrite 的 spawn 不是空操作 ──
+// 评审 finding 2（major）：runChannelWrite 之前注入 `spawnWorker: async () => {}`，
+// 真实 `--run` 认领卡到 in_flight 后什么都不做。这里证明真实路径的 spawn 会向
+// `board:agent-runs` 发布一条 `agent.run.started`（run_id/role/clue_id），
+// 使下一次 tick 读到 started 而不 reclaim 该在飞卡（堵掉 spec §0 churn）。
+
+describe("A8c real spawn publishes agent.run.started on the runs channel", () => {
+  it("dispatch CAS success ⇒ real spawnAgentRun registers agent.run.started", async () => {
+    const openClueMsg = {
+      message_id: "msg_open_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      entity_id: "clue_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const publishBodies: Array<{
+      channel?: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      entity_id?: string;
+    }> = [];
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: openClueMsg });
+        }
+        const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+        if (pm) {
+          const body = JSON.parse(String(init?.body));
+          publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+          return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+
+    // 活性：dispatch 真被 spawn，spawns 记录 spawned=true。
+    expect(outcome.spawns).toHaveLength(1);
+    expect(outcome.spawns[0].spawned).toBe(true);
+    // 真实 spawn 动作：向 board:agent-runs 发布 agent.run.started（run_id/role/clue_id）。
+    const started = publishBodies.filter((b) => b.kind === "agent.run.started.v1");
+    expect(started).toHaveLength(1);
+    expect(started[0].channel).toBe("board:agent-runs");
+    expect(started[0].payload.run_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(started[0].payload.role).toBe("dr-worker-code-local");
+    expect(started[0].payload.clue_id).toBe("clue_x");
+    // 另有恰好一次 clue CAS（open→in_flight）发到 clue 板 channel。
+    const cluePubs = publishBodies.filter((b) => b.kind === "research.clue.v2");
+    expect(cluePubs).toHaveLength(1);
+    expect(cluePubs[0].channel).toBe(WIRE_CLUE_CHANNEL);
+    expect(cluePubs[0].payload.status).toBe("in_flight");
+  });
+});

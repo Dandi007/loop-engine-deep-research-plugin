@@ -23,6 +23,9 @@ RUNTIME_FLEET="$RUN_ROOT/fleet.yaml"
 export PLUGIN_ROOT RUN_ROOT RUNTIME_FLEET MODE
 export TRIGGER_STORE_DIR="$RUN_ROOT/stores/trigger"
 export TICK_ENTRY="${TICK_ENTRY:-bash \"$PLUGIN_ROOT/bin/tick-entry.sh\"}"
+# A8c——tick 的 clue 板 channel：从 pipeline input namespace 注入 tick.md 供 `--run` 使用。
+# ⛔ spec §2 只允许在 research:p02-smoke-1dce60 上做真机写入验证；可用 TICK_CHANNEL 覆盖。
+export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
 export DD_CLAIM_STALE_MS="${DD_CLAIM_STALE_MS:-1800000}"
 
 mkdir -p "$TRIGGER_STORE_DIR" "$(dirname "$RUNTIME_FLEET")"

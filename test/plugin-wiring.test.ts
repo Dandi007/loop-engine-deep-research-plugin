@@ -172,6 +172,45 @@ describe("N9 template switched to real tick entry, selfcheck preserved", () => {
     expect(tpl).toMatch(/\-\-selfcheck/);
   });
 
+  it("tick_channel is wired end-to-end so --run is actually reachable", () => {
+    // ⛔ 判别性：不得只凭模板里出现 `--run` 就下结论（spec §0 / §4.1 纪律 8）。
+    // 必须证明 channel 真的从装配系统一路流到 tick 节点：
+    //   fleet.yaml.tpl 声明 tick_channel ← ${TICK_CHANNEL}（pipeline input）
+    //   workflow.yaml seed payload 携带 tick_channel ← {{tick_channel}}
+    //   tick.md 用非空的 tick_channel 走 --run 分支
+    //   渲染后的 fleet 里 pipeline input 真的带上非空 tick_channel
+    const tplText = readFileSync(
+      join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"),
+      "utf8",
+    );
+    const loopText = readFileSync(
+      join(ROOT, "bin", "deep-research-loop.sh"),
+      "utf8",
+    );
+    const workflowText = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml"),
+      "utf8",
+    );
+    const tickMd = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md"),
+      "utf8",
+    );
+    // 1) fleet 声明 tick_channel input，且来源是 ${TICK_CHANNEL} 环境变量。
+    expect(tplText).toMatch(/tick_channel:\s*\$\{TICK_CHANNEL\}/);
+    // 2) 装配脚本导出 TICK_CHANNEL（有值，非空），渲染才不失败。
+    expect(loopText).toMatch(/export\s+TICK_CHANNEL=/);
+    // 3) workflow seed payload 把 tick_channel 从 pipeline input namespace 注入。
+    expect(workflowText).toMatch(/tick_channel:\s*"\{\{tick_channel\}\}"/);
+    // 4) tick.md 在非空 tick_channel 时确实执行 --run（而不是永远落 --selfcheck）。
+    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"/);
+    // 5) 渲染产物：pipeline input 里 tick_channel 有非空值（真实 wiring 成立）。
+    const doc = parse(dryRun());
+    const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
+    expect(tickInput).toBeTruthy();
+    expect(typeof tickInput.tick_channel).toBe("string");
+    expect(tickInput.tick_channel.length).toBeGreaterThan(0);
+  });
+
   it("--selfcheck still exits 0 with a self-check (no side effects)", () => {
     const out = run([join(ROOT, "bin", "tick-entry.sh"), "--selfcheck"]);
     const obj = JSON.parse(out);

@@ -4,6 +4,7 @@ pipelines:
     config_dir: ${PLUGIN_ROOT}/workflows/deep-research/tick
     input:
       tick_entry: ${TICK_ENTRY}
+      tick_channel: ${TICK_CHANNEL}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

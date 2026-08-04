@@ -173,7 +173,6 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
   for (const card of open) {
     if (dispatched >= n) break;
     if (isWebSource(card.sources)) {
-      // V5 mutation: web goes normal dispatch instead of blocked.
       decisions.push({
         kind: "block",
         clueId: card.clueId,
@@ -182,7 +181,6 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
       continue;
     }
     if (!isValidSources(card.sources)) {
-      // V6 mutation: out-of-enum silently skipped instead of blocked.
       decisions.push({ kind: "block", clueId: card.clueId, reason: "invalid_sources" });
       continue;
     }

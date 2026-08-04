@@ -20,16 +20,29 @@
     调用 spawnWorker(clueId, role, runId)（N3）；**CAS 失败（409）跳过该卡、不 spawn**（N4）；
     **spawn 同步失败 ⇒ 当场 CAS 回 open**（N5，S2 补偿规则真实兑现）。
   - `WriteResult` 用 `spawns: SpawnRecord[]`（含 role/runId/spawned）取代 A8b 的 `pendingSpawns`。
-  - `runChannelWrite` 注入真实 spawnWorker（CAS 成功后调用）；CAS 一律走 A8b 的 `realCas`，
-    **不得绕过另写 CAS**（spec §4.1 纪律 8）。
-  - `--max-writes` 默认 5（M10）、channel 无默认值（M11）、v1 冻结 channel 拒写（M12）均沿用；
-    **spawn 本身不计入写入预算，但每次 spawn 前的 CAS 计入**（spec §2）。
+  - `runChannelWrite` 注入**真实 spawn** `spawnAgentRun`（A8c 重做 finding 2）：CAS 成功后向
+    `board:agent-runs` 发布一条 `agent.run.started`（run_id/role/clue_id），让下一次 tick 读到
+    started 而不再 reclaim 该在飞卡（堵掉 spec §0 的 churn）；CAS 一律走 A8b 的 `realCas`，
+    **不得绕过另写 CAS**（spec §4.1 纪律 8）。spawn 写的是 run 生命周期 channel，不是 clue 板，
+    不计入 `--max-writes` 的 CAS 预算（spec §2）。
+  - `--max-writes` 默认 5（M10）、channel 无默认值（M11）、v1 冻结 channel 拒写（M12）均沿用。
+- **修改 `src/tick.ts`**：删除 A8b 变异自检遗留的两行 mutation-marker 注释
+  （`// V5 mutation: …` / `// V6 mutation: …`，finding 3 的 minor）——它们与注释上方
+  实际正确 block 的分支相矛盾，误导读者；删注释即逐字还原为交付态（V5/V6 分支不变）。
 - **修改 `src/tick-entry.ts`**：`--run` 用法/注释更新为「CAS + spawn（接线判别）」。
 - **切换 `workflows/deep-research/tick/templates/tick.md`**：由 `--selfcheck` 切到真实 tick 入口
   `--run <channel>`（N9）；`--selfcheck` 仍保留（未注入 `tick_channel` 时退化自检，A7 G6/G7）。
   `workflow.yaml` seed payload 增加 `tick_channel`。
-- **新增测试**：`test/tick-run.test.ts`（N1–N5 接线判别 + spawn 接线）、`test/tick.test.ts`（N6/N7/N8
-  role 映射 + web/枚举外 block）、`test/plugin-wiring.test.ts`（N9 模板切换 + selfcheck 保留）。
+- **打通 `tick_channel` 全链路（A8c 重做 finding 1，blocker）**：此前 `tick.md` 里
+  `--run "$tick_channel"` 从未被触发——`fleet.yaml.tpl` 只声明 `tick_entry`，`deep-research-loop.sh`
+  不导出 `TICK_CHANNEL`，装配系统任何路径都不供给 `tick_channel`。本次：
+  - `fleet.yaml.tpl` input 增加 `tick_channel: ${TICK_CHANNEL}`（pipeline input namespace）。
+  - `bin/deep-research-loop.sh` 导出 `TICK_CHANNEL`（默认 `research:p02-smoke-1dce60`，可用 env 覆盖）。
+  - 于是渲染出的 fleet 里 tick pipeline 的 input 携带非空 `tick_channel`，经 `{{tick_channel}}`
+    注入 seed payload，`tick.md` 的 `--run "$tick_channel"` 真实可达（N9 判别性断言）。
+- **新增测试**：`test/tick-run.test.ts`（N1–N5 接线判别 + spawn 接线 + **A8c 真实 spawn 发布
+  agent.run.started**）、`test/tick.test.ts`（N6/N7/N8 role 映射 + web/枚举外 block）、
+  `test/plugin-wiring.test.ts`（N9 **判别性**模板切换 + `tick_channel` 端到端 wiring + selfcheck 保留）。
 
 ## 硬验收映射
 
@@ -43,7 +56,7 @@
 | N6 | sources 枚举外 ⇒ blocked，不 spawn | `N6` |
 | N7 | sources 含 web ⇒ blocked 且 rationale 非空，不 spawn | `N7`（与 N6 分开） |
 | N8 | role 映射正确 | `N8`（四条各一例 + dispatch 携带 role） |
-| N9 | 模板已切到真实 tick 入口 | `N9`（grep tick.md 命中 `--run`，且 `--selfcheck` 保留） |
+| N9 | 模板已切到真实 tick 入口 | `N9`（判别性：tick.md 命中 `--run` 且 `--selfcheck` 保留 + `fleet.yaml.tpl` 声明 `tick_channel`、loop 脚本导出 `TICK_CHANNEL`、渲染 fleet 的 pipeline input 携带非空 `tick_channel`） |
 | N10 | --selfcheck 仍保留且无副作用 | G6/G7 + `N9`（exit 0，不可达 bus 零网络） |
 | N11 | --max-writes 默认 5 且生效 | `M10` 沿用 |
 | N12 | v1 冻结 channel 拒写 | `M12` 沿用 |
@@ -136,6 +149,14 @@ $ echo $?   # exit 0
   （1 次 CAS）成功 ⇒ **spawn 被调用**，带 `role=dr-worker-code-local`、`runId=33793a1b…`（N3）。
   worker 产出（`worker.result.v1` 未注册）属 V1，本包不信机验证（spec §7）。
 - 随后再跑一次 `--run` 亦 exit 0（reclaim 回 open，writes 1，spawns 空），验证 reclaim 真机路径。
+
+## 重做（final review findings 修复）
+
+| finding | 处置 |
+|---|---|
+| **blocker（§1.3）**：`tick_channel` 无供给路径，`--run` 永不触发 | 打通全链路：`fleet.yaml.tpl` input 声明 `tick_channel: ${TICK_CHANNEL}`，`bin/deep-research-loop.sh` 导出 `TICK_CHANNEL`（默认 `research:p02-smoke-1dce60`）；渲染 fleet 的 pipeline input 携带非空 `tick_channel`，经 `{{tick_channel}}` 注入 seed payload，`tick.md` 的 `--run "$tick_channel"` 真实可达。N9 改为判别性断言（不再只 grep 文本）。 |
+| **major（§1.2）**：`runChannelWrite` 注入 `spawnWorker: async () => {}`，真实 `--run` 认领卡后不启动任何东西，造成 spec §0 churn | 注入真实 `spawnAgentRun`：CAS 成功后向 `board:agent-runs` 发布 `agent.run.started`（run_id/role/clue_id）。下一次 tick 读到 started 便不再 reclaim 该在飞卡，churn 消除。spawn 写 run 生命周期 channel，不计入 `--max-writes` 的 CAS 预算（spec §2）；worker 产出（worker.result.v1 未注册）仍属 V1，不在本包范围（spec §7）。新增 `A8c real spawn publishes agent.run.started on the runs channel` 用例证明真实路径非空操作。 |
+| **minor**：`src/tick.ts` 残留 V5/V6 mutation-marker 注释，与所注释分支矛盾 | 删除两行遗留注释（分支逻辑逐字不变，即变异自检后的还原态）。 |
 
 ## 验收
 

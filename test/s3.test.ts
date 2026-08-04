@@ -126,6 +126,52 @@ describe("S3 termination conditions", () => {
     expect(r.state).toBe("capped");
   });
 
+  it("C7b: condition 3 only blocks new clues — depth cap with an in-flight card does not terminate yet", () => {
+    const r = decideTermination(
+      {
+        cards: [
+          card({ clueId: "deep", depth: 2 }),
+          card({ clueId: "w", status: "in_flight" }),
+        ],
+        ...convergedParams(),
+      },
+      { ...cfg, maxDepth: 2 },
+    );
+    expect(r.capHit).toBe(true);
+    expect(r.state).toBeNull();
+  });
+
+  it("C7c: condition 3 with an open card still draining → not terminated yet", () => {
+    const r = decideTermination(
+      {
+        cards: [
+          card({ clueId: "deep", depth: 2 }),
+          card({ clueId: "o", status: "open" }),
+        ],
+        ...convergedParams(),
+      },
+      { ...cfg, maxDepth: 2 },
+    );
+    expect(r.capHit).toBe(true);
+    expect(r.state).toBeNull();
+  });
+
+  it("C7d: condition 2 (count cap) with an in-flight card also drains before capped", () => {
+    const r = decideTermination(
+      {
+        cards: [
+          card({ clueId: "a" }),
+          card({ clueId: "b" }),
+          card({ clueId: "w", status: "in_flight" }),
+        ],
+        ...convergedParams(),
+      },
+      { ...cfg, maxClues: 2 },
+    );
+    expect(r.capHit).toBe(true);
+    expect(r.state).toBeNull();
+  });
+
   it("C8: all clues blocked → NOT converged, must be partial", () => {
     const r = decideTermination(
       {
@@ -151,6 +197,18 @@ describe("S3 termination conditions", () => {
       cfg,
     );
     expect(r.state).toBe("partial");
+  });
+
+  it("C8c: cap reached with blocked>0 resolves to capped (honest cap signal, never converged)", () => {
+    const r = decideTermination(
+      {
+        cards: [card({ status: "blocked" }), card({ clueId: "b", status: "blocked" })],
+        ...convergedParams(),
+      },
+      { ...cfg, maxClues: 2 },
+    );
+    expect(r.state).not.toBe("converged");
+    expect(r.state).toBe("capped");
   });
 
   it("C10: terminal state is a closed enum and the three scenarios are mutually distinct", () => {

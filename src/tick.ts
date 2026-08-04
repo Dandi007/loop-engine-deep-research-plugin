@@ -24,7 +24,7 @@ export interface TickConfig {
   triageThreshold: number;
   /** 并发 worker 上限 */
   maxConcurrentWorkers: number;
-  /** 最大深度（本包只透传，不消费） */
+  /** 最大深度（条件 3：max(depth) >= maxDepth 即触顶） */
   maxDepth: number;
   /** 重试上限 */
   maxRetries: number;
@@ -169,6 +169,12 @@ export interface TerminationState {
   state: TerminalState | null;
   coverage: number;
   zeroGrowthRounds: number;
+  /**
+   * 触顶是否已发生（条件 2/3 的数量/深度上限已到）。
+   * 为 true 但 state 为 null 表示「已触顶、仍在排空」：只拦新 clue，已 open 的跑完
+   * （spec §3 line 37），待全部排空后才正式报 capped。
+   */
+  capHit: boolean;
 }
 
 /** 覆盖度 = 有至少一条 evidence 的 clue_id 的集合大小（spec §2，非 evidence 条数）。 */
@@ -194,15 +200,21 @@ export function decideTermination(
   const count = input.cards.length;
   const maxDepth = input.cards.reduce((m, c) => Math.max(m, c.depth), 0);
   const inFlight = input.cards.filter((c) => c.status === "in_flight").length;
+  const open = input.cards.filter((c) => c.status === "open").length;
   const proposed = input.cards.filter((c) => c.status === "proposed").length;
   const blocked = input.cards.filter((c) => c.status === "blocked").length;
 
   // 条件 2/3：触顶 → 终态 capped（触顶 ≠ 收敛，报告不得宣称完备，§3.1）。
-  const capped = count >= cfg.maxClues || maxDepth >= cfg.maxDepth;
+  // 条件 3 只拦新 clue，已 open 的跑完（spec §3 line 37）：触顶后并不立即终止，
+  // 需等 在途 / 待派 / 待 triage 的工作全部排空才正式报 capped；排空期间仅置 capHit。
+  const capHit = count >= cfg.maxClues || maxDepth >= cfg.maxDepth;
+  const drained = inFlight === 0 && open === 0 && proposed === 0;
 
   let state: TerminalState | null = null;
-  if (capped) {
-    state = "capped";
+  if (capHit) {
+    if (drained) {
+      state = "capped";
+    }
   } else if (
     zeroGrowthRounds >= cfg.zeroGrowthThreshold &&
     inFlight === 0 &&
@@ -212,7 +224,7 @@ export function decideTermination(
     state = blocked > 0 ? "partial" : "converged";
   }
 
-  return { state, coverage, zeroGrowthRounds };
+  return { state, coverage, zeroGrowthRounds, capHit };
 }
 
 /**

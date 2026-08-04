@@ -254,11 +254,21 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run。
     expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"\s+\-\-evidence-channel\s+"\$evidence_channel"/);
     // 5) 渲染产物：pipeline input 里 evidence_channel 有非空值（真实 wiring 成立）。
-    const doc = parse(dryRun());
+    //    ⛔ 装配脚本**无派生默认值**（spec §1.4 / H15：证据 channel 不得由板 channel 推导），
+    //    部署方必须显式配置。这里显式注入一个非派生值以证明「fleet → workflow → template」
+    //    接线真的带上它（判别性，纪律 8）。
+    const explicit = "research:p02-smoke-1dce60.evidence";
+    const rendered = run(
+      [join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"],
+      { EVIDENCE_CHANNEL: explicit },
+    );
+    const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
     expect(tickInput).toBeTruthy();
     expect(typeof tickInput.evidence_channel).toBe("string");
     expect(tickInput.evidence_channel.length).toBeGreaterThan(0);
+    // 判别性：注入的正是那个显式值，而不是由 TICK_CHANNEL 派生来的别的东西。
+    expect(tickInput.evidence_channel).toBe(explicit);
   });
 
   it("`--evidence-channel` reaches parseRunCliArgs on the production --run path", () => {

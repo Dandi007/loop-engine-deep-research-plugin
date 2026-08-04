@@ -6,7 +6,7 @@
  * 判别性成对用例（纪律 7：H5 / H9）。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -220,7 +220,7 @@ function harvestDeps(over: Partial<HarvestDeps> = {}): HarvestDeps {
     boardChannelId: "research:p02-smoke-1dce60",
     maxClues: 64,
     maxDepth: 3,
-    boardClueCount: 0,
+    boardClueCount: { value: 0 },
     readWorkerResult: vi.fn(async () => resultWith()),
     publishEvidence: vi.fn(async () => {}),
     publishClue: vi.fn(async () => {}),
@@ -330,7 +330,7 @@ describe("H9: idempotency key has no timestamp/random (discriminative)", () => {
 describe("H12: board at maxClues ⇒ no new clue, evidence still published, skipped reported", () => {
   it("boardClueCount >= maxClues ⇒ 0 clue publishes, 2 evidence publishes, skippedClues=2", async () => {
     const hd = harvestDeps({
-      boardClueCount: 64,
+      boardClueCount: { value: 64 },
       maxClues: 64,
     });
     const deps = writeDeps(hd);
@@ -353,7 +353,7 @@ describe("maxClues cap increments as clues are published (no overshoot)", () => 
     // boardClueCount=62, maxClues=64 ⇒ headroom=2，但卡带 5 条 proposed_clue。
     // 若只看 pre-tick 快照（boardClueCount 62 < 64 ⇒ 全发），板会被冲到 67 > 64。
     // 修复后：只发 2 条，跳过 3 条，板不超 maxClues。
-    const hd = harvestDeps({ boardClueCount: 62, maxClues: 64 });
+    const hd = harvestDeps({ boardClueCount: { value: 62 }, maxClues: 64 });
     // 覆盖默认 resultWith 的 2 条 proposed_clues，改成 5 条。
     (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       run_id: "run-1",
@@ -377,6 +377,45 @@ describe("maxClues cap increments as clues are published (no overshoot)", () => 
     expect(result.harvestReports[0].skippedClues).toBe(3);
     // 活性：evidence 照发 + CAS。
     expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+    // ⛔ 共享计数被写回：发布后 boardClueCount.value 从 62 → 64（跨卡累计）。
+    expect(hd.boardClueCount.value).toBe(64);
+  });
+});
+
+// ── maxClues 跨卡累计：attempt 2 major finding（多张 harvest 卡同一 tick）──
+
+describe("maxClues cap accumulates across multiple harvest cards in one runWrite", () => {
+  it("boardClueCount=63, maxClues=64, two exited(0) cards each with 1 clue ⇒ only 1 published, board never hits 65", async () => {
+    // ⛔ attempt 2 major finding 的复现场景：卡 A 发 1 条（board=64），卡 B 若仍从
+    //    旧的 pre-tick 快照 63 重算 headroom，就会再发 1 条（board=65）> maxClues。
+    //    修复后：boardClueCount 是共享可变计数，卡 A 发完写回 64；卡 B 从 64 重算
+    //    headroom=0 ⇒ 一条不发。整体板面最多停在 64。
+    const hd = harvestDeps({ boardClueCount: { value: 63 }, maxClues: 64 });
+    // 两张 harvest 决策，各带 1 条 evidence + 1 条 proposed_clue。
+    const cardA: Decision = { ...HARVEST_DECISION, clueId: "card_a", runId: "run-a" };
+    const cardB: Decision = { ...HARVEST_DECISION, clueId: "card_b", runId: "run-b" };
+    (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (runId: string) => ({
+        run_id: runId,
+        evidence: [
+          { quote: "q", claim: "c", source: "code", locator: "a", revision: "r" },
+        ],
+        proposed_clues: { items: [{ clue: "idea" }] },
+      }),
+    );
+    const deps = writeDeps(hd);
+    const result = await runWrite(deps, [cardA, cardB], 10);
+    // 卡 A 发 1 条 clue；卡 B 因共享计数已达 maxClues 一条不发。
+    expect((hd.publishClue as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
+    expect(result.harvestReports).toHaveLength(2);
+    expect(result.harvestReports[0].cluesPublished).toBe(1);
+    expect(result.harvestReports[0].skippedClues).toBe(0);
+    expect(result.harvestReports[1].cluesPublished).toBe(0);
+    expect(result.harvestReports[1].skippedClues).toBe(1);
+    // ⛔ 板面绝不超过 maxClues：共享计数停在 64。
+    expect(hd.boardClueCount.value).toBe(64);
+    // 活性：两张卡都 CAS 到 explored（evidence 照发 + CAS，不因封顶而不 CAS）。
+    expect(result.casResults.filter((c) => c.to === "explored")).toHaveLength(2);
   });
 });
 
@@ -431,12 +470,42 @@ describe("H14: evidence channel has no default; missing ⇒ loud error, zero req
 // ── H15：无 .board→.evidence 字符串推导 ────────────────────────────
 
 describe("H15: no .board→.evidence string derivation", () => {
-  it("harvest source contains no replace('board','evidence')-style derivation", () => {
-    const src = readFileSync(join(ROOT, "..", "src", "harvest.ts"), "utf8");
-    expect(src).not.toMatch(/\.board\s*\[\s*["']\.evidence["']/);
-    expect(src).not.toMatch(/replace\(/);
+  it("no board→evidence derivation anywhere in src/, bin/, workflows/, scripts/", () => {
+    // ⛔ review note（rf-attempt_01KZ7DKP...）：H15 必须仓库级 grep，不能只读 src/harvest.ts
+    //    并断言一个宽松代理（not.toMatch(/replace\(/)）。那检测不到加在 src/tick-run.ts、
+    //    src/tick-entry.ts、或 shell/workflow 装配层（bin/、workflows/、scripts/）里的派生——
+    //    之前那个派生默认值实证就住在 bin/deep-research-loop.sh。这里把装配与源码一起扫。
+    const dirs = ["src", "bin", "workflows", "scripts"];
+    const files: string[] = [];
+    for (const dir of dirs) {
+      const absolute = join(ROOT, "..", dir);
+      const walk = (d: string): void => {
+        for (const name of readdirSync(d)) {
+          const full = join(d, name);
+          if (statSync(full).isDirectory()) walk(full);
+          else if (/\.(ts|sh|yaml|yml|mjs|md)$/.test(name)) files.push(full);
+        }
+      };
+      walk(absolute);
+    }
+    // 只扫「把板 channel 名推导成 evidence channel」的**代码**形态（replace / 拼接 / 模板），
+    // 不匹配文档注释里的「`.board`→`.evidence`」字样。
+    const forbidden = [
+      /\.replace\s*\(\s*["'][^"']*board[^"']*["']\s*,\s*["'][^"']*evidence[^"']*["']\s*\)/i,
+      /\.replace\s*\(\s*["'][^"']*\.board[^"']*["']/i,
+      /\+\s*["']\.evidence["']/,
+      /["']\.evidence["']\s*\+/,
+      /`[^`]*\$\{[^}]*\}[^`]*\.evidence\b/,
+    ];
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const re of forbidden) {
+        expect(text, `${file} should not derive evidence channel from board channel`).not.toMatch(re);
+      }
+    }
     // 证据 channel 是显式注入的字段，绝不由 board channel 推导。
-    expect(src).toMatch(/evidenceChannelId/);
+    const harvestSrc = readFileSync(join(ROOT, "..", "src", "harvest.ts"), "utf8");
+    expect(harvestSrc).toMatch(/evidenceChannelId/);
   });
 });
 

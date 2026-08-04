@@ -720,7 +720,10 @@ export async function runChannelWrite(
       boardChannelId: opts.channelId,
       maxClues,
       maxDepth,
-      boardClueCount: assembled.clueEntities,
+      // ⛔ maxClues 运行计数：`{ value }` 是可变的共享计数器。runWrite 把同一
+      //    `deps.harvest` 传给**每一张** harvest 卡，harvestCard 发布新 clue 时实时
+      //    累加 `.value`，从而多张卡在同一 tick 内累计后板面也不超 maxClues（§1.6）。
+      boardClueCount: { value: assembled.clueEntities },
       readWorkerResult: async (runId) => findWorkerResult(runId, runsMessages),
       publishEvidence: (channelId, evidence, key) =>
         publishEvidence(channelId, evidence, key).then(() => undefined),

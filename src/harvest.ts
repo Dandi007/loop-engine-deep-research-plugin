@@ -165,8 +165,14 @@ export interface HarvestDeps {
   maxClues: number;
   /** maxDepth 上限（§1.6 / H11）。 */
   maxDepth: number;
-  /** 当前板上 clue 总数（用于 maxClues 封顶判定，§1.6）。 */
-  boardClueCount: number;
+  /**
+   * 当前板上 clue 总数（用于 maxClues 封顶判定，§1.6）。
+   * ⛔ **可变计数（`{ value }`）**：runWrite 把同一个 `deps.harvest` 传给**每一张**
+   *    harvest 卡，共享同一对象；新 clue 发布时实时累加 `.value`。这样不仅单张卡内封顶，
+   *    多张 harvest 卡在同一 tick 内也**累计**——卡 A 发完写回共享计数，卡 B 从更新后的
+   *    计数重算 headroom，板面不会冲到 maxClues 之上（attempt 2 major finding 修复）。
+   */
+  boardClueCount: { value: number };
   /** 按 run_id 读该 run 的 worker.result.v1（读 board:agent-runs）。 */
   readWorkerResult(runId: string): Promise<WorkerResultV1 | null>;
   /** 发一条 research.evidence.v2 到证据 channel。 */
@@ -242,7 +248,7 @@ export async function harvestCard(
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，
   //    发布循环里再用运行计数逐条校验（见下）。
-  const headroom = Math.max(0, hd.maxClues - hd.boardClueCount);
+  const headroom = Math.max(0, hd.maxClues - hd.boardClueCount.value);
   const cluesAllowed = Math.min(clueItems.length, headroom);
   // 整卡所需写数：evidence 条数 + 将新增的 clue 条数 + 最终 CAS（§1.7）。
   const needed = evItems.length + cluesAllowed + 1;
@@ -265,9 +271,11 @@ export async function harvestCard(
   let evidencePublished = 0;
   let cluesPublished = 0;
   let skippedClues = clueItems.length;
-  // ⛔ maxClues 运行计数：从 pre-tick 快照出发，每发一条新 clue 就 +1，
-  //    保证板面不会在单张卡（或多张卡累计）内冲到 maxClues 之上（§1.6 / H12）。
-  let boardClueCount = hd.boardClueCount;
+  // ⛔ maxClues 运行计数：`boardClueCount` 是**共享可变对象**（runWrite 把同一 `deps.harvest`
+  //    传给每张 harvest 卡）。每发一条新 clue 就把 `.value` +1，从而单张卡（或多张卡累计）
+  //    都不会把板面冲到 maxClues 之上（§1.6 / H12；attempt 2 major finding：卡间必须累计）。
+  //    这里取的是对共享对象的引用，跨卡持久。
+  const boardClueCount = hd.boardClueCount;
 
   // 先发 evidence（幂等键：dr-evidence:<run_id>:<index>，§1.2 / H8 / H9）。
   for (let i = 0; i < evItems.length; i += 1) {
@@ -283,11 +291,11 @@ export async function harvestCard(
 
   // 再发新 clue（幂等键：dr-clue:<run_id>:<index>，§1.2 / H8 / H9）。
   for (let i = 0; i < clueItems.length; i += 1) {
-    if (boardClueCount >= hd.maxClues) break; // ⛔ 已达 maxClues ⇒ 不新增 clue，但 evidence 已照发（§1.6 / H12）。
+    if (boardClueCount.value >= hd.maxClues) break; // ⛔ 已达 maxClues ⇒ 不新增 clue，但 evidence 已照发（§1.6 / H12）。
     const clue = clueFromWorker(card, clueItems[i], hd.maxDepth);
     await hd.publishClue(hd.boardChannelId, clue, `dr-clue:${runId}:${i}`);
     budget.consume(1);
-    boardClueCount += 1;
+    boardClueCount.value += 1;
     cluesPublished += 1;
     skippedClues -= 1;
   }

@@ -102,14 +102,14 @@ worker 的 `proposed_clues.items` 只有 `{clue, reason}`，缺 `status / depth 
 抛 `MissingEvidenceChannelError`，tick 永久卡在 in_flight（同时回归 A8b/A8c/A8d 的
 `--run` 路径）。修复：把 evidence channel 沿装配链一路透传——
 
-- `bin/deep-research-loop.sh` 导出 `EVIDENCE_CHANNEL`（缺省 `research:p02-smoke-1dce60.evidence`，
-  部署侧显式配置，**运行时不做 `.board`→`.evidence` 推导**，H15）。
+- `bin/deep-research-loop.sh` 导出 `EVIDENCE_CHANNEL`（**无派生默认值**：部署方必须显式配置到
+  已核实存在的证据 channel；**运行时不做 `.board`→`.evidence` 推导**，H15）。
 - `workflows/deep-research/fleet.yaml.tpl` 增加 `evidence_channel: ${EVIDENCE_CHANNEL}` input。
 - `workflows/deep-research/tick/workflow.yaml` seed payload 携带 `evidence_channel`。
 - `workflows/deep-research/tick/templates/tick.md`：非空 evidence_channel 时
   `--run "$tick_channel" --evidence-channel "$evidence_channel"`。
 - 新增接线判别测试（plugin-wiring，镜像 N9 的 tick_channel 判别）证明
-  fleet → workflow → template 端到端带上非空 evidence_channel。
+  fleet → workflow → template 端到端带上非空 evidence_channel（测试显式注入 EVIDENCE_CHANNEL）。
 
 ### major：H14/H13 落到 `--run` 生产路径（spec §4.1 纪律 8）
 新增生产路径用例：构造真实 in_flight 卡 + `exited(0)` run + `worker.result.v1`，
@@ -132,6 +132,35 @@ worker 的 `proposed_clues.items` 只有 `{clue, reason}`，缺 `status / depth 
 `runChannelWrite` 现在只对 `board:agent-runs` 分页读一次，同一份 `runsMessages`
 既喂 `buildRunsFromMessages`（runs 归集）又喂 `findWorkerResult`（每张卡的 worker.result 查询），
 消除「每张 harvest 卡把整个 channel 再分页一遍」的 O(cards × channel) 读放大。
+
+## Rework（attempt 3，处理 final review rf-attempt_01KZ7DKP322DDYPAP7S5BT1561 三条 finding）
+
+### major：maxClues 封顶必须跨多张 harvest 卡累计（attempt 2 复现）
+attempt 2 的修复把 `boardClueCount` 复制成本地计数并只递增本地，**从不写回**，
+且 `runWrite` 把同一 `deps.harvest` 传给每张卡、`runChannelWrite` 只从 `assembled.clueEntities`
+设一次 `boardClueCount`——所以多张卡在同一 tick 仍各按陈旧的 pre-tick 快照重算 headroom，
+板面可超 maxClues（boardClueCount=63、maxClues=64、两张 exited(0) 卡各带 1 条 clue ⇒
+卡 A 发 1 条（64）、卡 B 再按旧 63 发 1 条（65））。
+修复：`HarvestDeps.boardClueCount` 改为**共享可变计数 `{ value }`**。`harvestCard` 取的是对
+共享对象的引用，每发一条新 clue 就 `boardClueCount.value += 1` 写回；`runChannelWrite` 组装
+`{ value: assembled.clueEntities }`，而 `runWrite` 对每张 harvest 卡都用同一 `deps.harvest`
+对象 ⇒ 计数在卡间**累计**。新增判别用例（两张卡、共享计数从 63 停在 64，第二张一条不发）。
+
+### minor：装配层默认值不得由板 channel 名派生（spec §1.4 / H15）
+attempt 2 把 `.board`→`.evidence` 命名假设从运行时代码搬进装配脚本：
+`EVIDENCE_CHANNEL` 缺省 `research:p02-smoke-1dce60.evidence` = 板 channel `TICK_CHANNEL`
+（`research:p02-smoke-1dce60`）追加 `.evidence`。实测该板 channel「无任何后缀」，没有 `.evidence`
+兄弟——正是 spec §1.4 禁派生、要显式传入的原因；且发布 append-only 无 DELETE、不可回退。
+修复：`bin/deep-research-loop.sh` 的 `EVIDENCE_CHANNEL` **不再给派生默认值**（缺省留空），
+部署方必须显式配置到**已核实存在**的证据 channel；缺失时 `--run` 遇到 harvest 决策会响亮失败
+（§1.4 / H13/H14）。运行时「无默认、响亮失败」纪律不变；修掉的是部署默认的具体取值。
+
+### note：H15 必须仓库级 grep（不能只读 src/harvest.ts 的宽松代理）
+原 H15 只读 `src/harvest.ts` 并断言 `not.toMatch(/replace\(/)`，检测不到加在
+`src/tick-run.ts` / `src/tick-entry.ts` / shell / workflow 装配层里的派生——finding 2 的
+派生默认值实证就住在 `bin/deep-research-loop.sh`。修复：H15 扫描 `src/`、`bin/`、`workflows/`、
+`scripts/` 全部代码文件，对 replace / 字符串拼接 / 模板字面量这几类「由板 channel 名推导
+evidence channel」的**代码形态**逐一断言不存在（只匹配代码、不匹配文档注释里的「`.board`→`.evidence`」字样）。
 
 ## 非目标（spec §5）
 

@@ -28,9 +28,13 @@ export TICK_ENTRY="${TICK_ENTRY:-bash \"$PLUGIN_ROOT/bin/tick-entry.sh\"}"
 export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
-# ⛔ 这里配置的是与 TICK_CHANNEL 对应的 smoke 证据 channel（部署侧按实际 channel 名显式配置，
-#    绝不在运行时做 `.board`→`.evidence` 之类推导——见 src/harvest.ts H15）。
-export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-research:p02-smoke-1dce60.evidence}"
+# ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：
+#    `research:p02-smoke-1dce60` 存在且「无任何后缀」——没有 `.evidence` 兄弟 channel）。
+#    由板名做 `.board`→`.evidence` 之类推导在真实 channel 上静默推不出，且发布是 append-only
+#    无 DELETE、不可回退。因此这里**不给派生默认值**；部署方必须显式配置 EVIDENCE_CHANNEL 到
+#    **已核实存在**的证据 channel。未配置时留空，`--run` 一旦遇到 harvest 决策会响亮失败
+#    （§1.4 / H13/H14），绝不静默写进由字符串推导的错 channel。
+export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

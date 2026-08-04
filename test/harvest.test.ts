@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
+  anchorForEvidence,
   composeAnchor,
   evidenceFromWorker,
   clueFromWorker,
@@ -87,6 +88,55 @@ describe("H5: clue_id from card entity_id, not worker output (discriminative)", 
     const ev = evidenceFromWorker("card_x", item as never);
     expect(ev.clue_id).toBe("card_x");
     expect(ev.clue_id).not.toBe("FAKE_FROM_WORKER");
+  });
+});
+
+// ── anchor 缺组件必须响亮失败，不得落退化空锚（review minor finding）──
+
+describe("anchor missing component fails loudly (no silent empty anchor)", () => {
+  it("missing source ⇒ error, never a degenerate '://@' anchor", () => {
+    expect(() =>
+      anchorForEvidence({
+        quote: "q",
+        claim: "c",
+        locator: "a",
+        revision: "r",
+      }),
+    ).toThrow(/anchor/);
+  });
+
+  it("missing locator ⇒ error", () => {
+    expect(() =>
+      anchorForEvidence({
+        quote: "q",
+        claim: "c",
+        source: "code",
+        revision: "r",
+      }),
+    ).toThrow(/anchor/);
+  });
+
+  it("missing revision ⇒ error", () => {
+    expect(() =>
+      anchorForEvidence({
+        quote: "q",
+        claim: "c",
+        source: "code",
+        locator: "a",
+      }),
+    ).toThrow(/anchor/);
+  });
+
+  it("empty-string source ⇒ error (empty is not a meaningful anchor component)", () => {
+    expect(() =>
+      anchorForEvidence({
+        quote: "q",
+        claim: "c",
+        source: "",
+        locator: "a",
+        revision: "r",
+      }),
+    ).toThrow(/anchor/);
   });
 });
 
@@ -296,6 +346,40 @@ describe("H12: board at maxClues ⇒ no new clue, evidence still published, skip
   });
 });
 
+// ── maxClues 运行计数：不完全看 pre-tick 快照，随发布递增（review minor finding）──
+
+describe("maxClues cap increments as clues are published (no overshoot)", () => {
+  it("boardClueCount below maxClues with more clues than headroom ⇒ clips at headroom", async () => {
+    // boardClueCount=62, maxClues=64 ⇒ headroom=2，但卡带 5 条 proposed_clue。
+    // 若只看 pre-tick 快照（boardClueCount 62 < 64 ⇒ 全发），板会被冲到 67 > 64。
+    // 修复后：只发 2 条，跳过 3 条，板不超 maxClues。
+    const hd = harvestDeps({ boardClueCount: 62, maxClues: 64 });
+    // 覆盖默认 resultWith 的 2 条 proposed_clues，改成 5 条。
+    (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      run_id: "run-1",
+      evidence: [
+        { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+      ],
+      proposed_clues: {
+        items: [
+          { clue: "c0" },
+          { clue: "c1" },
+          { clue: "c2" },
+          { clue: "c3" },
+          { clue: "c4" },
+        ],
+      },
+    });
+    const deps = writeDeps(hd);
+    const result = await runWrite(deps, [HARVEST_DECISION], 10);
+    expect((hd.publishClue as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(2);
+    expect(result.harvestReports[0].cluesPublished).toBe(2);
+    expect(result.harvestReports[0].skippedClues).toBe(3);
+    // 活性：evidence 照发 + CAS。
+    expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+  });
+});
+
 // ── H13：预算不足 ⇒ 整卡跳过 ───────────────────────────────────────
 
 describe("H13: budget insufficient for whole card ⇒ zero publish, zero CAS, loud report", () => {
@@ -473,6 +557,93 @@ describe("H1: exited(0) + worker.result.v1 ⇒ one research.evidence.v2 per evid
     expect((last.payload as Record<string, unknown>).status).toBe("explored");
     expect(outcome.harvestReports).toHaveLength(1);
     expect(outcome.harvestReports[0].evidencePublished).toBe(2);
+  });
+});
+
+// ── H14 生产路径：runChannelWrite 缺 evidence channel ⇒ 响亮失败、零写入 ──
+// ⛔ spec §4.1 纪律 8：H14 是「响亮失败」判据，验收必须落在 `--run` 的生产路径
+//    （runChannelWrite），不得只验单元层 runWrite。这里构造真实的 in_flight 卡 +
+//    exited(0) run + worker.result.v1，让 decideTick 发出 harvest 决策；
+//    不传 evidenceChannelId ⇒ 生产装配路径必须响亮抛 MissingEvidenceChannelError，
+//    且零 publish（不发任何 evidence/clue/CAS 写请求）。
+
+describe("H14 production path: runChannelWrite without evidence channel ⇒ loud error, zero writes", () => {
+  it("harvest decision on real path without evidenceChannelId rejects and publishes nothing", async () => {
+    const inFlightMsg = {
+      message_id: "msg_clue_1",
+      channel_id: WIRE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: {
+        status: "in_flight",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+        run_id: "run-1",
+      },
+      entity_id: "card_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-1", exit_code: 0 },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_1",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-1",
+          evidence: [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: { items: [{ clue: "idea" }] },
+        },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    let publishCount = 0;
+    let clueCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: inFlightMsg });
+        }
+        if (/\/v1\/channels\/[^/]+\/publish/.test(u)) {
+          publishCount += 1;
+          return jsonResponse({ message_id: `p_${publishCount}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [inFlightMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          const hasAfterSeq = /[?&]after_seq=/.test(u);
+          return jsonResponse({ messages: hasAfterSeq ? [] : runsMessages });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    // ⛔ 生产路径：不传 evidenceChannelId（缺省 ⇒ 装配层 evidenceChannelId=""）。
+    await expect(
+      runChannelWrite({ channelId: WIRE_CHANNEL }),
+    ).rejects.toBeInstanceOf(MissingEvidenceChannelError);
+    // 零写入：没有发任何 publish（evidence / clue / CAS 全都没有）。
+    expect(publishCount).toBe(0);
   });
 });
 

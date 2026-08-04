@@ -217,3 +217,56 @@ describe("N9 template switched to real tick entry, selfcheck preserved", () => {
     expect(obj.ok).toBe(true);
   });
 });
+
+// ── A8e：evidence channel 随装配系统端到端接线（blocker finding）──
+
+describe("A8e evidence channel wired end-to-end through the assembly", () => {
+  it("`--evidence-channel` is reachable from the template down to the entry", () => {
+    // ⛔ 判别性（spec §4.1 纪律 8）：不得只凭模板里出现 `--evidence-channel` 就下结论，
+    //    必须证明 evidence channel 真的从装配系统一路流到 tick 节点：
+    //      fleet.yaml.tpl 声明 evidence_channel ← ${EVIDENCE_CHANNEL}（pipeline input）
+    //      workflow.yaml seed payload 携带 evidence_channel ← {{evidence_channel}}
+    //      tick.md 在非空 evidence_channel 时把 `--evidence-channel` 传给 `--run`
+    //      bin/deep-research-loop.sh 导出 EVIDENCE_CHANNEL（有值，非空）
+    //      渲染后的 fleet 里 pipeline input 真的带上非空 evidence_channel
+    const tplText = readFileSync(
+      join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"),
+      "utf8",
+    );
+    const loopText = readFileSync(
+      join(ROOT, "bin", "deep-research-loop.sh"),
+      "utf8",
+    );
+    const workflowText = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml"),
+      "utf8",
+    );
+    const tickMd = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md"),
+      "utf8",
+    );
+    // 1) 装配脚本导出 EVIDENCE_CHANNEL（有值，渲染才不失败）。
+    expect(loopText).toMatch(/export\s+EVIDENCE_CHANNEL=/);
+    // 2) fleet 声明 evidence_channel input，来源是 ${EVIDENCE_CHANNEL} 环境变量。
+    expect(tplText).toMatch(/evidence_channel:\s*\$\{EVIDENCE_CHANNEL\}/);
+    // 3) workflow seed payload 把 evidence_channel 从 pipeline input namespace 注入。
+    expect(workflowText).toMatch(/evidence_channel:\s*"\{\{evidence_channel\}\}"/);
+    // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run。
+    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"\s+\-\-evidence-channel\s+"\$evidence_channel"/);
+    // 5) 渲染产物：pipeline input 里 evidence_channel 有非空值（真实 wiring 成立）。
+    const doc = parse(dryRun());
+    const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
+    expect(tickInput).toBeTruthy();
+    expect(typeof tickInput.evidence_channel).toBe("string");
+    expect(tickInput.evidence_channel.length).toBeGreaterThan(0);
+  });
+
+  it("`--evidence-channel` reaches parseRunCliArgs on the production --run path", () => {
+    // ⛔ 生产 `--run` 路径（parseRunCliArgs）必须解析 `--evidence-channel`：
+    //    否则即使模板把参数传下去，入口也识别不了。
+    const tickRunSrc = readFileSync(join(ROOT, "src", "tick-run.ts"), "utf8");
+    expect(tickRunSrc).toMatch(/\-\-evidence-channel/);
+    const tickEntrySrc = readFileSync(join(ROOT, "src", "tick-entry.ts"), "utf8");
+    expect(tickEntrySrc).toMatch(/\-\-evidence-channel/);
+  });
+});

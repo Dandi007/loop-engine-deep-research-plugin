@@ -9,3 +9,4 @@ seed:
     payload:
       tick_entry: "{{tick_entry}}"
       tick_channel: "{{tick_channel}}"
+      evidence_channel: "{{evidence_channel}}"

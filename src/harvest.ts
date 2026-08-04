@@ -79,14 +79,24 @@ export function composeAnchor(
   return range ? `${base}#${range}` : base;
 }
 
-/** 由一条 worker evidence 生成 anchor。 */
+/**
+ * 由一条 worker evidence 生成 anchor。
+ * ⛔ source/locator/revision 任一缺失/为空 ⇒ **响亮报错**（不静默塞空串）。
+ *    缺失时若回退成空串会得到退化的 "://@" 锚——非空故能骗过
+ *    assertEvidenceComplete 的「四必填非空」检查，随后被不可回退地发布到
+ *    无 DELETE 的 append-only bus。这与本仓「解析不到 secret 不得塞空串」
+ *    的纪律同源（src/tick-run.ts）；缺 anchor 组件应响亮失败，绝不落退化的空锚。
+ */
 export function anchorForEvidence(item: WorkerEvidenceItem): string {
-  return composeAnchor(
-    item.source ?? "",
-    item.locator ?? "",
-    item.revision ?? "",
-    item.range,
-  );
+  const source = item.source;
+  const locator = item.locator;
+  const revision = item.revision;
+  if (!source || !locator || !revision) {
+    throw new Error(
+      "A8e: worker evidence missing source/locator/revision for anchor; refusing to derive a degenerate empty anchor (no silent empty-string fallback).",
+    );
+  }
+  return composeAnchor(source, locator, revision, item.range);
 }
 
 /** 校验 evidence 四必填字段齐全且非空（spec §1.3 / H2）。缺任一 ⇒ 抛错（响亮，不静默落空）。 */
@@ -228,8 +238,12 @@ export async function harvestCard(
 
   const evItems = result.evidence ?? [];
   const clueItems = result.proposed_clues?.items ?? [];
-  const atMaxClues = hd.boardClueCount >= hd.maxClues;
-  const cluesAllowed = atMaxClues ? 0 : clueItems.length;
+  // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
+  //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
+  //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，
+  //    发布循环里再用运行计数逐条校验（见下）。
+  const headroom = Math.max(0, hd.maxClues - hd.boardClueCount);
+  const cluesAllowed = Math.min(clueItems.length, headroom);
   // 整卡所需写数：evidence 条数 + 将新增的 clue 条数 + 最终 CAS（§1.7）。
   const needed = evItems.length + cluesAllowed + 1;
 
@@ -251,6 +265,9 @@ export async function harvestCard(
   let evidencePublished = 0;
   let cluesPublished = 0;
   let skippedClues = clueItems.length;
+  // ⛔ maxClues 运行计数：从 pre-tick 快照出发，每发一条新 clue 就 +1，
+  //    保证板面不会在单张卡（或多张卡累计）内冲到 maxClues 之上（§1.6 / H12）。
+  let boardClueCount = hd.boardClueCount;
 
   // 先发 evidence（幂等键：dr-evidence:<run_id>:<index>，§1.2 / H8 / H9）。
   for (let i = 0; i < evItems.length; i += 1) {
@@ -266,10 +283,11 @@ export async function harvestCard(
 
   // 再发新 clue（幂等键：dr-clue:<run_id>:<index>，§1.2 / H8 / H9）。
   for (let i = 0; i < clueItems.length; i += 1) {
-    if (atMaxClues) break; // ⛔ 已达 maxClues ⇒ 不新增 clue，但 evidence 已照发（§1.6 / H12）。
+    if (boardClueCount >= hd.maxClues) break; // ⛔ 已达 maxClues ⇒ 不新增 clue，但 evidence 已照发（§1.6 / H12）。
     const clue = clueFromWorker(card, clueItems[i], hd.maxDepth);
     await hd.publishClue(hd.boardChannelId, clue, `dr-clue:${runId}:${i}`);
     budget.consume(1);
+    boardClueCount += 1;
     cluesPublished += 1;
     skippedClues -= 1;
   }

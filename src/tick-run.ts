@@ -27,9 +27,9 @@ import {
 } from "./tick";
 import {
   assembleBoard,
-  readAgentRuns,
+  buildRunsFromMessages,
+  findWorkerResult,
   readChannelMessages,
-  readWorkerResult,
 } from "./tick-inspect";
 import {
   harvestCard,
@@ -692,7 +692,11 @@ export async function runChannelWrite(
   const nonce = randomUUID();
   const runsChannelId = opts.runsChannelId ?? "board:agent-runs";
   const messages = await readChannelMessages(opts.channelId);
-  const runs = await readAgentRuns(runsChannelId);
+  // A8e——`board:agent-runs` 只分页读一次，同时喂给 runs 归集与每张卡的 worker.result
+  //   查询（评审 note：readWorkerResult 原先每张 harvest 卡把整个 channel 再分页一遍，
+  //   这是 O(cards x channel) 的读放大；这里复用同一份已读消息列表）。
+  const runsMessages = await readChannelMessages(runsChannelId);
+  const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
   const state = assembled.state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
@@ -717,7 +721,7 @@ export async function runChannelWrite(
       maxClues,
       maxDepth,
       boardClueCount: assembled.clueEntities,
-      readWorkerResult: (runId) => readWorkerResult(runId, runsChannelId),
+      readWorkerResult: async (runId) => findWorkerResult(runId, runsMessages),
       publishEvidence: (channelId, evidence, key) =>
         publishEvidence(channelId, evidence, key).then(() => undefined),
       publishClue: (channelId, clue, key) =>

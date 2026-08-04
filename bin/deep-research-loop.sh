@@ -26,6 +26,11 @@ export TICK_ENTRY="${TICK_ENTRY:-bash \"$PLUGIN_ROOT/bin/tick-entry.sh\"}"
 # A8c——tick 的 clue 板 channel：从 pipeline input namespace 注入 tick.md 供 `--run` 使用。
 # ⛔ spec §2 只允许在 research:p02-smoke-1dce60 上做真机写入验证；可用 TICK_CHANNEL 覆盖。
 export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
+# A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
+# 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
+# ⛔ 这里配置的是与 TICK_CHANNEL 对应的 smoke 证据 channel（部署侧按实际 channel 名显式配置，
+#    绝不在运行时做 `.board`→`.evidence` 之类推导——见 src/harvest.ts H15）。
+export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-research:p02-smoke-1dce60.evidence}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

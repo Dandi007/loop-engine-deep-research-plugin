@@ -62,7 +62,7 @@
 | H11 超 maxDepth ⇒ blocked 且 rationale 非空 | 独立用例，确有一条可发布 clue |
 | H12 达 maxClues ⇒ 不新增 clue、evidence 照发、报告跳过数 | `runWrite` 断言 |
 | H13 预算不足 ⇒ 零 publish 零 CAS、响亮报告 | `runWrite` + `harvestCard` 预算边界 |
-| H14 证据 channel 无默认、缺失响亮报错、零请求 | `MissingEvidenceChannelError` + 未调用 readWorkerResult |
+| H14 证据 channel 无默认、缺失响亮报错、零请求 | 单元层 + **生产 `runChannelWrite` 路径**（缺省 evidenceChannelId ⇒ 抛错、零 publish） |
 | H15 无 `.board`→`.evidence` 推导 | 源码 grep 断言 |
 | H16 v1 冻结 channel 拒写、零请求 | `FrozenChannelError` + 未调用 readWorkerResult |
 | H17 A8c N1/N2、A8d P1/P2 仍成立 | 原用例未删、仍通过 |
@@ -70,7 +70,7 @@
 | H19 `reason` 未落库且写进 dev-notes | payload 无 `reason`；本文件下节说明 |
 | H20 不碰 `.dd-evidence/` | 提交文件面不含 |
 | H21 typecheck + 全量测试 | 已验证 exit 0 |
-| H22 既有用例一条不删 | 208 → 228（净增 20） |
+| H22 既有用例一条不删 | 208 → 237（净增 29） |
 | H23 dev-notes 存在、仓根无 `IMPLEMENTATION_SUMMARY.md` | 本文件 |
 
 ## ⛔ 关于 worker 的 `reason`：本包不落库（H19）
@@ -93,6 +93,45 @@ worker 的 `proposed_clues.items` 只有 `{clue, reason}`，缺 `status / depth 
 > U1（CAS 提前）→ H6/H7；U2（clue_id 用 worker 值）→ H5；U3（幂等键掺 Date.now）→ H9；
 > U4（超 maxDepth 静默丢弃）→ H11；U6（预算不足半发）→ H13；U7（证据 channel 字符串推导）→ H14/H15。
 > 每条变异后 `git diff --stat` 复核还原，未把变异留在工作区。
+
+## Rework（attempt 2，处理 final review rf-attempt_01KZ7CM1GNH7V8YZ4QVRY9H8AB 五条 finding）
+
+### blocker：evidence channel 未接进生产装配链 ⇒ tick 卡死
+`--run` 要求 `--evidence-channel`，但原装配链只透传 `TICK_ENTRY / TICK_CHANNEL`，
+一旦出现 `exited(0)` 卡（正是本包要处理的）`decideTick` 发 `harvest`，`runWrite`
+抛 `MissingEvidenceChannelError`，tick 永久卡在 in_flight（同时回归 A8b/A8c/A8d 的
+`--run` 路径）。修复：把 evidence channel 沿装配链一路透传——
+
+- `bin/deep-research-loop.sh` 导出 `EVIDENCE_CHANNEL`（缺省 `research:p02-smoke-1dce60.evidence`，
+  部署侧显式配置，**运行时不做 `.board`→`.evidence` 推导**，H15）。
+- `workflows/deep-research/fleet.yaml.tpl` 增加 `evidence_channel: ${EVIDENCE_CHANNEL}` input。
+- `workflows/deep-research/tick/workflow.yaml` seed payload 携带 `evidence_channel`。
+- `workflows/deep-research/tick/templates/tick.md`：非空 evidence_channel 时
+  `--run "$tick_channel" --evidence-channel "$evidence_channel"`。
+- 新增接线判别测试（plugin-wiring，镜像 N9 的 tick_channel 判别）证明
+  fleet → workflow → template 端到端带上非空 evidence_channel。
+
+### major：H14/H13 落到 `--run` 生产路径（spec §4.1 纪律 8）
+新增生产路径用例：构造真实 in_flight 卡 + `exited(0)` run + `worker.result.v1`，
+`decideTick` 发 `harvest` 决策；**不传 evidenceChannelId** 调 `runChannelWrite`
+（生产装配层 evidenceChannelId=""）⇒ 响亮抛 `MissingEvidenceChannelError` 且**零 publish**
+（不发 evidence / clue / CAS 任何写请求）。
+
+### minor：anchor 缺组件不再静默塞空串
+`anchorForEvidence` 原先对缺失 source/locator/revision 回退空串，产出退化锚 `"://@"`，
+非空故能骗过 `assertEvidenceComplete`，随后被不可回退地发布到无 DELETE 的 append-only bus。
+现改为缺任一组件（含空串）⇒ **响亮抛错**，与「解析不到 secret 不得塞空串」纪律同源。
+
+### minor：maxClues 封顶改为随发布递增的运行计数
+原实现 `atMaxClues` 只按 pre-tick 快照（`assembled.clueEntities`）判一次，多张 harvest 卡
+会把板面冲到 maxClues 之上。现 `harvestCard` 用 `boardClueCount` 运行计数，每发一条新 clue 就 +1，
+逐条校验封顶；预算所需写数也按「本卡实际最多可发条数」计算。新增判别用例
+（boardClueCount=62、maxClues=64、卡带 5 条 ⇒ 只发 2 条、跳 3 条、板不超 64）。
+
+### note：readWorkerResult 复用已读消息列表
+`runChannelWrite` 现在只对 `board:agent-runs` 分页读一次，同一份 `runsMessages`
+既喂 `buildRunsFromMessages`（runs 归集）又喂 `findWorkerResult`（每张卡的 worker.result 查询），
+消除「每张 harvest 卡把整个 channel 再分页一遍」的 O(cards × channel) 读放大。
 
 ## 非目标（spec §5）
 

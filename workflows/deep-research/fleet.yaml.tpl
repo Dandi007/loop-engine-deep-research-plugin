@@ -5,6 +5,7 @@ pipelines:
     input:
       tick_entry: ${TICK_ENTRY}
       tick_channel: ${TICK_CHANNEL}
+      evidence_channel: ${EVIDENCE_CHANNEL}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

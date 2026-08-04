@@ -211,21 +211,54 @@ export function parseRunEvent(
 }
 
 /**
- * A8b —— 真实 `runs`：分页读 `board:agent-runs`，按 run_id 归集
- * `agent.run.started.*` / `agent.run.exited.*`（spec §1.1）。
- * 同一 run_id 多事件取最后一次（分页返回最早在前，后来的覆盖）。
- * ⛔ 不硬编码空的 runs 字面量。
+ * A8b —— 把 `board:agent-runs` 的消息数组按 run_id 归集成 `runs`。
+ * `agent.run.started.*` / `agent.run.exited.*`（spec §1.1）；同一 run_id 多事件取最后一次
+ * （分页返回最早在前，后来的覆盖）。⛔ 不硬编码空的 runs 字面量。
+ * 纯函数：供 `readAgentRuns` 与 `runChannelWrite` 复用同一份已读消息列表。
  */
-export async function readAgentRuns(
-  channelId = "board:agent-runs",
-): Promise<Record<string, RunEvent>> {
-  const messages = await readChannelMessages(channelId);
+export function buildRunsFromMessages(
+  messages: InspectMessage[],
+): Record<string, RunEvent> {
   const runs: Record<string, RunEvent> = {};
   for (const msg of messages) {
     const parsed = parseRunEvent(msg);
     if (parsed) runs[parsed.runId] = parsed.event;
   }
   return runs;
+}
+
+/**
+ * A8b —— 真实 `runs`：分页读 `board:agent-runs`，按 run_id 归集
+ * `agent.run.started.*` / `agent.run.exited.*`（spec §1.1）。
+ * ⛔ 不硬编码空的 runs 字面量。
+ */
+export async function readAgentRuns(
+  channelId = "board:agent-runs",
+): Promise<Record<string, RunEvent>> {
+  const messages = await readChannelMessages(channelId);
+  return buildRunsFromMessages(messages);
+}
+
+/**
+ * A8e —— 从已读的 `board:agent-runs` 消息数组里，按 run_id 找该 run 的
+ * `worker.result.v1`（收割步用，spec §1）。取 payload.run_id 匹配的**最后一条**
+ * （同 run 后发覆盖先发）。找不到 ⇒ 返回 null（该 run 无产物可收割）。
+ * ⛔ 纯函数：幂等/重放安全，只读不写；同 run_id 读到的结果用于稳定序号映射。
+ * 供 `readWorkerResult` 与 `runChannelWrite` 复用同一份已读消息列表，
+ * 避免每张 harvest 卡把 `board:agent-runs` 整个 channel 再分页一遍（评审 note）。
+ */
+export function findWorkerResult(
+  runId: string,
+  messages: InspectMessage[],
+): WorkerResultV1 | null {
+  let found: WorkerResultV1 | null = null;
+  for (const msg of messages) {
+    if (msg.kind !== "worker.result.v1") continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id !== runId) continue;
+    found = payload as WorkerResultV1;
+  }
+  return found;
 }
 
 /**
@@ -240,14 +273,7 @@ export async function readWorkerResult(
   channelId = "board:agent-runs",
 ): Promise<WorkerResultV1 | null> {
   const messages = await readChannelMessages(channelId);
-  let found: WorkerResultV1 | null = null;
-  for (const msg of messages) {
-    if (msg.kind !== "worker.result.v1") continue;
-    const payload = (msg.payload ?? {}) as Record<string, unknown>;
-    if (payload.run_id !== runId) continue;
-    found = payload as WorkerResultV1;
-  }
-  return found;
+  return findWorkerResult(runId, messages);
 }
 
 /**

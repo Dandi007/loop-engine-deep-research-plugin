@@ -5,6 +5,7 @@
  * 读写 agent-bus 的 HTTP API (127.0.0.1:7490)。
  */
 import type { ClueV2, EvidenceV2, DocV2 } from "./protocol";
+import { readFileSync } from "node:fs";
 
 const BASE_URL = "http://127.0.0.1:7490";
 const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
@@ -12,12 +13,19 @@ const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 let _cachedToken: string | null = null;
 
 function token(): string {
-  if (!_cachedToken) {
-    _cachedToken = require("node:fs")
-      .readFileSync(TOKEN_PATH, "utf-8")
-      .trim();
+  if (_cachedToken === null) {
+    _cachedToken = readFileSync(TOKEN_PATH, "utf-8").trim();
   }
   return _cachedToken;
+}
+
+/** agent-bus HTTP 错误，携带数值状态码（用于 D1 的错误分类）。 */
+class BusError extends Error {
+  status: number;
+  constructor(method: string, path: string, status: number, body: string) {
+    super(`bus ${method} ${path}: ${status} ${body.slice(0, 200)}`);
+    this.status = status;
+  }
 }
 
 async function busFetch(
@@ -33,7 +41,7 @@ async function busFetch(
   const resp = await fetch(url, { ...options, headers });
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`bus ${options.method ?? "GET"} ${path}: ${resp.status} ${body.slice(0, 200)}`);
+    throw new BusError(options.method ?? "GET", path, resp.status, body);
   }
   return resp;
 }
@@ -74,7 +82,7 @@ export async function getMessages(
 ): Promise<BusMessage[]> {
   const params = new URLSearchParams();
   params.set("limit", String(opts.limit ?? 100));
-  if (opts.afterSeq) params.set("after_seq", String(opts.afterSeq));
+  if (opts.afterSeq !== undefined) params.set("after_seq", String(opts.afterSeq));
   const resp = await busFetch(
     `/v1/channels/${channelId}/messages?${params}`,
   );
@@ -82,13 +90,17 @@ export async function getMessages(
   return data.messages ?? [];
 }
 
-/** 获取 entity 的最新版本 */
+/** 获取 entity 的最新版本（D2：仅 404 视为“不存在”，其余读取失败向上抛）。 */
 export async function getEntity(entityId: string): Promise<BusMessage | null> {
   try {
     const resp = await busFetch(`/v1/entities/${entityId}`);
-    return await resp.json();
-  } catch {
-    return null;
+    const data = await resp.json();
+    return data.head ?? null;
+  } catch (err: any) {
+    if (err.status === 404) {
+      return null;
+    }
+    throw err;
   }
 }
 
@@ -187,11 +199,10 @@ export async function casUpdateClue(
     });
     return { success: true, messageId: result.message_id };
   } catch (err: any) {
-    const msg = err.message ?? "";
-    if (msg.includes("409")) {
+    if (err.status === 409) {
       return { success: false, error: "conflict" };
     }
-    if (msg.includes("400") || msg.includes("422")) {
+    if (err.status === 400 || err.status === 422) {
       return { success: false, error: "invalid_payload" };
     }
     throw err;

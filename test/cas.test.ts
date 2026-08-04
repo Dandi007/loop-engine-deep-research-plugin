@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { claimClue, casUpdateClue } from "../src/bus";
 
 /**
  * CAS 互斥的充要条件（来自 findings.md CAS 节）
@@ -7,97 +8,186 @@ import { describe, it, expect } from "vitest";
  * 同源读 ⇒ 互斥成立（读写之间有人抢到 → head 推进 → supersedes 过期 → 409）；
  * 分属两次读 ⇒ CAS 退化成纯粹的防丢失更新。
  *
- * 判据：看代码里 `status` 和 `supersedes` 是不是从同一个变量来的。
+ * 所有用例都通过真实调用路径进入 src/bus.ts 的 claimClue / casUpdateClue，
+ * 用打桩的全局 fetch 构造场景，不在此处重写任何产品逻辑副本。
  */
 
-// 模拟 bus 消息结构
-interface BusMessage {
-  message_id: string;
-  channel_seq: number;
-  payload: { status: string; [key: string]: unknown };
+type FakeJson = () => Promise<unknown>;
+
+interface FakeResponse {
+  ok: boolean;
+  status: number;
+  json: FakeJson;
+  text: FakeJson;
 }
 
-/**
- * CAS claim 函数（纯逻辑，不依赖 bus）
- * 返回成功或冲突原因
- */
-function casClaim(
-  head: BusMessage,              // 从 entity 读到的当前 head
-  expectedStatus: string,        // 前置条件：期望的 status
-  newStatus: string,             // 目标 status
-  assignee: string,
-  runId: string,
-): { success: true; newPayload: Record<string, unknown> } | { success: false; reason: string } {
-  // 关键：status 和 supersedes 来自同一个 head 对象（同源读）
-  const currentStatus = head.payload.status;
-  const supersedes = head.message_id;
-
-  if (currentStatus !== expectedStatus) {
-    return { success: false, reason: `conflict: expected ${expectedStatus}, got ${currentStatus}` };
-  }
-
+function jsonResponse(status: number, data: unknown): FakeResponse {
   return {
-    success: true,
-    newPayload: {
-      ...head.payload,
-      status: newStatus,
-      assignee,
-      run_id: runId,
-    },
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => data,
+    text: async () => JSON.stringify(data),
   };
 }
 
-describe("CAS claim (unit)", () => {
-  const headOpen: BusMessage = {
-    message_id: "msg_001",
-    channel_seq: 5,
-    payload: { status: "open", text: "test clue", depth: 0, sources: ["code-local"] },
-  };
+const openHead = {
+  message_id: "msg_001",
+  channel_id: "research:test",
+  channel_seq: 5,
+  kind: "research.clue.v2",
+  payload: { status: "open", text: "t", depth: 0, sources: [] },
+  entity_id: "msg_001",
+  supersedes: null,
+  created_at: "2026-01-01T00:00:00Z",
+};
 
-  const headInFlight: BusMessage = {
-    message_id: "msg_002",
-    channel_seq: 6,
-    payload: { status: "in_flight", text: "test clue", depth: 0, sources: ["code-local"], assignee: "other", run_id: "run_001" },
-  };
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
-  it("CAS success: open → in_flight with correct status", () => {
-    const result = casClaim(headOpen, "open", "in_flight", "dr-worker-code-local", "run_002");
+describe("CAS claim against src/bus.ts", () => {
+  it("A6: same-source read — supersedes equals the read head's message_id", async () => {
+    const publishBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse(200, { head: openHead });
+        }
+        if (u.includes("/publish")) {
+          publishBodies.push(JSON.parse(String(init?.body)));
+          return jsonResponse(200, { message_id: "msg_002", channel_seq: 6 });
+        }
+        return jsonResponse(404, { message: "unexpected" });
+      }),
+    );
+
+    const result = await claimClue(
+      "research:test",
+      "msg_001",
+      "w-1",
+      "run_002",
+      "claim-key",
+    );
+
+    expect(result.success).toBe(true);
+    expect(publishBodies).toHaveLength(1);
+    const publish = publishBodies[0];
+    // 前置条件与 supersedes 出自同一次读：supersedes 必须等于读到的 head.message_id
+    expect(publish.supersedes).toBe(openHead.message_id);
+    expect(publish.entity_id).toBe("msg_001");
+    expect((publish.payload as Record<string, unknown>).status).toBe("in_flight");
+    expect((publish.payload as Record<string, unknown>).assignee).toBe("w-1");
+    expect((publish.payload as Record<string, unknown>).run_id).toBe("run_002");
+  });
+
+  it("CAS success returns messageId from the bus", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse(200, { head: openHead });
+        }
+        return jsonResponse(200, { message_id: "msg_002", channel_seq: 6 });
+      }),
+    );
+
+    const result = await claimClue(
+      "research:test",
+      "msg_001",
+      "w-1",
+      "run_002",
+      "claim-key-2",
+    );
+
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.newPayload.status).toBe("in_flight");
-      expect(result.newPayload.assignee).toBe("dr-worker-code-local");
-      expect(result.newPayload.run_id).toBe("run_002");
+      expect(result.messageId).toBe("msg_002");
     }
   });
 
-  it("CAS 409: open → in_flight but clue already in_flight", () => {
-    // 别人抢先了——head 已经是 in_flight
-    const result = casClaim(headInFlight, "open", "in_flight", "dr-worker-code-local", "run_003");
+  it("CAS 409: head already in_flight → conflict, no publish", async () => {
+    const inFlightHead = {
+      ...openHead,
+      message_id: "msg_002",
+      payload: {
+        status: "in_flight",
+        text: "t",
+        depth: 0,
+        sources: [],
+        assignee: "other",
+        run_id: "run_001",
+      },
+    };
+    let publishCalled = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse(200, { head: inFlightHead });
+        }
+        if (u.includes("/publish")) {
+          publishCalled = true;
+          return jsonResponse(200, { message_id: "msg_003", channel_seq: 7 });
+        }
+        return jsonResponse(404, { message: "unexpected" });
+      }),
+    );
+
+    const result = await claimClue(
+      "research:test",
+      "msg_001",
+      "w-1",
+      "run_003",
+      "claim-key-3",
+    );
+
     expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.reason).toContain("conflict");
-    }
+    expect(result.error).toBe("conflict");
+    expect(publishCalled).toBe(false);
   });
 
-  it("CAS 409: payload stale — head was updated between read and CAS", () => {
-    // 模拟：第一次读 head 是 open，但 CAS 时 head 已变成 in_flight
-    // 这由 bus 的 supersedes 机制保证——如果 supersedes 指向的不是当前 head，bus 返回 409
-    // 本测试验证逻辑层：status 和 supersedes 来自同一个 head 对象
-    const result = casClaim(headInFlight, "open", "in_flight", "dr-worker-code-local", "run_004");
+  it("CAS 409: bus returns numeric 409 on stale supersedes → conflict", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse(200, { head: openHead });
+        }
+        return jsonResponse(409, { message: "stale supersedes" });
+      }),
+    );
+
+    const result = await casUpdateClue(
+      "research:test",
+      "msg_001",
+      openHead,
+      { status: "in_flight", assignee: "w-1", run_id: "run_004" },
+      "claim-key-4",
+    );
+
     expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.reason).toContain("conflict");
-    }
+    expect(result.error).toBe("conflict");
   });
 
-  it("CAS 同源读判据：status 和 supersedes 来自同一个变量", () => {
-    // 这是常驻断言——验证代码里 status 和 supersedes 确实来自同一个 head 对象
-    // 如果分属两次读，本测试不会捕获，但逻辑上会退化
-    const head = headOpen;
-    const status = head.payload.status;     // 来自 head
-    const supersedes = head.message_id;      // 来自同一个 head
-    expect(status).toBe("open");
-    expect(supersedes).toBe("msg_001");
-    // 同源 ⇒ 互斥成立
+  it("entity not found → entity_not_found", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(404, { message: "not found" })),
+    );
+
+    const result = await claimClue(
+      "research:test",
+      "missing",
+      "w-1",
+      "run_005",
+      "claim-key-5",
+    );
+
+    expect(result).toEqual({ success: false, error: "entity_not_found" });
   });
 });

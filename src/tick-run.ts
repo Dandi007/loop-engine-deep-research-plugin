@@ -71,7 +71,14 @@ export class MissingChannelError extends Error {
 /** 一次 CAS 写动作的最小输入。 */
 export interface WriteCasInput {
   clueId: string;
+  /** 目标 status（CAS 之后要写成的状态）。 */
   to: ClueV2["status"];
+  /**
+   * 前置条件：CAS 前 head 必须处于的当前 status。
+   * ⛔ 决策是在板快照上算的；CAS 前必须用**同一次 head 读**校验该前置条件，
+   *    否则若别人已抢先改状态，realCas 会 CAS 掉活 worker 的认领（spec §0 破坏场景）。
+   */
+  from: ClueV2["status"];
   runId?: string;
 }
 
@@ -118,6 +125,13 @@ export async function runWrite(
   let skipped = 0;
   const casResults: WriteResult["casResults"] = [];
   const pendingSpawns: WriteResult["pendingSpawns"] = [];
+  // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增，
+  //    若本包将来误调 spawnWorker，spawnCalls 会如实反映（M9 判别性）。
+  let spawnCalls = 0;
+  const spawnWorker = async (clueId: string): Promise<void> => {
+    spawnCalls += 1;
+    await deps.spawnWorker(clueId);
+  };
 
   const perform = async (input: WriteCasInput): Promise<CasDecision> => {
     if (writes >= maxWrites) {
@@ -131,9 +145,11 @@ export async function runWrite(
   for (const decision of decisions) {
     switch (decision.kind) {
       case "reclaim": {
+        // reclaim 决策源自 in_flight 卡 ⇒ 前置条件为 in_flight。
         const result = await perform({
           clueId: decision.clueId,
           to: decision.to,
+          from: "in_flight",
         });
         casResults.push({
           clueId: decision.clueId,
@@ -145,9 +161,11 @@ export async function runWrite(
       }
       case "dispatch": {
         const runId = generateRunId();
+        // dispatch 决策源自 open 卡 ⇒ 前置条件为 open。
         const result = await perform({
           clueId: decision.clueId,
           to: "in_flight",
+          from: "open",
           runId,
         });
         casResults.push({
@@ -166,9 +184,11 @@ export async function runWrite(
         break;
       }
       case "block": {
+        // block 决策源自 open 卡（invalid_sources）⇒ 前置条件为 open。
         const result = await perform({
           clueId: decision.clueId,
           to: "blocked",
+          from: "open",
         });
         casResults.push({
           clueId: decision.clueId,
@@ -190,7 +210,7 @@ export async function runWrite(
     skipped,
     casResults,
     pendingSpawns,
-    spawnCalls: 0,
+    spawnCalls,
   };
 }
 
@@ -211,8 +231,15 @@ export interface RunWriteOutcome {
   pendingSpawns: { clueId: string; runId: string }[];
 }
 
-/** 真实 bus 的 CAS：读 head → 合并 update → CAS（先 CAS 成功才算认领，S2）。 */
-async function realCas(
+/**
+ * 真实 bus 的 CAS：读 head → 校验前置条件 → 合并 update → CAS（先 CAS 成功才算认领，S2）。
+ * ⛔ CAS 互斥不变量：前置条件必须在**同一次 head 读**上求值。
+ *    决策虽在板快照上算，但 CAS 前用 getEntity 读最新 head 并校验 `from`；
+ *    若 head 状态 ≠ `from`（别人已抢先改状态，例如把 open 认领成 in_flight），
+ *    则返回 conflict 并**不 publish**，绝不 CAS 掉活 worker 的认领（spec §0 破坏场景）。
+ *    supersedes 一律取这同一次 head 的 message_id（与 claimClue 同源读语义一致）。
+ */
+export async function realCas(
   channelId: string,
   input: WriteCasInput,
   nonce: string,
@@ -220,6 +247,10 @@ async function realCas(
   const head = await getEntity(input.clueId);
   if (!head) {
     return { success: false, error: "entity_not_found" };
+  }
+  const current = (head.payload as ClueV2).status;
+  if (current !== input.from) {
+    return { success: false, error: "conflict" };
   }
   const update: Partial<ClueV2> = { status: input.to };
   if (input.runId) update.run_id = input.runId;

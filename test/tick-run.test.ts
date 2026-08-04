@@ -20,6 +20,7 @@ import {
   FrozenChannelError,
   MissingChannelError,
   isFrozenChannel,
+  realCas,
 } from "../src/tick-run";
 import type { WriteDeps, WriteCasInput } from "../src/tick-run";
 import { readAgentRuns } from "../src/tick-inspect";
@@ -187,8 +188,149 @@ describe("M7: dispatch CAS success writes run_id into card", () => {
     await runWrite(deps, decisions, 5);
     expect(captured).toHaveLength(1);
     expect(captured[0].to).toBe("in_flight");
+    expect(captured[0].from).toBe("open");
     expect(captured[0].runId).toBeTruthy();
     expect(typeof captured[0].runId).toBe("string");
+  });
+
+  it("realCas publish body carries a non-empty run_id in payload (X3 kills M7)", async () => {
+    // M7 的『怎么验』要求捕获 publish body，断言 payload 携带非空 run_id。
+    // 走真实 realCas→casUpdateClue→publish 路径，因此若删除
+    // `if (input.runId) update.run_id = input.runId;`（变异 X3），payload 无 run_id → 本条挂。
+    const publishBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "msg_001",
+              channel_id: "research:p02-smoke-1dce60",
+              channel_seq: 1,
+              kind: "research.clue.v2",
+              payload: { status: "open", text: "t", depth: 0, sources: [] },
+              entity_id: "x",
+              supersedes: null,
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          });
+        }
+        if (u.includes("/publish")) {
+          publishBodies.push(JSON.parse(String(init?.body)));
+          return jsonResponse({ message_id: "msg_002", channel_seq: 2 });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const result = await realCas(
+      "research:p02-smoke-1dce60",
+      { clueId: "x", to: "in_flight", from: "open", runId: "run-abc-123" },
+      "nonce-1",
+    );
+
+    expect(result.success).toBe(true);
+    expect(publishBodies).toHaveLength(1);
+    const payload = publishBodies[0].payload as Record<string, unknown>;
+    expect(payload.status).toBe("in_flight");
+    expect(payload.run_id).toBeTruthy();
+    expect(typeof payload.run_id).toBe("string");
+    expect(payload.run_id).not.toBe("");
+  });
+});
+
+describe("CAS: realCas guards head status against precondition (no live-claim overwrite)", () => {
+  it("dispatch when head already in_flight (another worker) ⇒ conflict, no publish", async () => {
+    // 决策在板快照上算（open→dispatch），但 CAS 前 head 已被别的 worker 认领为 in_flight。
+    // realCas 必须返回 conflict 且不 publish，绝不 CAS 掉活 worker 的认领（spec §0）。
+    let publishCalled = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "msg_002",
+              channel_id: "research:p02-smoke-1dce60",
+              channel_seq: 2,
+              kind: "research.clue.v2",
+              payload: {
+                status: "in_flight",
+                text: "t",
+                depth: 0,
+                sources: [],
+                assignee: "other-worker",
+                run_id: "run_other",
+              },
+              entity_id: "x",
+              supersedes: "msg_001",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          });
+        }
+        if (u.includes("/publish")) {
+          publishCalled = true;
+          return jsonResponse({ message_id: "msg_003", channel_seq: 3 });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const result = await realCas(
+      "research:p02-smoke-1dce60",
+      { clueId: "x", to: "in_flight", from: "open", runId: "run-abc" },
+      "nonce-2",
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("conflict");
+    expect(publishCalled).toBe(false);
+  });
+
+  it("reclaim when head no longer in_flight ⇒ conflict, no publish", async () => {
+    let publishCalled = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "msg_002",
+              channel_id: "research:p02-smoke-1dce60",
+              channel_seq: 2,
+              kind: "research.clue.v2",
+              payload: {
+                status: "blocked",
+                text: "t",
+                depth: 0,
+                sources: [],
+              },
+              entity_id: "x",
+              supersedes: "msg_001",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          });
+        }
+        if (u.includes("/publish")) {
+          publishCalled = true;
+          return jsonResponse({ message_id: "msg_003", channel_seq: 3 });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const result = await realCas(
+      "research:p02-smoke-1dce60",
+      { clueId: "x", to: "open", from: "in_flight" },
+      "nonce-3",
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("conflict");
+    expect(publishCalled).toBe(false);
   });
 });
 

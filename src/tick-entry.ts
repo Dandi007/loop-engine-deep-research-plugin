@@ -10,6 +10,10 @@
  * 无副作用调用：
  *   --help       打印用法并 exit 0，不发网络、不写 store、不触 bus（G6/G7）。
  *   --selfcheck  在空板面上跑一次纯决策自检并 exit 0，不发网络、不触 bus（G6/G7）。
+ *
+ * A8a 只读模式：
+ *   --inspect <channel_id>  只读真实 agent-bus channel → 决策 → 打印 JSON → exit 0。
+ *                           ⛔ 全程只发 GET，零写入，不触碰 MinerU / vault（spec §2）。
  */
 import {
   decideTick,
@@ -18,16 +22,19 @@ import {
   type Decision,
   type TerminationState,
 } from "./tick";
+import { runInspect } from "./tick-inspect";
 
 const USAGE = `deep-research tick entry
 
 把 loop-engine 的周期 tick 接到本仓已交付的纯决策模块（src/tick）。
 
 usage:
-  ... --help       打印本用法并 exit 0（无副作用）
-  ... --selfcheck  在空板面上执行一次纯决策自检并 exit 0（无副作用）
+  ... --help                    打印本用法并 exit 0（无副作用）
+  ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
+  ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
 
-本入口不 import ./bus，不发起任何网络请求，不触碰真实 agent-bus / MinerU / vault。
+--help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
+--inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
 真实启动（连 bus 跑完整 tick）属 V1，不在本包范围。
 `;
 
@@ -56,7 +63,7 @@ function runSelfCheck(): SelfCheckOutput {
   return { ok: true, decisions, termination };
 }
 
-function main(argv: string[]): number {
+async function main(argv: string[]): Promise<number> {
   const arg = argv[0];
   if (arg === "--help" || arg === "-h" || arg === undefined) {
     process.stdout.write(USAGE);
@@ -66,9 +73,18 @@ function main(argv: string[]): number {
     process.stdout.write(JSON.stringify(runSelfCheck(), null, 2) + "\n");
     return 0;
   }
+  if (arg === "--inspect") {
+    const channelId = argv[1];
+    if (!channelId) {
+      process.stderr.write("--inspect requires a <channel_id>\n\n");
+      process.stderr.write(USAGE);
+      return 2;
+    }
+    return await runInspect(channelId);
+  }
   process.stderr.write(`unknown argument: ${arg}\n\n`);
   process.stderr.write(USAGE);
   return 2;
 }
 
-process.exitCode = main(process.argv.slice(2));
+process.exitCode = await main(process.argv.slice(2));

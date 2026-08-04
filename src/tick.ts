@@ -7,7 +7,9 @@
  *
  * 硬不变量（spec §2）：先 CAS 后 spawn。CAS 失败不得 spawn；spawn 同步失败当场 CAS 回 open。
  */
+import { randomUUID } from "node:crypto";
 import type { ClueV2 } from "./protocol";
+import type { WorkerInputPayload } from "./tick-run";
 
 /** 封闭枚举：sources 取值只能来自这里（spec §4）。 */
 export const SOURCE_ENUM = [
@@ -143,7 +145,17 @@ export interface CasDecision {
 export interface TickDeps {
   readBoard(): Promise<BoardState>;
   cas(clueId: string, to: ClueV2["status"], retries?: number): Promise<CasDecision>;
-  spawnWorker(clueId: string, role: string, runId?: string): Promise<void>;
+  /**
+   * A8d——签名已加宽（spec §1.3）：除 role 外还携带 runId 与 worker 输入载荷
+   * `deep-research.worker-input/v1`（clue_text / depth / sources），供真实 `agent-run`
+   * 的 `--input` 与位置 prompt 使用。⛔ 不得丢弃 clue 文本（评审 finding）。
+   */
+  spawnWorker(
+    clueId: string,
+    role: string,
+    runId: string,
+    input: WorkerInputPayload,
+  ): Promise<void>;
   spawnTriage(): Promise<void>;
 }
 
@@ -336,8 +348,17 @@ export async function runTick(deps: TickDeps, cfg: TickConfig = DEFAULT_TICK_CON
           // CAS 失败（409 = 别人抢先）→ 跳过该卡，不得 spawn。
           break;
         }
+        // A8d——生成 runId 并把 clue 文本/depth/sources 以 worker 输入载荷传下去（spec §1.3），
+        //    不得丢弃 decideTick 已发出的这些字段（评审 finding）。
+        const runId = randomUUID();
+        const input: WorkerInputPayload = {
+          clue_id: decision.clueId,
+          clue_text: decision.text ?? "",
+          depth: decision.depth ?? 0,
+          sources: [...(decision.sources ?? [])],
+        };
         try {
-          await deps.spawnWorker(decision.clueId, decision.role);
+          await deps.spawnWorker(decision.clueId, decision.role, runId, input);
         } catch {
           // CAS 成功但 spawn 同步失败 → 当场 CAS 回 open。
           await deps.cas(decision.clueId, "open");

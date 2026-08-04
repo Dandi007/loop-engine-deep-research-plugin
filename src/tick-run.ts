@@ -288,7 +288,13 @@ export async function runWrite(
               runId,
               spawned: true,
             });
-          } catch {
+          } catch (err) {
+            // ⛔ spec §1.4 / P8：`agent-run` 解析不到 ⇒ **响亮失败**（非零退出 + 点名 agent-run），
+            //    绝不静默 CAS 回 open（评审 finding：静默回退会让调度器看到 spawned:false、exit 0，
+            //    而实际什么都没跑，形成 §0.1 的震荡危害）。仅对**其他** spawn 失败做 S2 补偿。
+            if (err instanceof AgentRunUnresolvedError) {
+              throw err;
+            }
             // ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿规则，真实路径兑现 N5）。
             const rollback = await perform({
               clueId: decision.clueId,
@@ -414,6 +420,14 @@ export interface WorkerSpawnSpec {
   args: string[];
   /** 透传给 worker 的环境变量。 */
   env?: Record<string, string>;
+  /**
+   * ⛔ worker 真正退出（或启动失败）时回调，用于释放 worker 独占的资源。
+   * A8d 评审 finding：`--input` 载荷文件的寿命必须绑定到**子进程的消费/退出**，
+   * 而不是一个无关的就绪计时器——真实 `agent-run` 是长驻进程，就绪窗口（2000ms）之后
+   * 仍在运行，若此时删除载荷文件，worker 读取 `--input` 会 ENOENT（spec §1.1 的 CONTRACT_ERROR）。
+   * 该回调只在子进程 exit / error 时触发一次，保证载荷在 worker 存活期间一直可用。
+   */
+  onExit?: () => void;
 }
 
 export interface SpawnedWorker {
@@ -462,14 +476,26 @@ export async function spawnWorkerProcess(
       if (timer) clearTimeout(timer);
       fn();
     };
-    child.once("error", (err) => settle(() => reject(err)));
+    child.once("error", (err) =>
+      settle(() => {
+        // 启动失败（如命令不存在）⇒ 释放 worker 独占资源（onExit 只触发一次）。
+        spec.onExit?.();
+        reject(err);
+      }),
+    );
     child.once("exit", (code) => {
       if (code === 0) {
-        // worker 正常完成 ⇒ 视为已启动。
-        settle(() => resolve({ pid: child.pid }));
+        // worker 正常完成 ⇒ 视为已启动，并释放 worker 独占资源（onExit）。
+        settle(() => {
+          spec.onExit?.();
+          resolve({ pid: child.pid });
+        });
       } else {
-        // 就绪窗口内非零退出 ⇒ 未真正启动 worker，触发 N5 补偿。
-        settle(() => reject(new WorkerStartupError(spec.cmd, code)));
+        // 就绪窗口内非零退出 ⇒ 未真正启动 worker，触发 N5 补偿；同时释放资源。
+        settle(() => {
+          spec.onExit?.();
+          reject(new WorkerStartupError(spec.cmd, code));
+        });
       }
     });
     // worker 存活超过就绪窗口 ⇒ 确认已真实启动。
@@ -541,22 +567,24 @@ export async function spawnAgentRunWorker(opts: {
   input: WorkerInputPayload;
 }): Promise<SpawnedWorker> {
   const payloadPath = writeWorkerInputFile(opts.input);
-  try {
-    const argv = buildAgentRunArgv({
-      agentRunBin: opts.agentRunBin,
-      role: opts.role,
-      runId: opts.runId,
-      inputPath: payloadPath,
-      clueText: opts.input.clue_text,
-    });
-    return await spawnWorkerProcess({
-      cmd: argv[0],
-      args: argv.slice(1),
-      env: { AGENT_RUN_BIN: opts.agentRunBin },
-    });
-  } finally {
-    rmSync(payloadPath, { force: true });
-  }
+  const argv = buildAgentRunArgv({
+    agentRunBin: opts.agentRunBin,
+    role: opts.role,
+    runId: opts.runId,
+    inputPath: payloadPath,
+    clueText: opts.input.clue_text,
+  });
+  // ⛔ 载荷文件的寿命绑定到**子进程退出**（onExit），而不是就绪计时器。
+  //    `spawnWorkerProcess` 在 SPAWN_READY_GRACE_MS 后就 unref 并 resolve，真实 `agent-run`
+  //    是长驻进程，此时仍在运行且可能尚未读取 `--input`。若在 finally 里随即删除，
+  //    worker 会 ENOENT 撞上 dispatch.ts:795 强制的 `--input` ⇒ CONTRACT_ERROR（评审 finding）。
+  //    onExit 只在子进程 exit/error 时触发，保证载荷在 worker 存活期间一直可用。
+  return await spawnWorkerProcess({
+    cmd: argv[0],
+    args: argv.slice(1),
+    env: { AGENT_RUN_BIN: opts.agentRunBin },
+    onExit: () => rmSync(payloadPath, { force: true }),
+  });
 }
 
 /**

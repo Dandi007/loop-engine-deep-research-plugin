@@ -781,9 +781,19 @@ function makeAgentRunStub(marker: string): string {
   const dir = join(tmpdir(), `agent-run-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   mkdirSync(dir, { recursive: true });
   const stub = join(dir, "agent-run");
+  // 桩记录每次调用收到的 argv（逐参数一行），并**在子进程里读 `--input` 所指的载荷文件**
+  // 把其内容回录为 INPUT_FILE / INPUT_CONTENT（P4 生产缺省路径断言据此读到真实文件内容）。
   writeFileSync(
     stub,
-    `#!/bin/sh\nprintf '%s\\n' "CMD=$0" >> "${marker}"\nfor a in "$@"; do printf '%s\\n' "$a"; done >> "${marker}"\nprintf '%s\\n' "---" >> "${marker}"\nexit 0\n`,
+    `#!/bin/sh\nprintf '%s\\n' "CMD=$0" >> "${marker}"\nprev=""
+for a in "$@"; do
+  if [ "$prev" = "--input" ]; then
+    printf '%s\\n' "INPUT_FILE=$a" >> "${marker}"
+    if [ -f "$a" ]; then printf '%s\\n' "INPUT_CONTENT=$(cat "$a")" >> "${marker}"; fi
+  fi
+  printf '%s\\n' "$a" >> "${marker}"
+  prev="$a"
+done\nprintf '%s\\n' "---" >> "${marker}"\nexit 0\n`,
   );
   chmodSync(stub, 0o755);
   return stub;
@@ -792,21 +802,27 @@ function makeAgentRunStub(marker: string): string {
 interface AgentRunBlock {
   cmd: string;
   args: string[];
+  /** `--input` 所指的载荷文件路径（桩在子进程里回录）。 */
+  inputPath?: string;
+  /** `--input` 所指载荷文件的原始内容（P4 生产缺省路径据此断言）。 */
+  inputContent?: string;
 }
 
 function readAgentRunBlocks(marker: string): AgentRunBlock[] {
   const blocks: AgentRunBlock[] = [];
-  let cmd = "";
-  let args: string[] = [];
+  let current: AgentRunBlock | null = null;
   for (const line of readFileSync(marker, "utf8").split("\n")) {
     if (line === "---") {
-      blocks.push({ cmd, args });
-      cmd = "";
-      args = [];
+      if (current) blocks.push(current);
+      current = null;
     } else if (line.startsWith("CMD=")) {
-      cmd = line.slice(4);
-    } else if (line !== "") {
-      args.push(line);
+      current = { cmd: line.slice(4), args: [] };
+    } else if (line.startsWith("INPUT_FILE=")) {
+      if (current) current.inputPath = line.slice("INPUT_FILE=".length);
+    } else if (line.startsWith("INPUT_CONTENT=")) {
+      if (current) current.inputContent = line.slice("INPUT_CONTENT=".length);
+    } else if (line !== "" && current) {
+      current.args.push(line);
     }
   }
   return blocks;
@@ -897,6 +913,13 @@ describe("A8d composed default: wiring + real agent-run verified together", () =
     // --input 指向本包写出的 worker-input 载荷文件路径（P4/P5 直接读该文件断言其内容）。
     expect(argv[inputIdx + 1]).toMatch(/a8d-worker-input-.*\.json$/);
     expect(argv[inputIdx + 1]).toContain(tmpdir());
+    // P4（生产缺省路径）：桩在**子进程里**读 `--input` 所指的真实载荷文件并回录内容。
+    // 评审 finding——不能只在 P4/P5 单测层断言 writeWorkerInputFile 自己写出的文件，
+    // 那守的是另一层不变量（spec §4.1 纪律 8）；必须断言实际交给 spawned agent-run 的文件。
+    expect(blocks[0].inputPath).toBe(argv[inputIdx + 1]);
+    const parsedPayload = JSON.parse(blocks[0].inputContent ?? "") as WorkerInputPayload;
+    expect(parsedPayload.clue_id.length).toBeGreaterThan(0);
+    expect(parsedPayload.clue_text.length).toBeGreaterThan(0);
   });
 });
 
@@ -1145,11 +1168,13 @@ describe("P9: unresolvable agent-run never falls back to placeholder, no spawned
     );
 
     try {
-      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
-      // 安全性：解析不到 ⇒ 未产生 spawned:true，且未启动任何进程（marker 未创建）。
-      expect(outcome.spawns).toHaveLength(1);
-      expect(outcome.spawns[0].spawned).toBe(false);
-      expect(outcome.spawns.filter((s) => s.spawned === true)).toHaveLength(0);
+      // 安全性 + 响亮失败（spec §1.4 / P8 / 评审 finding）：`agent-run` 解析不到 ⇒
+      // 生产缺省路径（runChannelWrite 未注入 spawnWorker）必须**响亮抛错**（非零退出 +
+      // 点名 agent-run），而不是静默 CAS 回 open、打印 spawned:false 后 exit 0。
+      await expect(
+        runChannelWrite({ channelId: WIRE_CLUE_CHANNEL }),
+      ).rejects.toBeInstanceOf(AgentRunUnresolvedError);
+      // 未启动任何进程（marker 未创建），也绝不产生 spawned:true。
       expect(existsSync(marker)).toBe(false);
       // 活性配对见 P1（正常时确实解析到 agent-run），此处只验安全侧。
     } finally {

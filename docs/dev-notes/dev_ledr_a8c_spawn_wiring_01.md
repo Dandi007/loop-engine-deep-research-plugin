@@ -20,11 +20,12 @@
     调用 spawnWorker(clueId, role, runId)（N3）；**CAS 失败（409）跳过该卡、不 spawn**（N4）；
     **spawn 同步失败 ⇒ 当场 CAS 回 open**（N5，S2 补偿规则真实兑现）。
   - `WriteResult` 用 `spawns: SpawnRecord[]`（含 role/runId/spawned）取代 A8b 的 `pendingSpawns`。
-  - `runChannelWrite` 注入**真实 spawn** `spawnAgentRun`（A8c 重做 finding 2）：CAS 成功后向
-    `board:agent-runs` 发布一条 `agent.run.started`（run_id/role/clue_id），让下一次 tick 读到
-    started 而不再 reclaim 该在飞卡（堵掉 spec §0 的 churn）；CAS 一律走 A8b 的 `realCas`，
-    **不得绕过另写 CAS**（spec §4.1 纪律 8）。spawn 写的是 run 生命周期 channel，不是 clue 板，
-    不计入 `--max-writes` 的 CAS 预算（spec §2）。
+  - `runChannelWrite` 注入**真实 spawn** `spawnWorkerProcess`（A8c 重做 finding 2）：CAS 成功后
+    **真正启动一个 worker 子进程**（`child_process.spawn`，命令可经 `TICK_WORKER_CMD`/options 配置）。
+    ⛔ spawn 本身**不写 agent-bus**、**不伪造 `agent.run.started`**（spec §2：spawn 不写 bus，
+    仅每次 spawn 前的 CAS 计入；评审 blocker：`agent.run.started` 必须由真正启动的 worker 自行发布，
+    无进程却发布 started 会把在飞卡永久钉死在 in_flight）。CAS 一律走 A8b 的 `realCas`，
+    **不得绕过另写 CAS**（spec §4.1 纪律 8）。worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
   - `--max-writes` 默认 5（M10）、channel 无默认值（M11）、v1 冻结 channel 拒写（M12）均沿用。
 - **修改 `src/tick.ts`**：删除 A8b 变异自检遗留的两行 mutation-marker 注释
   （`// V5 mutation: …` / `// V6 mutation: …`，finding 3 的 minor）——它们与注释上方
@@ -40,9 +41,9 @@
   - `bin/deep-research-loop.sh` 导出 `TICK_CHANNEL`（默认 `research:p02-smoke-1dce60`，可用 env 覆盖）。
   - 于是渲染出的 fleet 里 tick pipeline 的 input 携带非空 `tick_channel`，经 `{{tick_channel}}`
     注入 seed payload，`tick.md` 的 `--run "$tick_channel"` 真实可达（N9 判别性断言）。
-- **新增测试**：`test/tick-run.test.ts`（N1–N5 接线判别 + spawn 接线 + **A8c 真实 spawn 发布
-  agent.run.started**）、`test/tick.test.ts`（N6/N7/N8 role 映射 + web/枚举外 block）、
-  `test/plugin-wiring.test.ts`（N9 **判别性**模板切换 + `tick_channel` 端到端 wiring + selfcheck 保留）。
+- **新增测试**：`test/tick-run.test.ts`（N1–N5 接线判别 + spawn 接线 + **A8c 真实 spawn 启动
+  worker 子进程且不写 bus**）、`test/tick.test.ts`（N6/N7/N8 role 映射 + web/枚举外 block 且
+  rationale 进决策）、`test/plugin-wiring.test.ts`（N9 **判别性**模板切换 + `tick_channel` 端到端 wiring + selfcheck 保留）。
 
 ## 硬验收映射
 
@@ -60,7 +61,7 @@
 | N10 | --selfcheck 仍保留且无副作用 | G6/G7 + `N9`（exit 0，不可达 bus 零网络） |
 | N11 | --max-writes 默认 5 且生效 | `M10` 沿用 |
 | N12 | v1 冻结 channel 拒写 | `M12` 沿用 |
-| N13 | 真机 `--run` 对 `research:p02-smoke-1dce60` | 下方运行证据（跑前无在飞卡，增量 1 ≤ 5，spawn 被调用） |
+| N13 | 真机 `--run` 对 `research:p02-smoke-1dce60` | 下方运行证据（跑前无在飞卡，增量 1 ≤ 5，spawn 启动 worker 子进程） |
 | N14 | 不得触碰 `.dd-evidence/` | git diff 校验为空 |
 | N15 | typecheck + 全量测试 | 均 exit 0（**188** 条全绿） |
 | N16 | 既有用例一行未删 | git diff 无 `it(` 净减少（既有 171 全保留，净增 +17） |
@@ -146,22 +147,31 @@ $ echo $?   # exit 0
 ```
 - **N13 增量核验**：跑前 = 9，跑后 = 10，**增量 = 1 ≤ 5**（未触 --max-writes=5）。
 - **接线判别真机成立**：只有一张 open 卡（`code-local`），`--run` 一次 dispatch CAS open→in_flight
-  （1 次 CAS）成功 ⇒ **spawn 被调用**，带 `role=dr-worker-code-local`、`runId=33793a1b…`（N3）。
-  worker 产出（`worker.result.v1` 未注册）属 V1，本包不信机验证（spec §7）。
-- 随后再跑一次 `--run` 亦 exit 0（reclaim 回 open，writes 1，spawns 空），验证 reclaim 真机路径。
+  （1 次 CAS）成功 ⇒ **spawn 启动 worker 子进程**（`spawnWorkerProcess`），带
+  `role=dr-worker-code-local`、`runId=33793a1b…`（N3）。spawn **不写 agent-bus**、不伪造 started
+  （增量只有 1 次 clue CAS）；worker 产出（`worker.result.v1` 未注册）属 V1，本包不信机验证（spec §7）。
+- **一致性（评审 finding 2）**：随后再跑一次 `--run` 亦 exit 0（reclaim 回 open，writes 1，spawns 空）。
+  在重做后的代码下这是**一致**的——tick 的 spawn 不再向 `board:agent-runs` 写 started，因此下一次 tick
+  读到该在飞卡 `runId=33793a1b…` 在 runs channel 无 started，便按崩溃恢复 reclaim 回 open（writes 1、
+  spawns 空）。之前那条「随后 reclaim 回 open」的 N13 描述与 old 代码（spawn 写 started）矛盾，现已消除：
+  churn 的真正消除依赖被启动的 worker 自行发布 started（那属 V1 / worker 的职责），本包只保证
+  **spawn 真实启动 worker** 与 **W1/N1 接线判别**（有 started 即不 reclaim）。
 
 ## 重做（final review findings 修复）
 
 | finding | 处置 |
 |---|---|
 | **blocker（§1.3）**：`tick_channel` 无供给路径，`--run` 永不触发 | 打通全链路：`fleet.yaml.tpl` input 声明 `tick_channel: ${TICK_CHANNEL}`，`bin/deep-research-loop.sh` 导出 `TICK_CHANNEL`（默认 `research:p02-smoke-1dce60`）；渲染 fleet 的 pipeline input 携带非空 `tick_channel`，经 `{{tick_channel}}` 注入 seed payload，`tick.md` 的 `--run "$tick_channel"` 真实可达。N9 改为判别性断言（不再只 grep 文本）。 |
-| **major（§1.2）**：`runChannelWrite` 注入 `spawnWorker: async () => {}`，真实 `--run` 认领卡后不启动任何东西，造成 spec §0 churn | 注入真实 `spawnAgentRun`：CAS 成功后向 `board:agent-runs` 发布 `agent.run.started`（run_id/role/clue_id）。下一次 tick 读到 started 便不再 reclaim 该在飞卡，churn 消除。spawn 写 run 生命周期 channel，不计入 `--max-writes` 的 CAS 预算（spec §2）；worker 产出（worker.result.v1 未注册）仍属 V1，不在本包范围（spec §7）。新增 `A8c real spawn publishes agent.run.started on the runs channel` 用例证明真实路径非空操作。 |
+| **blocker（§1.2 spawn 伪造）**：`spawnAgentRun` 发布 `agent.run.started` 但无进程，把在飞卡永久钉死 | 移除伪造 bus 事实。真实 spawn 改为 `spawnWorkerProcess`：CAS 成功后**真正启动 worker 子进程**（`child_process.spawn`，命令经 `TICK_WORKER_CMD`/options 配置）。`agent.run.started` 改由真正启动的 worker 自行发布（spec §2：spawn 不写 bus；评审 blocker：started 必须对应真实进程）。启动失败 ⇒ reject ⇒ N5 当场 CAS 回 open。 |
+| **major（N13 证据矛盾）**：dev-note 称「随后 --run reclaim 回 open」与 old 代码（spawn 写 started）矛盾 | 见上方 N13 一致性说明：tick 不再写 started，随后 --run 读无 started ⇒ reclaim 回 open，描述自洽；churn 消除改为依赖 worker 自行发布 started（V1）。 |
+| **major（spawn 绕过写预算写 bus）**：spawn 发布走 board:agent-runs，不计入 --max-writes | spawn 不再写 agent-bus：`--max-writes` 只计 CAS（每次 spawn 前的 CAS 计入），无未计预算的额外 append（spec §2 前提恢复）。 |
+| **major（web block rationale 未落卡）**：`WEB_BLOCK_RATIONALE` 无生产路径引用，block CAS 只写 status | `Decision.block` 增加 `rationale`；`decideTick` 对 web/invalid/unmapped 各带明确 rationale；`runWrite` block 分支把它写进卡；`realCas` 把它并入 payload。N7 断言 web block 决策携带非空 `WEB_BLOCK_RATIONALE`。 |
 | **minor**：`src/tick.ts` 残留 V5/V6 mutation-marker 注释，与所注释分支矛盾 | 删除两行遗留注释（分支逻辑逐字不变，即变异自检后的还原态）。 |
 
 ## 验收
 
 - `npm run typecheck` —— exit 0
-- `npm test` —— 既有 171 条 + 新增 17 条全绿（**188** 条）
-- `--run` 对 `research:p02-smoke-1dce60` 真跑 exit 0；跑前无在飞卡，增量 1 ≤ 5，spawn 被调用
+- `npm test` —— 全量绿（**191** 条；既有用例一行未删，只增未减）
+- `--run` 对 `research:p02-smoke-1dce60` 真跑 exit 0；跑前无在飞卡，增量 1 ≤ 5，spawn 启动 worker 子进程
 - V1–V6 变异逐条杀到对应断言并逐字还原
 - 未触碰 `.dd-evidence/`

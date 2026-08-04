@@ -14,6 +14,7 @@
  * ⛔ CAS 一律走 A8b 的 `realCas`，不得绕过另写 CAS（spec §4.1 纪律 8）。
  */
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import type { ClueV2 } from "./protocol";
 import {
   decideTick,
@@ -26,7 +27,7 @@ import {
   readAgentRuns,
   readChannelMessages,
 } from "./tick-inspect";
-import { casUpdateClue, getEntity, publish } from "./bus";
+import { casUpdateClue, getEntity } from "./bus";
 
 /** --max-writes 默认值（spec §2：单次运行写入上限默认很小）。 */
 export const DEFAULT_MAX_WRITES = 5;
@@ -81,6 +82,8 @@ export interface WriteCasInput {
    */
   from: ClueV2["status"];
   runId?: string;
+  /** block 时写入卡的明确 rationale（spec §1.2 N7：blocked 且 rationale 非空）。 */
+  rationale?: string | null;
 }
 
 /** 写侧依赖注入面：所有副作用（CAS / spawn）都从这里走。 */
@@ -222,10 +225,12 @@ export async function runWrite(
       }
       case "block": {
         // block 决策源自 open 卡（invalid_sources / web_unimplemented / unmapped_source）⇒ 前置条件为 open。
+        // ⛔ 把 decision.rationale 写进卡（spec §1.2 N7：blocked 且 rationale 非空）。
         const result = await perform({
           clueId: decision.clueId,
           to: "blocked",
           from: "open",
+          rationale: decision.rationale,
         });
         casResults.push({
           clueId: decision.clueId,
@@ -256,6 +261,12 @@ export interface RunWriteOptions {
   channelId: string;
   maxWrites?: number;
   runsChannelId?: string;
+  /** 注入的 spawn dep（测试用）；缺省走真实子进程启动 worker。 */
+  spawnWorker?: WriteDeps["spawnWorker"];
+  /** worker 启动命令（argv[0]）；缺省 `TICK_WORKER_CMD` env 或 `bash`。 */
+  workerCmd?: string;
+  /** worker 启动固定参数（追加在 role/clueId/runId 之前）。 */
+  workerArgs?: string[];
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -291,39 +302,62 @@ export async function realCas(
   }
   const update: Partial<ClueV2> = { status: input.to };
   if (input.runId) update.run_id = input.runId;
+  if (input.rationale !== undefined) update.rationale = input.rationale;
   const idempotencyKey = `a8b-run:${channelId}:${input.clueId}:${input.to}:${nonce}`;
   return casUpdateClue(channelId, input.clueId, head, update, idempotencyKey);
 }
 
 /**
- * 真实 spawn 动作（spec §1.2 / A8c）：CAS 成功后在 `board:agent-runs` 上登记一次
- * `agent.run.started`，把该 run_id 标记为已起。这是 spawn 的真实可观察效果——
- * 下一次 tick 的 `readAgentRuns` 会读到它，从而不再把这张在飞卡 reclaim 回 open
- * （堵掉 spec §0 的「open→in_flight、无 started、下轮回收」churn）。
+ * 真实 spawn 动作（spec §1.2 / A8c）：CAS 成功后**真正启动一个 worker 子进程**。
  *
- * ⛔ spawn 本身写的是 run 生命周期 channel（board:agent-runs），不是 clue 板 channel，
- *    不触碰 `--max-writes` 的 CAS 预算（spec §2：spawn 不计入写入预算）；
- *    worker 的实际产出（worker.result.v1）属 V1，本包不注册（spec §7）。
+ * ⛔ spawn 本身不写 agent-bus（spec §2：spawn 不写 bus，仅每次 spawn 前的 CAS 计入）。
+ * ⛔ 本包**不伪造** `agent.run.started` —— 该生命周期事实必须由真正启动的 worker 自行发布；
+ *    若没有进程却发布 started，decideTick 会把在飞卡永久钉死在 in_flight（评审 blocker）。
+ *    worker 的实际产出（worker.result.v1 未注册）属 V1，本包不注册（spec §7）。
+ *
+ * 启动失败（如命令不存在）⇒ reject ⇒ 上层（N5 / S2 补偿）当场把卡 CAS 回 open。
  */
-export async function spawnAgentRun(
-  runsChannelId: string,
-  clueId: string,
-  role: string,
-  runId: string,
-): Promise<void> {
-  await publish(runsChannelId, {
-    kind: "agent.run.started.v1",
-    payload: { run_id: runId, role, clue_id: clueId },
-    idempotency_key: `a8c-spawn:${runsChannelId}:${clueId}:${runId}`,
-    entity_id: runId,
+export interface WorkerSpawnSpec {
+  /** worker 启动命令（argv[0]）。 */
+  cmd: string;
+  /** worker 启动参数（追加 role/clueId/runId 之外的可配置固定参数）。 */
+  args: string[];
+  /** 透传给 worker 的环境变量。 */
+  env?: Record<string, string>;
+}
+
+export interface SpawnedWorker {
+  pid: number | undefined;
+}
+
+export async function spawnWorkerProcess(
+  spec: WorkerSpawnSpec,
+): Promise<SpawnedWorker> {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(spec.cmd, spec.args, {
+      env: { ...process.env, ...spec.env },
+      stdio: "ignore",
+      detached: false,
+    });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve({ pid: child.pid });
+    });
   });
+}
+
+/** 缺省 worker 启动命令：由 `TICK_WORKER_CMD` 注入（部署方指向真实 worker launcher）。 */
+export function defaultWorkerCmd(): string {
+  return process.env.TICK_WORKER_CMD ?? "bash";
 }
 
 /**
  * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写 + spawn。
  * ⛔ CAS 一律走 A8b 的 `realCas`（不得绕过另写 CAS，spec §4.1 纪律 8）。
- * spawn 为真实路径实现：CAS 成功后调用（带 role/runId）登记 agent.run.started（spec §1.2）；
- * 本包真机验证只到「spawn 被调用」为止，worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
+ * spawn 为真实路径实现：CAS 成功后真正启动 worker 子进程（spec §1.2）；
+ * ⛔ spawn 不写 agent-bus、不伪造 `agent.run.started`（spec §2 / 评审 blocker）；
+ *    worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
  */
 export async function runChannelWrite(
   opts: RunWriteOptions,
@@ -337,10 +371,17 @@ export async function runChannelWrite(
   const runs = await readAgentRuns(runsChannelId);
   const state = assembleBoard(messages, runs).state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
+  const workerCmd = opts.workerCmd ?? defaultWorkerCmd();
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
-    spawnWorker: (clueId, role, runId) =>
-      spawnAgentRun(runsChannelId, clueId, role, runId),
+    spawnWorker:
+      opts.spawnWorker ??
+      ((clueId, role, runId) =>
+        spawnWorkerProcess({
+          cmd: workerCmd,
+          args: [...(opts.workerArgs ?? []), role, clueId, runId],
+          env: { TICK_ROLE: role, TICK_CLUE_ID: clueId, TICK_RUN_ID: runId },
+        }).then(() => undefined)),
   };
   const result = await runWrite(
     deps,

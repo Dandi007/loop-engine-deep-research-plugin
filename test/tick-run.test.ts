@@ -21,6 +21,7 @@ import {
   MissingChannelError,
   isFrozenChannel,
   realCas,
+  spawnWorkerProcess,
 } from "../src/tick-run";
 import type { WriteDeps, WriteCasInput } from "../src/tick-run";
 import { readAgentRuns } from "../src/tick-inspect";
@@ -629,14 +630,14 @@ describe("N5: spawn sync throw ⇒ immediate CAS back to open", () => {
   });
 });
 
-// ── A8c §1.2 真实 spawn 动作：runChannelWrite 的 spawn 不是空操作 ──
-// 评审 finding 2（major）：runChannelWrite 之前注入 `spawnWorker: async () => {}`，
-// 真实 `--run` 认领卡到 in_flight 后什么都不做。这里证明真实路径的 spawn 会向
-// `board:agent-runs` 发布一条 `agent.run.started`（run_id/role/clue_id），
-// 使下一次 tick 读到 started 而不 reclaim 该在飞卡（堵掉 spec §0 churn）。
+// ── A8c §1.2 真实 spawn 动作：runChannelWrite 的 spawn 不是空操作，也不伪造 bus 事实 ──
+// 评审 blocker + finding 3：重做前真实 spawn 直接向 `board:agent-runs` 发布 `agent.run.started`
+// （无进程的伪造生命周期事实，会把在飞卡永久钉死在 in_flight），且绕过 --max-writes 预算在
+// 非 sanctioned channel 上写 bus。重做后：真实 spawn = **真正启动 worker 子进程**，不写 agent-bus、
+// 不伪造 started（spec §2：spawn 不写 bus，仅每次 spawn 前的 CAS 计入）。
 
-describe("A8c real spawn publishes agent.run.started on the runs channel", () => {
-  it("dispatch CAS success ⇒ real spawnAgentRun registers agent.run.started", async () => {
+describe("A8c real spawn launches a worker subprocess without writing the bus", () => {
+  it("dispatch CAS success ⇒ real spawn called with role/runId, no agent.run.started publish", async () => {
     const openClueMsg = {
       message_id: "msg_open_1",
       channel_id: WIRE_CLUE_CHANNEL,
@@ -653,6 +654,7 @@ describe("A8c real spawn publishes agent.run.started on the runs channel", () =>
       payload: Record<string, unknown>;
       entity_id?: string;
     }> = [];
+    const spawnWorker = vi.fn(async () => {});
     let clueCalls = 0;
     let runsCalls = 0;
     vi.stubGlobal(
@@ -680,22 +682,38 @@ describe("A8c real spawn publishes agent.run.started on the runs channel", () =>
       }),
     );
 
-    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      spawnWorker,
+    });
 
     // 活性：dispatch 真被 spawn，spawns 记录 spawned=true。
     expect(outcome.spawns).toHaveLength(1);
     expect(outcome.spawns[0].spawned).toBe(true);
-    // 真实 spawn 动作：向 board:agent-runs 发布 agent.run.started（run_id/role/clue_id）。
+    // spawn 收到 role/clueId/runId。
+    expect(spawnWorker).toHaveBeenCalledTimes(1);
+    const [clueId, role, runId] = spawnWorker.mock.calls[0] as unknown as [string, string, string];
+    expect(clueId).toBe("clue_x");
+    expect(role).toBe("dr-worker-code-local");
+    expect(runId).toMatch(/^[0-9a-f-]{36}$/);
+    // ⛔ 不写 bus 生命周期事实：无 agent.run.started 发往 board:agent-runs（评审 blocker/finding 3）。
     const started = publishBodies.filter((b) => b.kind === "agent.run.started.v1");
-    expect(started).toHaveLength(1);
-    expect(started[0].channel).toBe("board:agent-runs");
-    expect(started[0].payload.run_id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(started[0].payload.role).toBe("dr-worker-code-local");
-    expect(started[0].payload.clue_id).toBe("clue_x");
-    // 另有恰好一次 clue CAS（open→in_flight）发到 clue 板 channel。
+    expect(started).toHaveLength(0);
+    // 唯一 bus 写是 clue CAS open→in_flight（计入 --max-writes 预算，spec §2）。
     const cluePubs = publishBodies.filter((b) => b.kind === "research.clue.v2");
     expect(cluePubs).toHaveLength(1);
     expect(cluePubs[0].channel).toBe(WIRE_CLUE_CHANNEL);
     expect(cluePubs[0].payload.status).toBe("in_flight");
+  });
+
+  it("spawnWorkerProcess genuinely launches a worker subprocess (no bus write)", async () => {
+    // 真实 spawn 原语：用 node -e 起一个立即退出的子进程，验证它真正 spawn 出进程并携带
+    // role/clueId/runId 参数；spawn 原语本身不碰 agent-bus（spec §2）。
+    const launched = spawnWorkerProcess({
+      cmd: process.execPath,
+      args: ["-e", "process.exit(0)", "dr-worker-wiki", "clue_y", "run-z"],
+      env: { TICK_ROLE: "dr-worker-wiki", TICK_CLUE_ID: "clue_y", TICK_RUN_ID: "run-z" },
+    });
+    await expect(launched).resolves.toMatchObject({ pid: expect.any(Number) });
   });
 });

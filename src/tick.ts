@@ -36,6 +36,12 @@ export const WEB_SOURCE = "web";
 /** `web` 卡 blocked 时的明确 rationale（N7：非空）。 */
 export const WEB_BLOCK_RATIONALE =
   "source 'web' has no worker role (dr-worker-web not implemented; spec §4.3 mechanism undecided)";
+/** 枚举外 `sources` 卡 blocked 时的明确 rationale（N6：blocked 且可解释）。 */
+export const INVALID_SOURCES_RATIONALE =
+  "source list contains values outside the closed enum (spec §4); cannot map to a worker role";
+/** 枚举内但无已映射 role 的 `sources` 卡 blocked 时的明确 rationale。 */
+export const UNMAPPED_SOURCE_RATIONALE =
+  "source list has no mapped worker role; cannot dispatch (spec §1.2)";
 
 /** `web` 是否出现在 sources 中（spec §1.2：必须走 blocked 分支，不得静默跳过/派给别的 role）。 */
 export function isWebSource(sources: string[]): boolean {
@@ -112,6 +118,8 @@ export type Decision =
       kind: "block";
       clueId: string;
       reason: "invalid_sources" | "web_unimplemented" | "unmapped_source";
+      /** 该卡 blocked 的明确 rationale（N7：blocked 且 rationale 非空，写进卡）。 */
+      rationale: string;
     }
   | { kind: "triage" };
 
@@ -177,17 +185,28 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
         kind: "block",
         clueId: card.clueId,
         reason: "web_unimplemented",
+        rationale: WEB_BLOCK_RATIONALE,
       });
       continue;
     }
     if (!isValidSources(card.sources)) {
-      decisions.push({ kind: "block", clueId: card.clueId, reason: "invalid_sources" });
+      decisions.push({
+        kind: "block",
+        clueId: card.clueId,
+        reason: "invalid_sources",
+        rationale: INVALID_SOURCES_RATIONALE,
+      });
       continue;
     }
     const role = roleForSources(card.sources);
     if (!role) {
       // 枚举内但无任何已映射 role 的 source（如 `web-search`）⇒ blocked（不 spawn）。
-      decisions.push({ kind: "block", clueId: card.clueId, reason: "unmapped_source" });
+      decisions.push({
+        kind: "block",
+        clueId: card.clueId,
+        reason: "unmapped_source",
+        rationale: UNMAPPED_SOURCE_RATIONALE,
+      });
       continue;
     }
     decisions.push({ kind: "dispatch", clueId: card.clueId, role });

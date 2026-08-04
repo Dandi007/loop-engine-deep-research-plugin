@@ -10,6 +10,8 @@ import {
   roleForSources,
   SOURCE_TO_ROLE,
   WEB_BLOCK_RATIONALE,
+  INVALID_SOURCES_RATIONALE,
+  UNMAPPED_SOURCE_RATIONALE,
   isWebSource,
 } from "../src/tick";
 import type {
@@ -215,7 +217,12 @@ describe("B8: out-of-enum source → card blocked, others still dispatched", () 
     const blocked = d.filter((x) => x.kind === "block");
     const dispatched = d.filter((x) => x.kind === "dispatch");
     expect(blocked).toEqual([
-      { kind: "block", clueId: "bad", reason: "invalid_sources" },
+      {
+        kind: "block",
+        clueId: "bad",
+        reason: "invalid_sources",
+        rationale: INVALID_SOURCES_RATIONALE,
+      },
     ]);
     expect(dispatched).toHaveLength(2);
   });
@@ -275,7 +282,12 @@ describe("N6: out-of-enum sources ⇒ card blocked, no dispatch", () => {
     const s = state({ cards: [card({ clueId: "bad", status: "open", sources: ["not-a-source"] })] });
     const d = decideTick(s, cfg);
     expect(d).toEqual([
-      { kind: "block", clueId: "bad", reason: "invalid_sources" },
+      {
+        kind: "block",
+        clueId: "bad",
+        reason: "invalid_sources",
+        rationale: INVALID_SOURCES_RATIONALE,
+      },
     ]);
     expect(d.some((x) => x.kind === "dispatch")).toBe(false);
   });
@@ -289,15 +301,29 @@ describe("N7: sources contains web ⇒ blocked with non-empty rationale, no disp
     const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
     const d = decideTick(s, cfg);
     expect(d).toEqual([
-      { kind: "block", clueId: "w", reason: "web_unimplemented" },
+      {
+        kind: "block",
+        clueId: "w",
+        reason: "web_unimplemented",
+        rationale: WEB_BLOCK_RATIONALE,
+      },
     ]);
     expect(d.some((x) => x.kind === "dispatch")).toBe(false);
   });
 
-  it("WEB_BLOCK_RATIONALE is non-empty and explicit", () => {
-    expect(typeof WEB_BLOCK_RATIONALE).toBe("string");
-    expect(WEB_BLOCK_RATIONALE.length).toBeGreaterThan(0);
-    expect(WEB_BLOCK_RATIONALE).toMatch(/web/);
+  it("the web block decision carries a non-empty rationale on the card", () => {
+    // ⛔ 判别性（spec §4.1 纪律 4/7）：不能只断言常量的长度/内容本身，
+    // 必须断言 decideTick 产出的 web block 决策真的携带该 rationale（会写进卡）。
+    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
+    const d = decideTick(s, cfg);
+    const block = d.find((x) => x.kind === "block");
+    expect(block?.kind).toBe("block");
+    if (block?.kind === "block") {
+      expect(block.reason).toBe("web_unimplemented");
+      expect(typeof block.rationale).toBe("string");
+      expect(block.rationale.length).toBeGreaterThan(0);
+      expect(block.rationale).toBe(WEB_BLOCK_RATIONALE);
+    }
   });
 });
 
@@ -336,7 +362,14 @@ describe("no-role enum member (web-search) ⇒ blocked (unmapped_source)", () =>
     expect(roleForSources(["web-search"])).toBeNull();
     const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web-search"] })] });
     const d = decideTick(s, cfg);
-    expect(d).toEqual([{ kind: "block", clueId: "w", reason: "unmapped_source" }]);
+    expect(d).toEqual([
+      {
+        kind: "block",
+        clueId: "w",
+        reason: "unmapped_source",
+        rationale: UNMAPPED_SOURCE_RATIONALE,
+      },
+    ]);
     expect(d.some((x) => x.kind === "dispatch")).toBe(false);
   });
 });

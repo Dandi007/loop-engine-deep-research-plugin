@@ -33,7 +33,7 @@ function baseDeps(over: Partial<GenerateDeps> = {}): GenerateDeps {
     spawnSynthesizer: vi.fn(async () => {}),
     spawnAnchorCheck: vi.fn(async () => ({ defects: 0 })),
     spawnExport: vi.fn(async () => {}),
-    tryLockSynthesizer: async () => async () => {},
+    lockSynthesizer: async () => async () => {},
     ...over,
   };
 }
@@ -87,6 +87,14 @@ describe("S4 debaters (D4/D5/D16)", () => {
     await runGenerate(deps, cfg);
     expect(routes).toHaveLength(3);
     expect(new Set(routes).size).toBe(3);
+  });
+
+  it("D5/Q2: a caller-supplied config with duplicate debater routes is rejected (not silently accepted)", async () => {
+    const bad: GenerateConfig = {
+      ...cfg,
+      debaterRoutes: ["debater.pro", "debater.pro", "debater.con"],
+    };
+    await expect(runGenerate(baseDeps(), bad)).rejects.toThrow(/mutually distinct/);
   });
 
   it("D16: route combination is not hardcoded — custom three routes are the ones used", async () => {
@@ -152,8 +160,9 @@ describe("S4 ordering (D7/D8)", () => {
 });
 
 describe("S4 singleton synthesizer lock (D6)", () => {
-  it("D6: while one synthesizer is pending, no second synthesizer is spawned", async () => {
+  it("D6: while one synthesizer is pending, the lock serializes — no second synthesizer spawn; synthesizer is never skipped", async () => {
     let locked = false;
+    let waiters: Array<() => void> = [];
     let resolveSynth!: () => void;
     const gate = new Promise<void>((r) => {
       resolveSynth = r;
@@ -161,27 +170,41 @@ describe("S4 singleton synthesizer lock (D6)", () => {
     const spawnSynth = vi.fn(async () => {
       await gate;
     });
+    const lockSynth = vi.fn(async () => {
+      if (locked) {
+        // 串行化：等待锁释放（wait-then-run），绝不跳过 synthesizer。
+        await new Promise<void>((r) => waiters.push(r));
+      }
+      locked = true;
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        locked = false;
+        const w = waiters;
+        waiters = [];
+        w.forEach((r) => r());
+      };
+    });
     const deps = baseDeps({
       spawnSynthesizer: spawnSynth,
-      tryLockSynthesizer: async () => {
-        if (locked) return null;
-        locked = true;
-        return async () => {
-          locked = false;
-        };
-      },
+      lockSynthesizer: lockSynth,
     });
 
     const first = runGenerate(deps, cfg);
     // 等第一次调用真正发起 synthesizer spawn（此刻 lock 已被持有且挂起）。
     await vi.waitFor(() => expect(spawnSynth).toHaveBeenCalledTimes(1));
 
-    // 挂起期间驱动第二次编排：拿不到锁，不得发起第二次 synthesizer spawn。
-    await runGenerate(deps, cfg);
+    // 挂起期间驱动第二次编排：拿不到锁必须等待，不得发起第二次 synthesizer spawn。
+    const second = runGenerate(deps, cfg);
+    await new Promise((r) => setTimeout(r, 20));
     expect(spawnSynth).toHaveBeenCalledTimes(1);
 
+    // 释放第一次后，第二次串行拿到锁并补跑 synthesizer（不跳过阶段）。
     resolveSynth();
     await first;
+    await second;
+    expect(spawnSynth).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -242,6 +265,13 @@ describe("S4 report header (D11/D12/D13/D14/D15)", () => {
 
     // 散文/无标记 body → null
     expect(parseReportMarker("## 无结论")).toBeNull();
+  });
+
+  it("D15: parse is head-scoped — a marker embedded mid-document (not at body head) is NOT parsed", () => {
+    const body = renderReportBody({ stop: "converged", blocked: 0, capHit: false });
+    // 把标记嵌进正文中间（前面有散文），不得被当成头部标记解析出来。
+    const midDocument = `prose intro\n${body}\nmore`;
+    expect(parseReportMarker(midDocument)).toBeNull();
   });
 });
 

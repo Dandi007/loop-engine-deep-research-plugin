@@ -127,6 +127,16 @@ export type Decision =
       sources?: string[];
     }
   | {
+      kind: "harvest";
+      clueId: string;
+      /** 该 run 的 run_id（A8e：按 run_id 找 worker.result.v1，spec §1）。 */
+      runId: string | null | undefined;
+      /** 父卡 clue 文本 / 深度 / sources：proposed_clue 继承用（spec §1.5/§1.6）。 */
+      text: string;
+      depth: number;
+      sources: string[];
+    }
+  | {
       kind: "block";
       clueId: string;
       reason: "invalid_sources" | "web_unimplemented" | "unmapped_source";
@@ -187,7 +197,16 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
       continue;
     }
     if (run.exitCode === 0) {
-      decisions.push({ kind: "reclaim", clueId: card.clueId, to: "explored", retries: card.retries });
+      // A8e——exited(0) ⇒ 收割步：先把 worker.result.v1 转成 evidence + 新 clue 发回研究板，
+      // 全部发完之后才 CAS 该卡 → explored（spec §1；§1.1 CAS 必须是最后一步）。
+      decisions.push({
+        kind: "harvest",
+        clueId: card.clueId,
+        runId: card.runId,
+        text: card.text,
+        depth: card.depth,
+        sources: card.sources,
+      });
     } else if (card.retries < cfg.maxRetries) {
       decisions.push({ kind: "reclaim", clueId: card.clueId, to: "open", retries: card.retries + 1 });
     } else {

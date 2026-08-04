@@ -29,8 +29,15 @@ import {
   assembleBoard,
   readAgentRuns,
   readChannelMessages,
+  readWorkerResult,
 } from "./tick-inspect";
-import { casUpdateClue, getEntity } from "./bus";
+import {
+  harvestCard,
+  MissingEvidenceChannelError,
+  type HarvestDeps,
+  type HarvestReport,
+} from "./harvest";
+import { casUpdateClue, getEntity, publishClue, publishEvidence } from "./bus";
 
 /** --max-writes 默认值（spec §2：单次运行写入上限默认很小）。 */
 export const DEFAULT_MAX_WRITES = 5;
@@ -104,6 +111,11 @@ export interface WriteDeps {
     runId: string,
     input: WorkerInputPayload,
   ): Promise<void>;
+  /**
+   * A8e——收割写依赖（可选）：仅在存在 `harvest` 决策（exited(0)）时使用。
+   * 缺省（未接线）⇒ 遇到 harvest 决策时抛 `MissingEvidenceChannelError`（§1.4 / H14）。
+   */
+  harvest?: HarvestDeps;
 }
 
 /** 一次 spawn 的观察记录：role/runId 由决策注入，spawned 表示 spawnWorker 是否成功返回。 */
@@ -130,6 +142,8 @@ export interface WriteResult {
   spawns: SpawnRecord[];
   /** spawn dep 被调用的次数。 */
   spawnCalls: number;
+  /** A8e——收割报告（每张 exited(0) 卡一条；H12/H13 显式报告跳过数）。 */
+  harvestReports: HarvestReport[];
 }
 
 function generateRunId(): string {
@@ -218,6 +232,7 @@ export async function runWrite(
   let skipped = 0;
   const casResults: WriteResult["casResults"] = [];
   const spawns: WriteResult["spawns"] = [];
+  const harvestReports: WriteResult["harvestReports"] = [];
   // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增。
   let spawnCalls = 0;
   const spawnWorker = async (
@@ -254,6 +269,67 @@ export async function runWrite(
           success: result.success,
           error: result.error,
         });
+        break;
+      }
+      case "harvest": {
+        // A8e——收割步：把 worker.result.v1 转成 evidence + 新 clue 发回研究板，
+        // 全部发布成功后才 CAS 到 explored（§1.1：先发完，才 CAS；H6/H7）。
+        const hd = deps.harvest;
+        // ⛔ 证据 channel 无默认值：未接线/缺失 ⇒ 响亮报错，且零网络请求（§1.4 / H14 / H15）。
+        if (!hd || !hd.evidenceChannelId) {
+          throw new MissingEvidenceChannelError();
+        }
+        // 无 runId（极端状态）⇒ 无从收割，直接 CAS 到 explored（与 no_result 同语义）。
+        if (!decision.runId) {
+          const result = await perform({
+            clueId: decision.clueId,
+            to: "explored",
+            from: "in_flight",
+          });
+          casResults.push({
+            clueId: decision.clueId,
+            to: "explored",
+            success: result.success,
+            error: result.error,
+          });
+          break;
+        }
+        // ⛔ v1 冻结证据 channel 拒写，零请求（§2 / H16）。
+        if (isFrozenChannel(hd.evidenceChannelId)) {
+          throw new FrozenChannelError(hd.evidenceChannelId);
+        }
+        // §1.7——evidence+clue 发布均计入 --max-writes；不足则整卡跳过。
+        const budget = {
+          remaining: () => maxWrites - writes,
+          consume: (n: number) => {
+            writes += n;
+          },
+        };
+        const report = await harvestCard(
+          hd,
+          {
+            clueId: decision.clueId,
+            depth: decision.depth,
+            sources: decision.sources,
+          },
+          decision.runId,
+          budget,
+        );
+        harvestReports.push(report);
+        if (report.casExplored) {
+          // 全部发布成功 ⇒ 最后 CAS 到 explored（§1.1 / H6）。
+          const result = await perform({
+            clueId: decision.clueId,
+            to: "explored",
+            from: "in_flight",
+          });
+          casResults.push({
+            clueId: decision.clueId,
+            to: "explored",
+            success: result.success,
+            error: result.error,
+          });
+        }
         break;
       }
       case "dispatch": {
@@ -351,6 +427,7 @@ export async function runWrite(
     casResults,
     spawns,
     spawnCalls,
+    harvestReports,
   };
 }
 
@@ -359,6 +436,15 @@ export interface RunWriteOptions {
   channelId: string;
   maxWrites?: number;
   runsChannelId?: string;
+  /**
+   * A8e——证据 channel：⛔ 显式传入、无默认值、无 `.board`→`.evidence` 字符串推导（§1.4 / H14 / H15）。
+   * 仅当存在 harvest 决策（exited(0) 卡）时才必需；缺失 ⇒ 抛 `MissingEvidenceChannelError`（零请求）。
+   */
+  evidenceChannelId?: string;
+  /** A8e——maxDepth（§1.6 / H11）；缺省用 DEFAULT_TICK_CONFIG.maxDepth。 */
+  maxDepth?: number;
+  /** A8e——maxClues（§1.6 / H12）；缺省用 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
   /** 注入的 spawn dep（测试用）；缺省走真实 `agent-run` 子进程启动 worker。 */
   spawnWorker?: WriteDeps["spawnWorker"];
   /** `agent-run` 可执行路径（argv[0]）；缺省 `resolveAgentRunBin()`（`AGENT_RUN_BIN`/PATH）。 */
@@ -373,6 +459,8 @@ export interface RunWriteOutcome {
   writes: number;
   skipped: number;
   spawns: SpawnRecord[];
+  /** A8e——收割报告（exited(0) 卡的 evidence/clue 发布与跳过情况）。 */
+  harvestReports: HarvestReport[];
 }
 
 /**
@@ -605,8 +693,12 @@ export async function runChannelWrite(
   const runsChannelId = opts.runsChannelId ?? "board:agent-runs";
   const messages = await readChannelMessages(opts.channelId);
   const runs = await readAgentRuns(runsChannelId);
-  const state = assembleBoard(messages, runs).state;
+  const assembled = assembleBoard(messages, runs);
+  const state = assembled.state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
+  // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
+  const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
+  const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
@@ -618,6 +710,19 @@ export async function runChannelWrite(
           runId,
           input,
         }).then(() => undefined)),
+    // A8e——收割写依赖：证据 channel 显式传入（无默认值）；readWorkerResult 读 board:agent-runs。
+    harvest: {
+      evidenceChannelId: opts.evidenceChannelId ?? "",
+      boardChannelId: opts.channelId,
+      maxClues,
+      maxDepth,
+      boardClueCount: assembled.clueEntities,
+      readWorkerResult: (runId) => readWorkerResult(runId, runsChannelId),
+      publishEvidence: (channelId, evidence, key) =>
+        publishEvidence(channelId, evidence, key).then(() => undefined),
+      publishClue: (channelId, clue, key) =>
+        publishClue(channelId, clue, key).then(() => undefined),
+    },
   };
   const result = await runWrite(
     deps,
@@ -631,6 +736,7 @@ export async function runChannelWrite(
     writes: result.writes,
     skipped: result.skipped,
     spawns: result.spawns,
+    harvestReports: result.harvestReports,
   };
 }
 
@@ -638,10 +744,13 @@ export async function runChannelWrite(
 export interface RunCliOptions {
   channelId: string;
   maxWrites: number;
+  /** A8e——证据 channel（--evidence-channel）；可选，缺失时仅当有 harvest 决策才报错（§1.4 / H14）。 */
+  evidenceChannelId?: string;
 }
 
 /**
- * 解析 `--run` 之后的参数：`[<channel_id>] [--max-writes <n>]`。
+ * 解析 `--run` 之后的参数：
+ * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>]`。
  * ⛔ 不传 channel → 抛 MissingChannelError（exit ≠ 0，M11）。
  * ⛔ 冻结 channel → 抛 FrozenChannelError（M12）。
  */
@@ -651,6 +760,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     throw new MissingChannelError();
   }
   let maxWrites = DEFAULT_MAX_WRITES;
+  let evidenceChannelId: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -659,10 +769,18 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       maxWrites = value;
       i += 1;
+    } else if (args[i] === "--evidence-channel") {
+      evidenceChannelId = args[i + 1];
+      if (!evidenceChannelId) {
+        throw new Error(
+          "A8e: invalid --evidence-channel (must specify a channel id).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
     throw new FrozenChannelError(channelId);
   }
-  return { channelId, maxWrites };
+  return { channelId, maxWrites, evidenceChannelId };
 }

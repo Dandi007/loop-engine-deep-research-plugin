@@ -150,14 +150,21 @@ describe("B6: reclaim four branches each have an independent case", () => {
     ]);
   });
 
-  it("exited with exit_code 0 → CAS to explored", () => {
+  it("exited with exit_code 0 → harvest (reclaim-explored moves to harvest)", () => {
     const s = state({
       cards: [inFlightCard()],
       runs: { run_1: { state: "exited", exitCode: 0 } },
     });
     const d = decideTick(s, cfg);
     expect(d).toEqual([
-      { kind: "reclaim", clueId: "x", to: "explored", retries: 0 },
+      {
+        kind: "harvest",
+        clueId: "x",
+        runId: "run_1",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+      },
     ]);
   });
 

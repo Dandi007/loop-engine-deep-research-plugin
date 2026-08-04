@@ -103,14 +103,21 @@ describe("M2: discriminative — no started run ⇒ reclaim to open", () => {
 
 // ── M3 / M4 / M5：exited 分支 ────────────────────────────────────
 
-describe("M3: exited exit_code 0 ⇒ reclaim to explored", () => {
-  it("run exited with exit_code 0 ⇒ explore", () => {
+describe("M3: exited exit_code 0 ⇒ harvest decision (reclaim-explored moves to harvest)", () => {
+  it("run exited with exit_code 0 ⇒ harvest with runId + card fields", () => {
     const s = state({
       cards: [INFLIGHT_CARD],
       runs: { r1: { state: "exited", exitCode: 0 } },
     });
     expect(decideTick(s, cfg)).toEqual([
-      { kind: "reclaim", clueId: "x", to: "explored", retries: 0 },
+      {
+        kind: "harvest",
+        clueId: "x",
+        runId: "r1",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+      },
     ]);
   });
 });

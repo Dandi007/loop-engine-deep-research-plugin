@@ -8,6 +8,7 @@
  * 不重新实现（spec §1 step 4 / H5）。本模块只做「读 + 组装 + 打印」。
  */
 import type { ClueV2, EvidenceV2 } from "./protocol";
+import type { WorkerResultV1 } from "./harvest";
 import { getMessages } from "./bus";
 import {
   decideTick,
@@ -225,6 +226,28 @@ export async function readAgentRuns(
     if (parsed) runs[parsed.runId] = parsed.event;
   }
   return runs;
+}
+
+/**
+ * A8e —— 按 run_id 读该 run 的 `worker.result.v1`（收割步用，spec §1）。
+ * 分页读 `board:agent-runs`，取 kind 为 `worker.result.v1.message`（或含 result 语义的
+ * `worker.result.v1`）且 payload.run_id 匹配的**最后一条**（同 run 后发覆盖先发）。
+ * 找不到 ⇒ 返回 null（该 run 无产物可收割）。
+ * ⛔ 幂等/重放安全：本函数只读，不写；同 run_id 读到的结果用于稳定序号映射。
+ */
+export async function readWorkerResult(
+  runId: string,
+  channelId = "board:agent-runs",
+): Promise<WorkerResultV1 | null> {
+  const messages = await readChannelMessages(channelId);
+  let found: WorkerResultV1 | null = null;
+  for (const msg of messages) {
+    if (msg.kind !== "worker.result.v1") continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id !== runId) continue;
+    found = payload as WorkerResultV1;
+  }
+  return found;
 }
 
 /**

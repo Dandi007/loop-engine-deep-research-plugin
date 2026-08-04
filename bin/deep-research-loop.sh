@@ -26,6 +26,10 @@ export TICK_ENTRY="${TICK_ENTRY:-bash \"$PLUGIN_ROOT/bin/tick-entry.sh\"}"
 # A8c——tick 的 clue 板 channel：从 pipeline input namespace 注入 tick.md 供 `--run` 使用。
 # ⛔ spec §2 只允许在 research:p02-smoke-1dce60 上做真机写入验证；可用 TICK_CHANNEL 覆盖。
 export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
+# A8c（评审 blocker）——生产 spawn 的落地命令：**必须**指向一个真实存在的 worker launcher，
+# 而不是让缺省退化成 `bash <role>`（role 作为脚本路径不存在 ⇒ 退出 127，从未拉起 worker）。
+# 本脚本显式导出 TICK_WORKER_CMD 指向随包提供的 worker-launcher.sh；部署方可覆盖。
+export TICK_WORKER_CMD="${TICK_WORKER_CMD:-$PLUGIN_ROOT/bin/worker-launcher.sh}"
 export DD_CLAIM_STALE_MS="${DD_CLAIM_STALE_MS:-1800000}"
 
 mkdir -p "$TRIGGER_STORE_DIR" "$(dirname "$RUNTIME_FLEET")"

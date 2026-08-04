@@ -26,6 +26,12 @@
     仅每次 spawn 前的 CAS 计入；评审 blocker：`agent.run.started` 必须由真正启动的 worker 自行发布，
     无进程却发布 started 会把在飞卡永久钉死在 in_flight）。CAS 一律走 A8b 的 `realCas`，
     **不得绕过另写 CAS**（spec §4.1 纪律 8）。worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
+  - **第三次重做（评审 blocker）**：缺省 spawn 命令不再退化为 `bash`（把 role 当脚本路径、退出 127）。
+    新增真实 launcher `bin/worker-launcher.sh` + 占位 worker `bin/worker-placeholder.sh`（可执行）；
+    `bin/deep-research-loop.sh` **显式导出 `TICK_WORKER_CMD`** 指向 launcher；`defaultWorkerCmd()`
+    缺省退化为随包 launcher 路径。`spawnWorkerProcess` 增加「就绪窗口」：窗口内非零退出 ⇒ reject
+    （N5 回滚触发），仅「存活超窗」或「正常退出 0」才 resolve。新增**组合默认端到端用例**把
+    launcher 与 wiring 一起验证。
   - `--max-writes` 默认 5（M10）、channel 无默认值（M11）、v1 冻结 channel 拒写（M12）均沿用。
 - **修改 `src/tick.ts`**：删除 A8b 变异自检遗留的两行 mutation-marker 注释
   （`// V5 mutation: …` / `// V6 mutation: …`，finding 3 的 minor）——它们与注释上方
@@ -63,7 +69,7 @@
 | N12 | v1 冻结 channel 拒写 | `M12` 沿用 |
 | N13 | 真机 `--run` 对 `research:p02-smoke-1dce60` | 下方运行证据（跑前无在飞卡，增量 1 ≤ 5，spawn 启动 worker 子进程） |
 | N14 | 不得触碰 `.dd-evidence/` | git diff 校验为空 |
-| N15 | typecheck + 全量测试 | 均 exit 0（**188** 条全绿） |
+| N15 | typecheck + 全量测试 | 均 exit 0（**196** 条全绿） |
 | N16 | 既有用例一行未删 | git diff 无 `it(` 净减少（既有 171 全保留，净增 +17） |
 | N17 | 证据写 `docs/dev-notes/<development_id>.md` | 本文件；仓根无 `IMPLEMENTATION_SUMMARY.md` |
 
@@ -147,15 +153,20 @@ $ echo $?   # exit 0
 ```
 - **N13 增量核验**：跑前 = 9，跑后 = 10，**增量 = 1 ≤ 5**（未触 --max-writes=5）。
 - **接线判别真机成立**：只有一张 open 卡（`code-local`），`--run` 一次 dispatch CAS open→in_flight
-  （1 次 CAS）成功 ⇒ **spawn 启动 worker 子进程**（`spawnWorkerProcess`），带
-  `role=dr-worker-code-local`、`runId=33793a1b…`（N3）。spawn **不写 agent-bus**、不伪造 started
-  （增量只有 1 次 clue CAS）；worker 产出（`worker.result.v1` 未注册）属 V1，本包不信机验证（spec §7）。
+  （1 次 CAS）成功 ⇒ **spawn 拉起一个真实 worker 进程**（走 `TICK_WORKER_CMD`/缺省
+  `bin/worker-launcher.sh`），带 `role=dr-worker-code-local`、`runId=33793a1b…`（N3）。
+  spawn **不写 agent-bus**、不伪造 started（增量只有 1 次 clue CAS）。
+- **⚠️ 本包 spawn 的真实边界（spec §7）**：worker 的**研究行为与产出**（`worker.result.v1` 未注册）
+  属 **V1**，本包**不信机验证**。真机只能证明「**CAS + spawn 真实拉起 worker 进程**」到这一步，
+  **不得把 spawned:true 说成 worker 已产出结果**。占位 worker（`bin/worker-placeholder.sh`）只是
+  「worker 进程真实启动」的落地证明；真实 worker 由部署方经 `TICK_WORKER_RUNNER`（agent-runtime /
+  subagent-mcp）接入（V1）。
 - **一致性（评审 finding 2）**：随后再跑一次 `--run` 亦 exit 0（reclaim 回 open，writes 1，spawns 空）。
   在重做后的代码下这是**一致**的——tick 的 spawn 不再向 `board:agent-runs` 写 started，因此下一次 tick
   读到该在飞卡 `runId=33793a1b…` 在 runs channel 无 started，便按崩溃恢复 reclaim 回 open（writes 1、
   spawns 空）。之前那条「随后 reclaim 回 open」的 N13 描述与 old 代码（spawn 写 started）矛盾，现已消除：
   churn 的真正消除依赖被启动的 worker 自行发布 started（那属 V1 / worker 的职责），本包只保证
-  **spawn 真实启动 worker** 与 **W1/N1 接线判别**（有 started 即不 reclaim）。
+  **spawn 真实拉起 worker 进程**与 **W1/N1 接线判别**（有 started 即不 reclaim）。
 
 ## 重做（final review findings 修复）
 
@@ -168,10 +179,19 @@ $ echo $?   # exit 0
 | **major（web block rationale 未落卡）**：`WEB_BLOCK_RATIONALE` 无生产路径引用，block CAS 只写 status | `Decision.block` 增加 `rationale`；`decideTick` 对 web/invalid/unmapped 各带明确 rationale；`runWrite` block 分支把它写进卡；`realCas` 把它并入 payload。N7 断言 web block 决策携带非空 `WEB_BLOCK_RATIONALE`。 |
 | **minor**：`src/tick.ts` 残留 V5/V6 mutation-marker 注释，与所注释分支矛盾 | 删除两行遗留注释（分支逻辑逐字不变，即变异自检后的还原态）。 |
 
+## 第三次重做（attempt_01KZ76W5ETA48E7WSGSG1C27CV final review findings 修复）
+
+| finding | 处置 |
+|---|---|
+| **blocker（生产 spawn 无法拉起任何 worker）**：`defaultWorkerCmd()` 在 `TICK_WORKER_CMD` 未设时退化 `bash`，仓库无人设置它 ⇒ 部署态执行 `bash dr-worker-code-local <clueId> <runId>`（脚本不存在 ⇒ 退出 127，从未拉起 worker）；且组合默认从不被一起验证（wiring 注入 spawnWorker、原语给显式 cmd） | ① 新增真实 launcher `bin/worker-launcher.sh`（可执行，把 role/clueId/runId 作为**参数**拉起 worker，不再是 `bash <role>` 把 role 当脚本路径）；`bin/deep-research-loop.sh` **显式导出 `TICK_WORKER_CMD`** 指向它（评审：仓库此前无人设置）。② `defaultWorkerCmd()` 缺省退化为随包 launcher 路径，不再退化 `bash`。③ 新增**组合默认端到端用例**：`runChannelWrite` 不注入 spawnWorker、用缺省 launcher，验证它真实拉起 worker 进程（marker 文件作证，参数为 role/clueId/runId），且不写 `agent.run.started`——launcher 与 wiring **一起**被测。 |
+| **major（spawnWorkerProcess 只在 spawn 事件上断言成功）**：立即死亡（退出 127）的命令仍记 spawned:true，N5 补偿永不触发 | `spawnWorkerProcess` 增加「就绪窗口」：窗口内**非零退出**（如 127）⇒ reject `WorkerStartupError` ⇒ 上层 N5 当场 CAS 回 open；仅「存活超过窗口」或「正常退出 0」才 resolve。新增用例：立即退出 127 ⇒ reject（N5 会触发）。 |
+| **major（N13 真机证据夸大）**：dev-note 称 spawn 带 role=dr-worker-code-local 启动 worker；但旧缺省是 `bash dr-worker-code-local`，无法启动任何 worker | 见上方 N13 修订：本包 spawn 的真实边界是「**CAS + spawn 真实拉起 worker 进程**」（spec §7，不信机验证 worker 产出）；占位 worker 仅为「进程真实启动」的落地证明，真实 worker 属 V1 / 部署方经 `TICK_WORKER_RUNNER` 接入。不再把 spawned:true 说成 worker 已产出。 |
+| **minor（N7 rationale 只在决策层断言）**：写路径（runWrite block 分支 → realCas 并入 payload）无 publish-body 断言；删除 `if (input.rationale !== undefined) update.rationale = …` 测试仍全绿 | 新增 `realCas` block 分支 publish-body 断言：payload 携带非空 `rationale`（`WEB_BLOCK_RATIONALE`）。该变异（删除 rationale 并入）现会被杀。 |
+
 ## 验收
 
 - `npm run typecheck` —— exit 0
-- `npm test` —— 全量绿（**191** 条；既有用例一行未删，只增未减）
-- `--run` 对 `research:p02-smoke-1dce60` 真跑 exit 0；跑前无在飞卡，增量 1 ≤ 5，spawn 启动 worker 子进程
+- `npm test` —— 全量绿（**196** 条；既有用例一行未删，只增未减）
+- `--run` 对 `research:p02-smoke-1dce60` 真跑 exit 0；跑前无在飞卡，增量 1 ≤ 5，spawn 真实拉起 worker 进程
 - V1–V6 变异逐条杀到对应断言并逐字还原
 - 未触碰 `.dd-evidence/`

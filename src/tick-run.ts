@@ -15,6 +15,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
 import type { ClueV2 } from "./protocol";
 import {
   decideTick,
@@ -330,6 +332,31 @@ export interface SpawnedWorker {
   pid: number | undefined;
 }
 
+/** worker 进程在就绪窗口内即非零退出 —— 启动失败（如缺省命令退出 127），触发 N5 回滚。 */
+export class WorkerStartupError extends Error {
+  constructor(cmd: string, code: number | null) {
+    super(
+      `A8c: worker failed to start (${cmd}) — exited with code ${code}.`,
+    );
+    this.name = "WorkerStartupError";
+  }
+}
+
+/**
+ * worker 就绪窗口（ms）：进程存活超过该窗口即视为「已真实启动」。
+ * 在此窗口内非零退出（如命令不存在退出 127）⇒ 拒绝 ⇒ 上层 N5 当场 CAS 回 open。
+ * 窗口取足够大，避免在并发/负载下把「尚未来得及退出的坏命令」误判为已启动。
+ */
+export const SPAWN_READY_GRACE_MS = 2000;
+
+/**
+ * 真实 spawn 进程序（spec §1.2 / A8c）：CAS 成功后**真正启动一个 worker 子进程**，
+ * 并确认 worker 已真实启动（不是只在 `spawn` 事件上就断言成功，评审 finding 2）。
+ *
+ * ⛔ 只认「进程存活超过就绪窗口」或「正常退出（exit 0）」为启动成功；
+ *    就绪窗口内非零退出（如 `bash <缺失脚本>` 退出 127）⇒ reject ⇒ 上层 N5 不回滚。
+ *    spawned:true 由此只在 worker 确实起来时成立，不再是无意义的占位。
+ */
 export async function spawnWorkerProcess(
   spec: WorkerSpawnSpec,
 ): Promise<SpawnedWorker> {
@@ -339,17 +366,44 @@ export async function spawnWorkerProcess(
       stdio: "ignore",
       detached: false,
     });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve({ pid: child.pid });
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn();
+    };
+    child.once("error", (err) => settle(() => reject(err)));
+    child.once("exit", (code) => {
+      if (code === 0) {
+        // worker 正常完成 ⇒ 视为已启动。
+        settle(() => resolve({ pid: child.pid }));
+      } else {
+        // 就绪窗口内非零退出 ⇒ 未真正启动 worker，触发 N5 补偿。
+        settle(() => reject(new WorkerStartupError(spec.cmd, code)));
+      }
     });
+    // worker 存活超过就绪窗口 ⇒ 确认已真实启动。
+    timer = setTimeout(() => {
+      settle(() => {
+        child.unref();
+        resolve({ pid: child.pid });
+      });
+    }, SPAWN_READY_GRACE_MS);
   });
 }
 
-/** 缺省 worker 启动命令：由 `TICK_WORKER_CMD` 注入（部署方指向真实 worker launcher）。 */
+/**
+ * 缺省 worker 启动命令：由 `TICK_WORKER_CMD` 注入（部署方指向真实 worker launcher）；
+ * 缺省退化为**随包提供的真实 launcher** `bin/worker-launcher.sh`（评审 blocker）——
+ * 绝不是把 role 当脚本路径交给 `bash`（那会退出 127、从未拉起 worker）。
+ */
 export function defaultWorkerCmd(): string {
-  return process.env.TICK_WORKER_CMD ?? "bash";
+  const fromEnv = process.env.TICK_WORKER_CMD;
+  if (fromEnv) return fromEnv;
+  const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  return join(pluginRoot, "bin", "worker-launcher.sh");
 }
 
 /**

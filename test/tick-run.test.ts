@@ -6,10 +6,11 @@
  * M9 安全性断言配活性断言（第 3 条）。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { decideTick, DEFAULT_TICK_CONFIG } from "../src/tick";
+import { decideTick, DEFAULT_TICK_CONFIG, WEB_BLOCK_RATIONALE } from "../src/tick";
 import type { BoardCard, BoardState, Decision } from "../src/tick";
 import {
   runWrite,
@@ -22,6 +23,8 @@ import {
   isFrozenChannel,
   realCas,
   spawnWorkerProcess,
+  WorkerStartupError,
+  defaultWorkerCmd,
 } from "../src/tick-run";
 import type { WriteDeps, WriteCasInput } from "../src/tick-run";
 import { readAgentRuns } from "../src/tick-inspect";
@@ -715,5 +718,166 @@ describe("A8c real spawn launches a worker subprocess without writing the bus", 
       env: { TICK_ROLE: "dr-worker-wiki", TICK_CLUE_ID: "clue_y", TICK_RUN_ID: "run-z" },
     });
     await expect(launched).resolves.toMatchObject({ pid: expect.any(Number) });
+  });
+});
+
+// ── 评审 finding：缺省 spawn 命令（组合默认）不得是 `bash <role>`（退出 127、从未拉起 worker）──
+
+describe("A8c default worker command is a real launcher, not bash <role>", () => {
+  it("defaultWorkerCmd() points at the repo's worker-launcher.sh (not 'bash')", () => {
+    const cmd = defaultWorkerCmd();
+    expect(cmd).not.toBe("bash");
+    expect(cmd).toMatch(/worker-launcher\.sh$/);
+    expect(existsSync(cmd)).toBe(true);
+  });
+
+  it("deep-research-loop.sh exports TICK_WORKER_CMD pointing at a real launcher", () => {
+    const src = readFileSync(join(ROOT, "..", "bin", "deep-research-loop.sh"), "utf8");
+    expect(src).toMatch(/TICK_WORKER_CMD=/);
+    expect(src).toMatch(/worker-launcher\.sh/);
+  });
+});
+
+// ── 评审 finding 2：spawnWorkerProcess 必须把「就绪窗口内立即非零退出」判为启动失败 ──
+
+describe("A8c spawnWorkerProcess rejects an immediate non-zero exit (worker never started)", () => {
+  it("a command that exits 127 immediately is rejected ⇒ N5 compensation fires", async () => {
+    // 缺省坏命令（旧实现 `bash <role>` 的等价物）：进程随 spawn 拉起但立即退出 127。
+    // spawnWorkerProcess 不得在 spawn 事件上就断言成功，必须拒绝以触发上层 N5 回滚。
+    await expect(
+      spawnWorkerProcess({
+        cmd: process.execPath,
+        args: ["-e", "process.exit(127)"],
+      }),
+    ).rejects.toBeInstanceOf(WorkerStartupError);
+  });
+});
+
+// ── 评审 blocker：组合默认被分开验证（wiring 注入 spawnWorker / 原语给显式 cmd），
+//    从不一起跑。这里把 **缺省 launcher** 与 **wiring** 放在同一条端到端用例里验证。 ──
+
+describe("A8c composed default: wiring + default launcher verified together", () => {
+  it("runChannelWrite with no injected spawnWorker launches the default worker launcher as a real process", async () => {
+    const marker = join(tmpdir(), `worker-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+    const prevCmd = process.env.TICK_WORKER_CMD;
+    const prevMarker = process.env.TICK_WORKER_MARKER;
+    const prevMaxS = process.env.TICK_WORKER_MAX_S;
+    delete process.env.TICK_WORKER_CMD; // 用缺省 launcher（不注入 spawnWorker）
+    process.env.TICK_WORKER_MARKER = marker;
+    process.env.TICK_WORKER_MAX_S = "1"; // 占位 worker 运行 1s 后退出 0，避免泄漏进程
+    const openClueMsg = {
+      message_id: "msg_open_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      entity_id: "clue_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const publishBodies: Array<{ channel?: string; kind: string; payload: Record<string, unknown> }> = [];
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: openClueMsg });
+        }
+        const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+        if (pm) {
+          const body = JSON.parse(String(init?.body));
+          publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+          return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    try {
+      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+      // 活性：组合默认下 dispatch 真被 spawn，spawned:true 有真实进程作证。
+      expect(outcome.spawns).toHaveLength(1);
+      expect(outcome.spawns[0].spawned).toBe(true);
+      // 判别性：缺省 launcher 真实被拉起，参数为 role/clueId/runId（不是 bash <role>）。
+      const deadline = Date.now() + 3000;
+      while (!existsSync(marker)) {
+        if (Date.now() > deadline) throw new Error(`worker launcher marker not created: ${marker}`);
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      const line = readFileSync(marker, "utf8").trim();
+      const [role, clueId, runId] = line.split("\t");
+      expect(role).toBe("dr-worker-code-local");
+      expect(clueId).toBe("clue_x");
+      expect(runId).toMatch(/^[0-9a-f-]{36}$/);
+      // 安全：spawn 不写 agent-bus 生命周期事实（无 agent.run.started ⇒ 不外推 started）。
+      const started = publishBodies.filter((b) => b.kind === "agent.run.started.v1");
+      expect(started).toHaveLength(0);
+    } finally {
+      rmSync(marker, { force: true });
+      if (prevCmd === undefined) delete process.env.TICK_WORKER_CMD;
+      else process.env.TICK_WORKER_CMD = prevCmd;
+      if (prevMarker === undefined) delete process.env.TICK_WORKER_MARKER;
+      else process.env.TICK_WORKER_MARKER = prevMarker;
+      if (prevMaxS === undefined) delete process.env.TICK_WORKER_MAX_S;
+      else process.env.TICK_WORKER_MAX_S = prevMaxS;
+    }
+  });
+});
+
+// ── 评审 minor finding：N7 rationale 必须落在真实写路径（publish body），
+//    而不只是在决策层断言── ──
+
+describe("N7: block rationale is written into the card on the real write path", () => {
+  it("realCas block publish body carries non-empty rationale (kills rationale-deletion mutation)", async () => {
+    const publishBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "msg_001",
+              channel_id: WIRE_CLUE_CHANNEL,
+              channel_seq: 1,
+              kind: "research.clue.v2",
+              payload: { status: "open", text: "t", depth: 0, sources: [] },
+              entity_id: "x",
+              supersedes: null,
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          });
+        }
+        if (u.includes("/publish")) {
+          publishBodies.push(JSON.parse(String(init?.body)));
+          return jsonResponse({ message_id: "msg_002", channel_seq: 2 });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const result = await realCas(
+      WIRE_CLUE_CHANNEL,
+      { clueId: "x", to: "blocked", from: "open", rationale: WEB_BLOCK_RATIONALE },
+      "nonce-block",
+    );
+
+    expect(result.success).toBe(true);
+    expect(publishBodies).toHaveLength(1);
+    const payload = publishBodies[0].payload as Record<string, unknown>;
+    expect(payload.status).toBe("blocked");
+    expect(typeof payload.rationale).toBe("string");
+    expect(String(payload.rationale).length).toBeGreaterThan(0);
+    expect(payload.rationale).toBe(WEB_BLOCK_RATIONALE);
   });
 });

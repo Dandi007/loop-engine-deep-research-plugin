@@ -12,6 +12,7 @@ import type { BoardCard, TickConfig, TerminalState } from "../src/tick";
 function card(over: Partial<BoardCard> = {}): BoardCard {
   return {
     clueId: "c1",
+    text: "investigate X",
     status: "explored",
     depth: 0,
     sources: ["code-local"],

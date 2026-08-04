@@ -15,8 +15,9 @@
  */
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import type { ClueV2 } from "./protocol";
 import {
   decideTick,
@@ -91,8 +92,18 @@ export interface WriteCasInput {
 /** 写侧依赖注入面：所有副作用（CAS / spawn）都从这里走。 */
 export interface WriteDeps {
   cas(input: WriteCasInput): Promise<CasDecision>;
-  /** ⛔ 注入的 spawn dep：CAS 成功后才调用，带 role/runId（A8c 真实兑现 S2 的 spawn）。 */
-  spawnWorker(clueId: string, role: string, runId: string): Promise<void>;
+  /**
+   * ⛔ 注入的 spawn dep：CAS 成功后才调用。
+   * A8d——签名已加宽（spec §1.3）：除 role/runId 外还携带 worker 输入载荷
+   * `deep-research.worker-input/v1`（clue_id / clue_text / depth / sources），
+   * 供真实 `agent-run` 的 `--input` 与位置 prompt 使用。
+   */
+  spawnWorker(
+    clueId: string,
+    role: string,
+    runId: string,
+    input: WorkerInputPayload,
+  ): Promise<void>;
 }
 
 /** 一次 spawn 的观察记录：role/runId 由决策注入，spawned 表示 spawnWorker 是否成功返回。 */
@@ -126,6 +137,73 @@ function generateRunId(): string {
 }
 
 /**
+ * A8d——真实 `agent-run` 的 `--input` 载荷，形状由 R1c 的
+ * `deep-research.worker-input/v1` 硬验收 T3–T6 钉死（spec §1.2）。
+ * ⛔ 不得含 `attempt_id` / `development_id` / `spec_commit` / `run_id`
+ * （`run_id` 由 `--run-id` 单独传递，放进 input 会成为第二真相源）。
+ */
+export interface WorkerInputPayload {
+  clue_id: string;
+  clue_text: string;
+  allowed_root?: string;
+  depth: number;
+  sources: string[];
+}
+
+/**
+ * A8d——按 R1c 形状构造 worker 输入载荷（spec §1.2）。
+ * 只产出 `clue_id` / `clue_text` / `depth` / `sources`（及可选 `allowed_root`），
+ * 绝不注入任何调度元数据。
+ */
+export function buildWorkerInput(
+  clueId: string,
+  clueText: string,
+  depth: number,
+  sources: string[],
+  allowedRoot?: string,
+): WorkerInputPayload {
+  const input: WorkerInputPayload = {
+    clue_id: clueId,
+    clue_text: clueText,
+    depth,
+    sources: [...sources],
+  };
+  if (allowedRoot) input.allowed_root = allowedRoot;
+  return input;
+}
+
+/** A8d——`agent-run` 解析不到 ⇒ 响亮失败（spec §1.4 / P8），绝不静默回退占位 worker。 */
+export class AgentRunUnresolvedError extends Error {
+  constructor() {
+    super(
+      "A8d: cannot resolve the 'agent-run' binary (set AGENT_RUN_BIN to an existing agent-run path, or add its directory to PATH). Refusing to fall back to a placeholder worker.",
+    );
+    this.name = "AgentRunUnresolvedError";
+  }
+}
+
+/**
+ * A8d——解析 `agent-run` 可执行路径（spec §1.4 / P8 / P10）：
+ * 允许 `AGENT_RUN_BIN` 覆盖；否则按 PATH 解析。
+ * ⛔ 解析不到（含 `AGENT_RUN_BIN` 指向不存在路径）⇒ 当场抛 `AgentRunUnresolvedError`，
+ *    绝不静默回退占位 worker（与「解析不到 secret 不得塞空串」同源）。
+ */
+export function resolveAgentRunBin(): string {
+  const override = process.env.AGENT_RUN_BIN;
+  if (override) {
+    if (existsSync(override)) return override;
+    throw new AgentRunUnresolvedError();
+  }
+  const pathDirs = (process.env.PATH ?? "").split(delimiter);
+  for (const dir of pathDirs) {
+    if (!dir) continue;
+    const candidate = join(dir, "agent-run");
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new AgentRunUnresolvedError();
+}
+
+/**
  * 纯副作用执行：按决策序执行写动作（先 CAS 后 spawn；CAS 失败跳过不 spawn，S2）。
  * ⛔ 先 CAS 成功才 spawn；spawn 同步失败 → 当场 CAS 回 open（spec §1.2 / S2 补偿）。
  * ⛔ 每次写前检查 max-writes 上限，超限立即抛错（M10）。spawn 本身不写 bus、不计入预算；
@@ -142,9 +220,14 @@ export async function runWrite(
   const spawns: WriteResult["spawns"] = [];
   // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增。
   let spawnCalls = 0;
-  const spawnWorker = async (clueId: string, role: string, runId: string): Promise<void> => {
+  const spawnWorker = async (
+    clueId: string,
+    role: string,
+    runId: string,
+    input: WorkerInputPayload,
+  ): Promise<void> => {
     spawnCalls += 1;
-    await deps.spawnWorker(clueId, role, runId);
+    await deps.spawnWorker(clueId, role, runId, input);
   };
 
   const perform = async (input: WriteCasInput): Promise<CasDecision> => {
@@ -189,9 +272,16 @@ export async function runWrite(
           error: result.error,
         });
         if (result.success) {
-          // CAS 成功才算认领：按决策注入的 role 真正 spawn（A8c 兑现 spec §1.2）。
+          // CAS 成功才算认领：按决策注入的 role/runId 真正 spawn，并把 clue 文本/depth/sources
+          // 以 worker 输入载荷传下去（A8d spec §1.3 —— `--input` 与 prompt 都需要它）。
+          const input = buildWorkerInput(
+            decision.clueId,
+            decision.text ?? "",
+            decision.depth ?? 0,
+            decision.sources ?? [],
+          );
           try {
-            await spawnWorker(decision.clueId, decision.role, runId);
+            await spawnWorker(decision.clueId, decision.role, runId, input);
             spawns.push({
               clueId: decision.clueId,
               role: decision.role,
@@ -263,12 +353,10 @@ export interface RunWriteOptions {
   channelId: string;
   maxWrites?: number;
   runsChannelId?: string;
-  /** 注入的 spawn dep（测试用）；缺省走真实子进程启动 worker。 */
+  /** 注入的 spawn dep（测试用）；缺省走真实 `agent-run` 子进程启动 worker。 */
   spawnWorker?: WriteDeps["spawnWorker"];
-  /** worker 启动命令（argv[0]）；缺省 `TICK_WORKER_CMD` env 或 `bash`。 */
+  /** `agent-run` 可执行路径（argv[0]）；缺省 `resolveAgentRunBin()`（`AGENT_RUN_BIN`/PATH）。 */
   workerCmd?: string;
-  /** worker 启动固定参数（追加在 role/clueId/runId 之前）。 */
-  workerArgs?: string[];
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -395,23 +483,89 @@ export async function spawnWorkerProcess(
 }
 
 /**
- * 缺省 worker 启动命令：由 `TICK_WORKER_CMD` 注入（部署方指向真实 worker launcher）；
- * 缺省退化为**随包提供的真实 launcher** `bin/worker-launcher.sh`（评审 blocker）——
- * 绝不是把 role 当脚本路径交给 `bash`（那会退出 127、从未拉起 worker）。
+ * A8d——缺省 worker 启动命令：真实 `agent-run`（spec §1.1）。
+ * 由 `resolveAgentRunBin()` 解析（`AGENT_RUN_BIN` 覆盖 / PATH），
+ * ⛔ 解析不到 ⇒ 抛 `AgentRunUnresolvedError`，**绝不回退占位 worker**。
+ * 不再是 A8c 的 `bin/worker-launcher.sh`（占位链路只保留给测试）。
  */
 export function defaultWorkerCmd(): string {
-  const fromEnv = process.env.TICK_WORKER_CMD;
-  if (fromEnv) return fromEnv;
-  const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  return join(pluginRoot, "bin", "worker-launcher.sh");
+  return resolveAgentRunBin();
+}
+
+/**
+ * A8d——构造真实 `agent-run` 的完整 argv（spec §1.1）：
+ * `agent-run --role <role> --run-id <runId> --input <payloadPath> -- "<clue_text>"`
+ * 返回的数组 [0] 即 argv[0]（agent-run 可执行路径），供 P1–P7 逐项断言。
+ */
+export function buildAgentRunArgv(opts: {
+  agentRunBin: string;
+  role: string;
+  runId: string;
+  inputPath: string;
+  clueText: string;
+}): string[] {
+  return [
+    opts.agentRunBin,
+    "--role",
+    opts.role,
+    "--run-id",
+    opts.runId,
+    "--input",
+    opts.inputPath,
+    "--",
+    opts.clueText,
+  ];
+}
+
+/**
+ * A8d——把 worker 输入载荷写成 JSON 文件，返回 `--input` 要指向的路径（spec §1.2）。
+ * 文件内容即 `deep-research.worker-input/v1` 载荷（P4/P5 直接读该文件断言）。
+ */
+export function writeWorkerInputFile(input: WorkerInputPayload): string {
+  const file = join(tmpdir(), `a8d-worker-input-${randomUUID()}.json`);
+  writeFileSync(file, JSON.stringify(input));
+  return file;
+}
+
+/**
+ * A8d——真实 `agent-run` spawn 动作（spec §1.1/§1.2）：
+ * 把载荷写成 `--input` 文件 → 以 `agent-run --role <role> --run-id <runId>
+ * --input <path> -- "<clue_text>"` 启动子进程。
+ * ⛔ `agent-run` 解析不到 ⇒ `resolveAgentRunBin` 先抛（P8/P9），根本不会走到 spawn，
+ *    也绝不回退占位 worker。spawn 的启动成败判定仍走 A8c 的 `spawnWorkerProcess`。
+ */
+export async function spawnAgentRunWorker(opts: {
+  agentRunBin: string;
+  role: string;
+  runId: string;
+  input: WorkerInputPayload;
+}): Promise<SpawnedWorker> {
+  const payloadPath = writeWorkerInputFile(opts.input);
+  try {
+    const argv = buildAgentRunArgv({
+      agentRunBin: opts.agentRunBin,
+      role: opts.role,
+      runId: opts.runId,
+      inputPath: payloadPath,
+      clueText: opts.input.clue_text,
+    });
+    return await spawnWorkerProcess({
+      cmd: argv[0],
+      args: argv.slice(1),
+      env: { AGENT_RUN_BIN: opts.agentRunBin },
+    });
+  } finally {
+    rmSync(payloadPath, { force: true });
+  }
 }
 
 /**
  * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写 + spawn。
  * ⛔ CAS 一律走 A8b 的 `realCas`（不得绕过另写 CAS，spec §4.1 纪律 8）。
- * spawn 为真实路径实现：CAS 成功后真正启动 worker 子进程（spec §1.2）；
+ * spawn 为真实路径实现：CAS 成功后**缺省走真实 `agent-run`**（spec §1.1，A8d）；
  * ⛔ spawn 不写 agent-bus、不伪造 `agent.run.started`（spec §2 / 评审 blocker）；
- *    worker 产出（worker.result.v1 未注册）属 V1，不在本包范围（spec §7）。
+ *    缺省命令解析不到 agent-run ⇒ 响亮失败（P8/P9），绝不回退占位 worker。
+ *    注入 `spawnWorker` 时解析不触发（惰性，仅缺省分支用到）。
  */
 export async function runChannelWrite(
   opts: RunWriteOptions,
@@ -425,16 +579,16 @@ export async function runChannelWrite(
   const runs = await readAgentRuns(runsChannelId);
   const state = assembleBoard(messages, runs).state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
-  const workerCmd = opts.workerCmd ?? defaultWorkerCmd();
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
       opts.spawnWorker ??
-      ((clueId, role, runId) =>
-        spawnWorkerProcess({
-          cmd: workerCmd,
-          args: [...(opts.workerArgs ?? []), role, clueId, runId],
-          env: { TICK_ROLE: role, TICK_CLUE_ID: clueId, TICK_RUN_ID: runId },
+      ((clueId, role, runId, input) =>
+        spawnAgentRunWorker({
+          agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+          role,
+          runId,
+          input,
         }).then(() => undefined)),
   };
   const result = await runWrite(

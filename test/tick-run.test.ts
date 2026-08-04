@@ -6,7 +6,7 @@
  * M9 安全性断言配活性断言（第 3 条）。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -25,8 +25,13 @@ import {
   spawnWorkerProcess,
   WorkerStartupError,
   defaultWorkerCmd,
+  resolveAgentRunBin,
+  AgentRunUnresolvedError,
+  buildAgentRunArgv,
+  buildWorkerInput,
+  writeWorkerInputFile,
 } from "../src/tick-run";
-import type { WriteDeps, WriteCasInput } from "../src/tick-run";
+import type { WriteDeps, WriteCasInput, WorkerInputPayload } from "../src/tick-run";
 import { readAgentRuns } from "../src/tick-inspect";
 import type { InspectMessage } from "../src/tick-inspect";
 
@@ -36,6 +41,7 @@ const cfg = DEFAULT_TICK_CONFIG;
 function card(over: Partial<BoardCard> = {}): BoardCard {
   return {
     clueId: "x",
+    text: "investigate X",
     status: "open",
     depth: 0,
     sources: ["code-local"],
@@ -69,6 +75,7 @@ afterEach(() => {
 
 const INFLIGHT_CARD: BoardCard = {
   clueId: "x",
+  text: "investigate X",
   status: "in_flight",
   depth: 0,
   sources: ["code-local"],
@@ -721,20 +728,31 @@ describe("A8c real spawn launches a worker subprocess without writing the bus", 
   });
 });
 
-// ── 评审 finding：缺省 spawn 命令（组合默认）不得是 `bash <role>`（退出 127、从未拉起 worker）──
+// ── A8d 评审 blocker：生产缺省命令 = 真实 `agent-run`，不再是占位 launcher ──
 
-describe("A8c default worker command is a real launcher, not bash <role>", () => {
-  it("defaultWorkerCmd() points at the repo's worker-launcher.sh (not 'bash')", () => {
-    const cmd = defaultWorkerCmd();
-    expect(cmd).not.toBe("bash");
-    expect(cmd).toMatch(/worker-launcher\.sh$/);
-    expect(existsSync(cmd)).toBe(true);
+describe("A8d default worker command is real agent-run, not the placeholder", () => {
+  it("defaultWorkerCmd() resolves to an agent-run binary via AGENT_RUN_BIN (not a placeholder)", () => {
+    const stub = join(tmpdir(), `agent-run-def-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+    chmodSync(stub, 0o755);
+    const prev = process.env.AGENT_RUN_BIN;
+    process.env.AGENT_RUN_BIN = stub;
+    try {
+      const cmd = defaultWorkerCmd();
+      expect(cmd).not.toBe("bash");
+      expect(cmd).toBe(stub);
+      expect(existsSync(cmd)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prev;
+      rmSync(stub, { force: true });
+    }
   });
 
-  it("deep-research-loop.sh exports TICK_WORKER_CMD pointing at a real launcher", () => {
+  it("deep-research-loop.sh wires AGENT_RUN_BIN, not TICK_WORKER_CMD→placeholder as default", () => {
     const src = readFileSync(join(ROOT, "..", "bin", "deep-research-loop.sh"), "utf8");
-    expect(src).toMatch(/TICK_WORKER_CMD=/);
-    expect(src).toMatch(/worker-launcher\.sh/);
+    expect(src).toMatch(/AGENT_RUN_BIN/);
+    expect(src).not.toMatch(/TICK_WORKER_CMD/);
   });
 });
 
@@ -753,84 +771,132 @@ describe("A8c spawnWorkerProcess rejects an immediate non-zero exit (worker neve
   });
 });
 
-// ── 评审 blocker：组合默认被分开验证（wiring 注入 spawnWorker / 原语给显式 cmd），
-//    从不一起跑。这里把 **缺省 launcher** 与 **wiring** 放在同一条端到端用例里验证。 ──
+// ── A8d 组合默认：wiring 与缺省真实 `agent-run` 一起被端到端验证（不再是占位 launcher）──
+//
+// 构造一个可执行的 `agent-run` 桩：把每次调用收到的 argv（逐参数一行）追加到 marker，
+// 以 `---` 分隔每次调用。runChannelWrite 不注入 spawnWorker、AGENT_RUN_BIN 指向该桩，
+// 验证缺省 spawn 真实拉起 agent-run、argv 符合 spec §1.1，且不写 agent.run.started。
 
-describe("A8c composed default: wiring + default launcher verified together", () => {
-  it("runChannelWrite with no injected spawnWorker launches the default worker launcher as a real process", async () => {
-    const marker = join(tmpdir(), `worker-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
-    const prevCmd = process.env.TICK_WORKER_CMD;
-    const prevMarker = process.env.TICK_WORKER_MARKER;
-    const prevMaxS = process.env.TICK_WORKER_MAX_S;
-    delete process.env.TICK_WORKER_CMD; // 用缺省 launcher（不注入 spawnWorker）
-    process.env.TICK_WORKER_MARKER = marker;
-    process.env.TICK_WORKER_MAX_S = "1"; // 占位 worker 运行 1s 后退出 0，避免泄漏进程
-    const openClueMsg = {
-      message_id: "msg_open_1",
-      channel_id: WIRE_CLUE_CHANNEL,
-      channel_seq: 1,
-      kind: "research.clue.v2",
-      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
-      entity_id: "clue_x",
-      supersedes: null,
-      created_at: "2026-01-01T00:00:00Z",
-    };
-    const publishBodies: Array<{ channel?: string; kind: string; payload: Record<string, unknown> }> = [];
-    let clueCalls = 0;
-    let runsCalls = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: unknown, init?: RequestInit) => {
-        const u = String(url);
-        if (u.includes("/entities/")) {
-          return jsonResponse({ head: openClueMsg });
-        }
-        const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
-        if (pm) {
-          const body = JSON.parse(String(init?.body));
-          publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
-          return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
-        }
-        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
-          clueCalls += 1;
-          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
-        }
-        if (u.includes("/v1/channels/board:agent-runs/messages")) {
-          runsCalls += 1;
-          return jsonResponse({ messages: [] });
-        }
-        return jsonResponse({ messages: [] });
-      }),
-    );
+function makeAgentRunStub(marker: string): string {
+  const dir = join(tmpdir(), `agent-run-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  const stub = join(dir, "agent-run");
+  writeFileSync(
+    stub,
+    `#!/bin/sh\nprintf '%s\\n' "CMD=$0" >> "${marker}"\nfor a in "$@"; do printf '%s\\n' "$a"; done >> "${marker}"\nprintf '%s\\n' "---" >> "${marker}"\nexit 0\n`,
+  );
+  chmodSync(stub, 0o755);
+  return stub;
+}
 
-    try {
-      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
-      // 活性：组合默认下 dispatch 真被 spawn，spawned:true 有真实进程作证。
-      expect(outcome.spawns).toHaveLength(1);
-      expect(outcome.spawns[0].spawned).toBe(true);
-      // 判别性：缺省 launcher 真实被拉起，参数为 role/clueId/runId（不是 bash <role>）。
-      const deadline = Date.now() + 3000;
-      while (!existsSync(marker)) {
-        if (Date.now() > deadline) throw new Error(`worker launcher marker not created: ${marker}`);
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      const line = readFileSync(marker, "utf8").trim();
-      const [role, clueId, runId] = line.split("\t");
-      expect(role).toBe("dr-worker-code-local");
-      expect(clueId).toBe("clue_x");
-      expect(runId).toMatch(/^[0-9a-f-]{36}$/);
-      // 安全：spawn 不写 agent-bus 生命周期事实（无 agent.run.started ⇒ 不外推 started）。
-      const started = publishBodies.filter((b) => b.kind === "agent.run.started.v1");
-      expect(started).toHaveLength(0);
-    } finally {
-      rmSync(marker, { force: true });
-      if (prevCmd === undefined) delete process.env.TICK_WORKER_CMD;
-      else process.env.TICK_WORKER_CMD = prevCmd;
-      if (prevMarker === undefined) delete process.env.TICK_WORKER_MARKER;
-      else process.env.TICK_WORKER_MARKER = prevMarker;
-      if (prevMaxS === undefined) delete process.env.TICK_WORKER_MAX_S;
-      else process.env.TICK_WORKER_MAX_S = prevMaxS;
+interface AgentRunBlock {
+  cmd: string;
+  args: string[];
+}
+
+function readAgentRunBlocks(marker: string): AgentRunBlock[] {
+  const blocks: AgentRunBlock[] = [];
+  let cmd = "";
+  let args: string[] = [];
+  for (const line of readFileSync(marker, "utf8").split("\n")) {
+    if (line === "---") {
+      blocks.push({ cmd, args });
+      cmd = "";
+      args = [];
+    } else if (line.startsWith("CMD=")) {
+      cmd = line.slice(4);
+    } else if (line !== "") {
+      args.push(line);
     }
+  }
+  return blocks;
+}
+
+function readUntilMarker(marker: string, timeoutMs = 4000): void {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(marker)) {
+    if (Date.now() > deadline) throw new Error(`agent-run stub marker not created: ${marker}`);
+  }
+}
+
+/** 单卡默认 spawn：打桩 bus + 把 AGENT_RUN_BIN 指向桩，跑一次 runChannelWrite 并读回 argv。 */
+async function runDefaultSpawnWithText(clueText: string): Promise<{
+  outcome: Awaited<ReturnType<typeof runChannelWrite>>;
+  blocks: AgentRunBlock[];
+}> {
+  const marker = join(tmpdir(), `a8d-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+  const stub = makeAgentRunStub(marker);
+  const prevBin = process.env.AGENT_RUN_BIN;
+  process.env.AGENT_RUN_BIN = stub;
+  const openClueMsg = {
+    message_id: "msg_open_1",
+    channel_id: WIRE_CLUE_CHANNEL,
+    channel_seq: 1,
+    kind: "research.clue.v2",
+    payload: { status: "open", text: clueText, depth: 0, sources: ["code-local"] },
+    entity_id: "clue_x",
+    supersedes: null,
+    created_at: "2026-01-01T00:00:00Z",
+  };
+  const publishBodies: Array<{ channel?: string; kind: string; payload: Record<string, unknown> }> = [];
+  let clueCalls = 0;
+  let runsCalls = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) {
+        return jsonResponse({ head: openClueMsg });
+      }
+      const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+      if (pm) {
+        const body = JSON.parse(String(init?.body));
+        publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+        return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+        clueCalls += 1;
+        return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        runsCalls += 1;
+        return jsonResponse({ messages: [] });
+      }
+      return jsonResponse({ messages: [] });
+    }),
+  );
+  try {
+    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+    readUntilMarker(marker);
+    return { outcome, blocks: readAgentRunBlocks(marker) };
+  } finally {
+    rmSync(marker, { force: true });
+    rmSync(dirname(stub), { recursive: true, force: true });
+    if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+    else process.env.AGENT_RUN_BIN = prevBin;
+  }
+}
+
+describe("A8d composed default: wiring + real agent-run verified together", () => {
+  it("runChannelWrite with no injected spawnWorker launches real agent-run with spec argv", async () => {
+    const { outcome, blocks } = await runDefaultSpawnWithText("t");
+    // 活性：组合默认下 dispatch 真被 spawn，spawned:true 有真实 agent-run 进程作证。
+    expect(outcome.spawns).toHaveLength(1);
+    expect(outcome.spawns[0].spawned).toBe(true);
+    // 判别性：缺省 agent-run 真实被拉起，argv 逐项符合 spec §1.1。
+    expect(blocks).toHaveLength(1);
+    const argv = blocks[0].args;
+    const roleIdx = argv.indexOf("--role");
+    expect(roleIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[roleIdx + 1]).toBe("dr-worker-code-local");
+    const runIdIdx = argv.indexOf("--run-id");
+    expect(runIdIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[runIdIdx + 1]).toMatch(/^[0-9a-f-]{36}$/);
+    const inputIdx = argv.indexOf("--input");
+    expect(inputIdx).toBeGreaterThanOrEqual(0);
+    // --input 指向本包写出的 worker-input 载荷文件路径（P4/P5 直接读该文件断言其内容）。
+    expect(argv[inputIdx + 1]).toMatch(/a8d-worker-input-.*\.json$/);
+    expect(argv[inputIdx + 1]).toContain(tmpdir());
   });
 });
 
@@ -879,5 +945,318 @@ describe("N7: block rationale is written into the card on the real write path", 
     expect(typeof payload.rationale).toBe("string");
     expect(String(payload.rationale).length).toBeGreaterThan(0);
     expect(payload.rationale).toBe(WEB_BLOCK_RATIONALE);
+  });
+});
+
+// ── A8d 硬验收 P1–P11：生产缺省 = 真实 `agent-run`（spec §3 验收表）──────────
+//
+// 一个 describe 一个判据（spec §4.1 纪律 2）。对纯数据/真实文件求值（纪律 4），
+// 安全性断言配活性断言（纪律 3），判别性成对用例（纪律 7），变异主路径（纪律 6）。
+
+const A8D_ROLE = "dr-worker-code-local";
+const A8D_RUN_ID = "00000000-0000-4000-8000-000000000000";
+const A8D_CLUE = "investigate the retry storm";
+
+describe("P1: production default argv[0] resolves to real agent-run", () => {
+  it("default spawn argv[0] ends with agent-run, not bash, not placeholder", async () => {
+    const { blocks } = await runDefaultSpawnWithText(A8D_CLUE);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].cmd).not.toBe("bash");
+    // 判别性：缺省 spawn 的 argv[0]（agent-run 可执行路径）以 `agent-run` 结尾（W1 变异杀 P1）。
+    expect(blocks[0].cmd).toMatch(/agent-run$/);
+  });
+});
+
+describe("P2: default argv contains --run-id with this runId", () => {
+  it("argv has adjacent pair [--run-id, runId]", () => {
+    const argv = buildAgentRunArgv({
+      agentRunBin: "/x/agent-run",
+      role: A8D_ROLE,
+      runId: A8D_RUN_ID,
+      inputPath: "/tmp/input.json",
+      clueText: A8D_CLUE,
+    });
+    const idx = argv.indexOf("--run-id");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[idx + 1]).toBe(A8D_RUN_ID);
+  });
+});
+
+describe("P3: default argv contains --role with the mapped role", () => {
+  it("argv has adjacent pair [--role, role]", () => {
+    const argv = buildAgentRunArgv({
+      agentRunBin: "/x/agent-run",
+      role: A8D_ROLE,
+      runId: A8D_RUN_ID,
+      inputPath: "/tmp/input.json",
+      clueText: A8D_CLUE,
+    });
+    const idx = argv.indexOf("--role");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(argv[idx + 1]).toBe(A8D_ROLE);
+  });
+});
+
+describe("P4: default argv contains --input <path> with a valid payload file", () => {
+  it("payload file has non-empty clue_id and clue_text", () => {
+    const input = buildWorkerInput("clue_x", A8D_CLUE, 0, ["code-local"]);
+    const path = writeWorkerInputFile(input);
+    try {
+      const argv = buildAgentRunArgv({
+        agentRunBin: "/x/agent-run",
+        role: A8D_ROLE,
+        runId: A8D_RUN_ID,
+        inputPath: path,
+        clueText: A8D_CLUE,
+      });
+      const idx = argv.indexOf("--input");
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(existsSync(argv[idx + 1])).toBe(true);
+      const parsed = JSON.parse(readFileSync(argv[idx + 1], "utf8")) as WorkerInputPayload;
+      expect(parsed.clue_id).toBe("clue_x");
+      expect(parsed.clue_id.length).toBeGreaterThan(0);
+      expect(parsed.clue_text).toBe(A8D_CLUE);
+      expect(parsed.clue_text.length).toBeGreaterThan(0);
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+});
+
+describe("P5: payload excludes attempt_id/development_id/spec_commit/run_id", () => {
+  it("payload file has none of the four forbidden keys", () => {
+    const input = buildWorkerInput("clue_x", A8D_CLUE, 2, ["wiki"]);
+    const path = writeWorkerInputFile(input);
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      for (const key of ["attempt_id", "development_id", "spec_commit", "run_id"]) {
+        expect(parsed, key).not.toHaveProperty(key);
+      }
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+});
+
+describe("P6: argv positional prompt equals the clue text", () => {
+  it("the item after `--` equals clue text", () => {
+    const argv = buildAgentRunArgv({
+      agentRunBin: "/x/agent-run",
+      role: A8D_ROLE,
+      runId: A8D_RUN_ID,
+      inputPath: "/tmp/input.json",
+      clueText: A8D_CLUE,
+    });
+    const dash = argv.indexOf("--");
+    expect(dash).toBeGreaterThanOrEqual(0);
+    expect(argv[dash + 1]).toBe(A8D_CLUE);
+  });
+});
+
+describe("P7: worker-placeholder.sh is not on the default path", () => {
+  it("default spawn argv[0] and all args exclude worker-placeholder", async () => {
+    const { blocks } = await runDefaultSpawnWithText(A8D_CLUE);
+    expect(blocks).toHaveLength(1);
+    const joined = `${blocks[0].cmd} ${blocks[0].args.join(" ")}`;
+    expect(joined).not.toMatch(/worker-placeholder/);
+    expect(blocks[0].cmd).not.toMatch(/worker-placeholder/);
+  });
+});
+
+describe("P8: agent-run unresolvable ⇒ loud failure naming agent-run", () => {
+  it("AGENT_RUN_BIN to a non-existent path + empty PATH ⇒ throws naming agent-run", () => {
+    const prevBin = process.env.AGENT_RUN_BIN;
+    const prevPath = process.env.PATH;
+    process.env.AGENT_RUN_BIN = join(tmpdir(), `no-such-agent-run-${Math.random().toString(36).slice(2)}`);
+    process.env.PATH = "";
+    try {
+      expect(() => resolveAgentRunBin()).toThrow(AgentRunUnresolvedError);
+    } finally {
+      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prevBin;
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+    }
+    expect(true).toBe(true);
+  });
+
+  it("error message text names `agent-run`", () => {
+    const prevBin = process.env.AGENT_RUN_BIN;
+    const prevPath = process.env.PATH;
+    process.env.AGENT_RUN_BIN = join(tmpdir(), `no-such-agent-run-${Math.random().toString(36).slice(2)}`);
+    process.env.PATH = "";
+    try {
+      let msg = "";
+      try {
+        resolveAgentRunBin();
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/agent-run/);
+    } finally {
+      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prevBin;
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+    }
+  });
+});
+
+describe("P9: unresolvable agent-run never falls back to placeholder, no spawned:true", () => {
+  it("runChannelWrite with unresolvable agent-run ⇒ spawned:false, no spawned:true, no process", async () => {
+    const marker = join(tmpdir(), `no-spawn-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+    const stub = makeAgentRunStub(marker);
+    // 指向一个**不存在**的 agent-run（解析必然失败）。
+    const bad = join(tmpdir(), `missing-agent-run-${Math.random().toString(36).slice(2)}`);
+    const prevBin = process.env.AGENT_RUN_BIN;
+    process.env.AGENT_RUN_BIN = bad;
+    const openClueMsg = {
+      message_id: "msg_open_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      entity_id: "clue_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: openClueMsg });
+        }
+        if (u.includes("/publish")) {
+          return jsonResponse({ message_id: `p_${Math.random()}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    try {
+      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+      // 安全性：解析不到 ⇒ 未产生 spawned:true，且未启动任何进程（marker 未创建）。
+      expect(outcome.spawns).toHaveLength(1);
+      expect(outcome.spawns[0].spawned).toBe(false);
+      expect(outcome.spawns.filter((s) => s.spawned === true)).toHaveLength(0);
+      expect(existsSync(marker)).toBe(false);
+      // 活性配对见 P1（正常时确实解析到 agent-run），此处只验安全侧。
+    } finally {
+      rmSync(marker, { force: true });
+      rmSync(stub, { force: true });
+      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prevBin;
+    }
+  });
+});
+
+describe("P10: AGENT_RUN_BIN override takes effect", () => {
+  it("argv[0] equals the executable stub pointed to by AGENT_RUN_BIN", () => {
+    const stub = join(tmpdir(), `my-agent-run-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    writeFileSync(stub, "#!/bin/sh\nexit 0\n");
+    chmodSync(stub, 0o755);
+    const prev = process.env.AGENT_RUN_BIN;
+    process.env.AGENT_RUN_BIN = stub;
+    try {
+      const bin = resolveAgentRunBin();
+      const argv = buildAgentRunArgv({
+        agentRunBin: bin,
+        role: A8D_ROLE,
+        runId: A8D_RUN_ID,
+        inputPath: "/tmp/input.json",
+        clueText: A8D_CLUE,
+      });
+      expect(argv[0]).toBe(stub);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prev;
+      rmSync(stub, { force: true });
+    }
+  });
+});
+
+describe("P11: spawnWorker widened — clue text really reaches the prompt (discriminative)", () => {
+  it("two cards differing only in clue text produce different prompts via the real default spawn", async () => {
+    const marker = join(tmpdir(), `p11-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+    const stub = makeAgentRunStub(marker);
+    const prevBin = process.env.AGENT_RUN_BIN;
+    process.env.AGENT_RUN_BIN = stub;
+    const textA = "question about retry storm A";
+    const textB = "question about retry storm B";
+    const openClueMsgA = {
+      message_id: "msg_a",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: textA, depth: 0, sources: ["code-local"] },
+      entity_id: "clue_a",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const openClueMsgB = {
+      message_id: "msg_b",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 2,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: textB, depth: 0, sources: ["code-local"] },
+      entity_id: "clue_b",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          const id = u.includes("clue_a") ? "clue_a" : "clue_b";
+          return jsonResponse({ head: id === "clue_a" ? openClueMsgA : openClueMsgB });
+        }
+        const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+        if (pm) {
+          const body = JSON.parse(String(init?.body));
+          return jsonResponse({ message_id: `p_${Math.random()}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsgA, openClueMsgB] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    try {
+      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+      expect(outcome.spawns).toHaveLength(2);
+      expect(outcome.spawns.every((s) => s.spawned === true)).toBe(true);
+      readUntilMarker(marker);
+      const blocks = readAgentRunBlocks(marker);
+      expect(blocks).toHaveLength(2);
+      const prompts = blocks.map((b) => b.args[b.args.length - 1]);
+      // 判别性：两条卡只差 clue 文本，prompt 必须不同（变异主路径）。
+      expect(prompts[0]).not.toBe(prompts[1]);
+      expect(prompts.sort()).toEqual([textA, textB].sort());
+    } finally {
+      rmSync(marker, { force: true });
+      rmSync(dirname(stub), { recursive: true, force: true });
+      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prevBin;
+    }
   });
 });

@@ -25,6 +25,7 @@ import type {
 function card(over: Partial<BoardCard> = {}): BoardCard {
   return {
     clueId: "clue_1",
+    text: "investigate X",
     status: "open",
     depth: 0,
     sources: ["code-local"],
@@ -200,6 +201,9 @@ describe("B7: concurrency cap applies", () => {
       kind: "dispatch",
       clueId: "open_0",
       role: "dr-worker-code-local",
+      text: "investigate X",
+      depth: 0,
+      sources: ["code-local"],
     });
   });
 });
@@ -353,7 +357,16 @@ describe("N8: sources→role mapping is correct for the four roles", () => {
   it("dispatch decision carries the mapped role", () => {
     const s = state({ cards: [card({ clueId: "a", status: "open", sources: ["wiki"] })] });
     const d = decideTick(s, cfg);
-    expect(d).toEqual([{ kind: "dispatch", clueId: "a", role: "dr-worker-wiki" }]);
+    expect(d).toEqual([
+      {
+        kind: "dispatch",
+        clueId: "a",
+        role: "dr-worker-wiki",
+        text: "investigate X",
+        depth: 0,
+        sources: ["wiki"],
+      },
+    ]);
   });
 });
 

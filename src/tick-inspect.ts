@@ -93,6 +93,7 @@ export function assembleBoard(
     const p = msg.payload as ClueV2;
     const card: BoardCard = {
       clueId: msg.entity_id,
+      text: p.text,
       status: p.status,
       depth: p.depth,
       sources: p.sources,

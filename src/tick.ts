@@ -95,6 +95,8 @@ export interface RunEvent {
 /** 板面上一张卡的最小视图。 */
 export interface BoardCard {
   clueId: string;
+  /** A8d——clue 文本：真实 `agent-run` 的 `--input` 载荷与位置 prompt 都需要它（spec §1.3）。 */
+  text: string;
   status: ClueV2["status"];
   depth: number;
   sources: string[];
@@ -113,7 +115,15 @@ export interface BoardState {
 /** 决策——纯函数输出，副作用执行权归 runTick。 */
 export type Decision =
   | { kind: "reclaim"; clueId: string; to: ClueV2["status"]; retries: number }
-  | { kind: "dispatch"; clueId: string; role: string }
+  | {
+      kind: "dispatch";
+      clueId: string;
+      role: string;
+      /** A8d——clue 文本：真实 `agent-run` 的 prompt 与 `--input` 载荷（spec §1.1/§1.3）。 */
+      text?: string;
+      depth?: number;
+      sources?: string[];
+    }
   | {
       kind: "block";
       clueId: string;
@@ -209,7 +219,14 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
       });
       continue;
     }
-    decisions.push({ kind: "dispatch", clueId: card.clueId, role });
+    decisions.push({
+      kind: "dispatch",
+      clueId: card.clueId,
+      role,
+      text: card.text,
+      depth: card.depth,
+      sources: card.sources,
+    });
     dispatched += 1;
   }
 

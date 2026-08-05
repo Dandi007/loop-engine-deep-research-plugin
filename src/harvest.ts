@@ -37,11 +37,49 @@ export interface WorkerProposedClue {
   reason?: string;
 }
 
-/** worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。 */
+/**
+ * worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。
+ *
+ * ⛔ A10a：权威形状（已冻结的 `profiles/roles/schemas/worker-result.v1.json`）是
+ *    `required: ['evidences','proposed_clues','materials']`，三者**均为数组**。
+ *    旧代码写 `evidence`（单数）/ `proposed_clues:{items}` 是把 JSON Schema 的
+ *    `items` 关键字误当成运行期结构——这是 F0 真跑 6 条证据被静默丢弃的根因。
+ */
 export interface WorkerResultV1 {
   run_id?: string;
-  evidence?: WorkerEvidenceItem[];
-  proposed_clues?: { items?: WorkerProposedClue[] };
+  evidences?: WorkerEvidenceItem[];
+  proposed_clues?: WorkerProposedClue[];
+  materials?: unknown[];
+}
+
+/** 形状守卫失败——响亮报错，绝不当成「空产物」静默通过（A10a §1.3）。 */
+export class WorkerResultShapeError extends Error {
+  constructor(message: string) {
+    super(`A10a: invalid worker.result.v1 shape: ${message}`);
+    this.name = "WorkerResultShapeError";
+  }
+}
+
+/** 冻结的 worker.result.v1 必填键（与 `profiles/roles/schemas/worker-result.v1.json` 一致）。 */
+const WORKER_RESULT_REQUIRED = ["evidences", "proposed_clues", "materials"] as const;
+
+/**
+ * 形状守卫（A10a §1.3）：worker.result.v1 必须带齐全部 required 键，且三者均为数组。
+ * ⛔ 缺任一（含旧的单数 `evidence`、`{items}` 嵌套形状）⇒ **响亮失败**，
+ *    绝不当作「0 发布 + CAS explored」静默通过。旧错误形状在此被拒：
+ *   - `evidence`（单数）⇒ `evidences` 键缺失；
+ *   - `proposed_clues:{items:[...]}` ⇒ `proposed_clues` 不是数组。
+ */
+export function assertWorkerResultShape(result: WorkerResultV1): void {
+  for (const key of WORKER_RESULT_REQUIRED) {
+    const value = (result as Record<string, unknown>)[key];
+    if (value === undefined || value === null) {
+      throw new WorkerResultShapeError(`missing required key '${key}'`);
+    }
+    if (!Array.isArray(value)) {
+      throw new WorkerResultShapeError(`'${key}' must be an array (got ${typeof value})`);
+    }
+  }
 }
 
 /** 收割所依赖的卡的最小视图（纯映射只需 clueId / depth / sources）。 */
@@ -229,7 +267,9 @@ export async function harvestCard(
 ): Promise<HarvestReport> {
   const result = await hd.readWorkerResult(runId);
   if (!result) {
-    // 该 run 无 worker.result ⇒ 无产物可收割；仍 CAS 到 explored（无产出即无事）。
+    // ⛔ A10a §0.3 / §1.2：找不到 worker.result ⇒ **不得写终态**。
+    //   「没找到结果」≠「worker 确实无产出」。留 in_flight、响亮报告、casExplored=false，
+    //   下一 tick 幂等重放仍可再收割。只有「结果存在且 evidences 为空数组」才可置终态。
     return {
       clueId: card.clueId,
       runId,
@@ -238,12 +278,16 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
-      casExplored: true,
+      casExplored: false,
     };
   }
 
-  const evItems = result.evidence ?? [];
-  const clueItems = result.proposed_clues?.items ?? [];
+  // ⛔ A10a §1.3：result 存在 ⇒ 形状守卫查 required 键齐全（evidences/proposed_clues/materials）。
+  //   缺任一或非数组 ⇒ 响亮失败，绝不静默当作空产物（丢证据的根因）。
+  assertWorkerResultShape(result);
+  const evItems = result.evidences ?? [];
+  const clueItems = result.proposed_clues ?? [];
+  // materials 是 worker 的输入/产出清单，本收割步只读取校验形状，不发布（§1）。
   // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，

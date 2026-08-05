@@ -1,4 +1,10 @@
-limits: { max_nodes: 1, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# A10b —— limits.max_nodes 必须 ≥ 2（§1.1 自然收敛）。
+# ⛔ max_nodes:1 会让「单 tick 节点正常完成」被 loop-engine 判成 reason="max_nodes"（先查
+#    done.size>=max_nodes 再查自然排空），而 fleet 的 claim.complete 把非 {halt,drained} 的终局
+#    当失败路由到 failure_status:open ⇒ seed 每轮被认领后又退回 open ⇒ 永不「已排空」（§0.1 实测）。
+#    设成 2（本板面单 seed 实际只跑 1 节点，不受影响）使单 tick 正常完成后 reason="drained"，
+#    complete 才把它落到 success_status:done ⇒ 板面全终态时不续投 ⇒ drain 以 reason="drained" 收敛。
+limits: { max_nodes: 2, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

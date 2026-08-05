@@ -16,7 +16,11 @@ DRY_RUN=""
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 
 MODE="deep-research"
-RUN_ID="${DD_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+# A10b —— 每次渲染的缺省 RUN_ID 必须唯一（§0.2/§1.2）。
+# ⛔ 秒级 `date +%Y%m%d-%H%M%S` 会让同一秒内并发的多次渲染共用同一 RUN_ROOT ⇒ 互相覆盖
+#    读对方写了一半的 fleet.yaml（本 gate 实测 20% 假红）。改用 纳秒时间戳 + PID（tick.md 已有
+#    同款范式），保证每次渲染唯一。DD_RUN_ID / DD_RUN_ROOT 的显式覆盖语义不变（§1.2）。
+RUN_ID="${DD_RUN_ID:-$(date +%s%N)-$$}"
 RUN_ROOT="${DD_RUN_ROOT:-$PLUGIN_ROOT/.runtime/$MODE/$RUN_ID}"
 RUNTIME_FLEET="$RUN_ROOT/fleet.yaml"
 

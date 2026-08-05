@@ -7,7 +7,9 @@
 import type { ClueV2, EvidenceV2, DocV2 } from "./protocol";
 import { readFileSync } from "node:fs";
 
-const BASE_URL = "http://127.0.0.1:7490";
+// A10b —— agent-bus 基址可用 AGENT_BUS_URL 覆盖（默认本机 7490）。
+// 显式覆盖保持既有语义：默认仍是 127.0.0.1:7490，不覆盖时行为不变。
+const BASE_URL = process.env.AGENT_BUS_URL ?? "http://127.0.0.1:7490";
 const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 
 let _cachedToken: string | null = null;

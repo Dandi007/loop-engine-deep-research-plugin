@@ -409,11 +409,11 @@ describe("M9: spawn after CAS success with role/runId", () => {
   });
 });
 
-// ── M10：--max-writes 生效，默认 5，超限响亮报错 ──────────────────
+// ── M10：--max-writes 生效，默认足收割真实卡（A10c 起 64），超限响亮报错 ──
 
-describe("M10: max-writes enforced, default 5, loud error", () => {
-  it("DEFAULT_MAX_WRITES is 5", () => {
-    expect(DEFAULT_MAX_WRITES).toBe(5);
+describe("M10: max-writes enforced, default sufficient for a real card, loud error", () => {
+  it("DEFAULT_MAX_WRITES is 64 (A10c: enough to harvest a real card, finite)", () => {
+    expect(DEFAULT_MAX_WRITES).toBe(64);
   });
 
   it("7 write decisions with maxWrites 5 ⇒ 6th triggers MaxWritesExceededError", async () => {
@@ -448,7 +448,7 @@ describe("M11: channel has no default, must be explicit", () => {
   it("parseRunCliArgs(['research:p02-smoke-1dce60']) parses channel + default max-writes", () => {
     const opts = parseRunCliArgs(["research:p02-smoke-1dce60"]);
     expect(opts.channelId).toBe("research:p02-smoke-1dce60");
-    expect(opts.maxWrites).toBe(5);
+    expect(opts.maxWrites).toBe(64);
   });
 });
 

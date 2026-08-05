@@ -44,6 +44,11 @@ export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"
 # 未配置时留空，`--run` 一旦遇到 code-local dispatch 会响亮失败（§1.2 / F5），绝不静默零证据。
 # 其余 role（wiki / feishu / code-remote）不需要它，不会因缺失被阻断。
 export ALLOWED_ROOT="${ALLOWED_ROOT:-}"
+# A10c——写入预算上限：从 bin 一路导出 → fleet → workflow → tick.md → `tick-entry --run --max-writes`。
+# ⛔ 缺省值必须**足以收割一张真实卡**（真实 worker 产出实测 6~10 条 evidence，加最终 CAS）；
+#    旧默认 5 让任何产出 ≥5 条 evidence 的卡永远收割不了 ⇒ 恒 max_rounds 死锁（本包根因）。
+#    预算仍是**不可回退写的有限护栏**，绝不设成无穷大（spec §4 非目标）；显式覆盖语义保留（MAX_WRITES）。
+export MAX_WRITES="${MAX_WRITES:-64}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

@@ -455,7 +455,7 @@ describe("maxClues cap accumulates across multiple harvest cards in one runWrite
 // ── H13：预算不足 ⇒ 整卡跳过 ───────────────────────────────────────
 
 describe("H13: budget insufficient for whole card ⇒ zero publish, zero CAS, loud report", () => {
-  it("needed(2 ev + 2 clue + 1 CAS = 5) > maxWrites 3 ⇒ skip whole card", async () => {
+  it("needed(2 ev + 2 clue + 1 CAS = 5) > maxWrites 3 ⇒ skip whole card, marked infeasible (A10c)", async () => {
     const hd = harvestDeps();
     const deps = writeDeps(hd);
     const result = await runWrite(deps, [HARVEST_DECISION], 3);
@@ -464,7 +464,9 @@ describe("H13: budget insufficient for whole card ⇒ zero publish, zero CAS, lo
     expect(result.casResults).toHaveLength(0);
     expect(result.writes).toBe(0);
     expect(result.harvestReports[0].skipped).toBe(true);
-    expect(result.harvestReports[0].skippedReason).toBe("budget");
+    // ⛔ A10c §1.2：needed(5) > maxWrites(3)，与本轮已用无关 ⇒ 永不可收割 ⇒ 可辨识的
+    //    budget_infeasible（配置错误），不再是「本轮预算耗尽」的 budget（spec D5）。
+    expect(result.harvestReports[0].skippedReason).toBe("budget_infeasible");
     expect(result.harvestReports[0].clueId).toBe("card_x");
   });
 
@@ -474,6 +476,51 @@ describe("H13: budget insufficient for whole card ⇒ zero publish, zero CAS, lo
     const result = await runWrite(deps, [HARVEST_DECISION], 5);
     expect(result.writes).toBe(5);
     expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+  });
+});
+
+// ── A10c D5/D6：死锁必须可辨识，不能只报 budget ────────────────────
+
+describe("A10c D5/D6: distinguish never-harvestable from budget-exhausted-this-round", () => {
+  it("D5: needed > maxWrites (infeasible, config error) ⇒ budget_infeasible, distinguishable from budget", async () => {
+    const hd = harvestDeps();
+    const deps = writeDeps(hd);
+    // 默认 resultWith: 2 ev + 2 clue + 1 CAS = 5 needed；maxWrites 3 ⇒ 永不可收割。
+    const result = await runWrite(deps, [HARVEST_DECISION], 3);
+    expect(result.harvestReports[0].skipped).toBe(true);
+    // ⛔ 与本轮已用无关（fresh 预算 3 == remaining 3）⇒ 仍判定为配置错误，标记可辨识。
+    expect(result.harvestReports[0].skippedReason).toBe("budget_infeasible");
+    expect(result.harvestReports[0].budgetShortfall).toBe(2);
+  });
+
+  it("D6: card A consumes budget, card B needed ≤ maxWrites but remaining short ⇒ still budget (recoverable next round)", async () => {
+    const hd = harvestDeps();
+    // card A: 1 ev + 1 clue (+1 CAS) = 3 writes；card B: 2 ev + 2 clue (+1 CAS) = 5 writes。
+    (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (runId: string) => {
+        if (runId === "run-a") {
+          return {
+            run_id: "run-a",
+            evidences: [
+              { quote: "q", claim: "c", source: "code", locator: "a", revision: "r" },
+            ],
+            proposed_clues: [{ clue: "idea a" }],
+            materials: [{ uri: "m" }],
+          };
+        }
+        return resultWith();
+      },
+    );
+    const cardA: Decision = { ...HARVEST_DECISION, clueId: "card_a", runId: "run-a" };
+    const cardB: Decision = { ...HARVEST_DECISION, clueId: "card_b", runId: "run-b" };
+    const deps = writeDeps(hd);
+    const result = await runWrite(deps, [cardA, cardB], 5);
+    // card A 完整收割（活性）。
+    expect(result.harvestReports[0].skipped).toBe(false);
+    // card B 被跳过，但原因是 budget（非 infeasible）：needed(5) ≤ maxWrites(5)，
+    //    只是本轮 remaining(2) 不足 ⇒ 下一轮可继续（spec D6）。
+    expect(result.harvestReports[1].skipped).toBe(true);
+    expect(result.harvestReports[1].skippedReason).toBe("budget");
   });
 });
 
@@ -758,6 +805,7 @@ describe("harvestCard budget boundary", () => {
     let remaining = 5;
     let consumed = 0;
     const budget: HarvestBudget = {
+      total: () => remaining,
       remaining: () => remaining - consumed,
       consume: (n) => {
         consumed += n;
@@ -788,6 +836,7 @@ const HARVEST_CARD = { clueId: "card_x", depth: 0, sources: ["code-local"] };
 function makeBudget(total: number): HarvestBudget {
   let used = 0;
   return {
+    total: () => total,
     remaining: () => total - used,
     consume: (n: number) => {
       used += n;

@@ -8,7 +8,7 @@
  *
  * ⛔ 先 CAS 成功才算认领；CAS 失败（409）跳过该卡且不 spawn（M8 / N4）。
  * ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿，N5）。
- * ⛔ 写入不可回退：`--max-writes` 默认 5，超限立即停止并响亮报错（M10）；
+ * ⛔ 写入不可回退：`--max-writes` 默认 DEFAULT_MAX_WRITES（A10c 起足以收割一张真实卡），超限立即停止并响亮报错（M10）；
  *    spawn 本身不写 bus、不计入预算，但每次 spawn 前的 CAS 计入（spec §2）。
  * ⛔ 只对显式传入的 channel 操作（M11）；拒绝写 v1 冻结 channel（M12）。
  * ⛔ CAS 一律走 A8b 的 `realCas`，不得绕过另写 CAS（spec §4.1 纪律 8）。
@@ -41,8 +41,13 @@ import {
 } from "./harvest";
 import { casUpdateClue, getEntity, publishClue, publishEvidence } from "./bus";
 
-/** --max-writes 默认值（spec §2：单次运行写入上限默认很小）。 */
-export const DEFAULT_MAX_WRITES = 5;
+/**
+ * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
+ * 实测 6~10 条 evidence，加上新 clue 与最终 CAS）。真实产出量 > 旧默认 5 ⇒ 卡永远收割不了、
+ * 恒 max_rounds 死锁，这是本包根因。取 64：明显高于单张真实卡的 needed，仍是**有限**护栏
+ * （非无穷大），绝不因 D1 而放开成不限。
+ */
+export const DEFAULT_MAX_WRITES = 64;
 
 /** v1 冻结只读 channel 前缀（spec §2 / §8：不得触碰）。 */
 export const FROZEN_CHANNEL_PATTERNS = [
@@ -343,6 +348,7 @@ export async function runWrite(
         }
         // §1.7——evidence+clue 发布均计入 --max-writes；不足则整卡跳过。
         const budget = {
+          total: () => maxWrites,
           remaining: () => maxWrites - writes,
           consume: (n: number) => {
             writes += n;

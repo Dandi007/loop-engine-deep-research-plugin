@@ -229,6 +229,12 @@ export interface HarvestDeps {
 
 /** 写入预算接口（由上层 runWrite 提供共享计数，见 §1.7）。 */
 export interface HarvestBudget {
+  /**
+   * A10c——本轮总预算（--max-writes，固定）。
+   * ⛔ 用于区分「该卡在当前预算下**永远不可收割**」（needed > 总预算，配置错误）
+   *    与「本轮预算被前面的卡用掉、下一轮可继续」（needed ≤ 总预算但 remaining 不足）。
+   */
+  total(): number;
   /** 剩余可用写数。 */
   remaining(): number;
   /** 消耗 n 次写预算。 */
@@ -241,8 +247,8 @@ export interface HarvestReport {
   runId: string;
   /** true ⇒ 整卡被跳过（预算不足），零 publish 零 CAS（§1.7 / H13）。 */
   skipped: boolean;
-  /** 整卡跳过的原因：budget（预算不足）/ no_result（该 run 无 worker.result）。 */
-  skippedReason?: "budget" | "no_result";
+  /** 整卡跳过的原因：budget（本轮预算被前面的卡用尽，下一轮可继续）/ budget_infeasible（该卡在当前预算下永不可收割，配置错误）/ no_result（该 run 无 worker.result）。 */
+  skippedReason?: "budget" | "budget_infeasible" | "no_result";
   /** budget 跳过时还差多少预算（§1.7：响亮报告差量）。 */
   budgetShortfall?: number;
   evidencePublished: number;
@@ -298,12 +304,16 @@ export async function harvestCard(
   const needed = evItems.length + cluesAllowed + 1;
 
   if (budget.remaining() < needed) {
-    // ⛔ 预算不足 ⇒ 整卡跳过：不发、不 CAS，留 in_flight，响亮报告（§1.7 / H13）。
+    // ⛔ A10c §1.2——预算不足 ⇒ 整卡跳过：不发、不 CAS，留 in_flight，响亮报告（§1.7 / H13）。
+    //    必须区分两种形态（§1.2）：「本轮预算被前面的卡用掉、下一轮可继续」（needed ≤ 总预算
+    //    但 remaining 不足 ⇒ 仍报 budget）与「该卡在当前预算下**永不可收割**」（needed > 总预算
+    //    本身，与本轮已用无关 ⇒ 配置错误，报可辨识的 budget_infeasible）。后者绝不与前者同形。
+    const infeasible = needed > budget.total();
     return {
       clueId: card.clueId,
       runId,
       skipped: true,
-      skippedReason: "budget",
+      skippedReason: infeasible ? "budget_infeasible" : "budget",
       budgetShortfall: needed - budget.remaining(),
       evidencePublished: 0,
       cluesPublished: 0,

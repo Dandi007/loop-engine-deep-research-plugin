@@ -95,3 +95,13 @@ F0 达成（`ticksByLabel.tick = 16 >= 1`）。
 - **hasPendingWork 用写后板面（note）**：`runChannelWrite` 原来用写前快照 `state` 判 hasPendingWork，
   一个把最后非终态卡推到终态的 tick 仍报 true、多投一条。现用成功 CAS 的写后 status 重建板面再判定
   （`applyCasOutcomes`，src/tick-run.ts）。
+- **写后 hasPendingWork 计入本 tick 新发布的 clue（attempt 2 blocker 修复）**：`applyCasOutcomes` 只重写
+  **写前快照里已存在**的卡，本 tick 经 harvest 新发布的 clue（status=proposed，非终态）不在其中。若被收割的
+  卡恰是最后一张非终态卡，写后板面全为终态 ⇒ hasPendingWork=false ⇒ tick.md 跳过续投 ⇒ 新发布的 proposed
+  clue 被**静默搁浅**（spec §3.2 禁止静默零结果）。修复：`runChannelWrite` 把 `harvestReports[].cluesPublished`
+  的累计并入 hasPendingWork（`hasPendingWork(postWriteState) || cluesPublished > 0`），保证新发布的非终态
+  clue 必被下一 tick 探索（src/tick-run.ts）。新增生产路径测试：收割把最后一张非终态卡 CAS 到 explored 且
+  发布 1 条新 proposed clue ⇒ `outcome.hasPendingWork === true`（test/a9-tick-trigger.test.ts）。
+- **bin/deep-research-loop.sh 置为可执行（note）**：该脚本带 `#!/usr/bin/env bash` shebang 但此前 mode 为
+  100644，与 bin/tick-entry.sh 等兄弟脚本（100755）不一致，只能显式 `bash bin/deep-research-loop.sh` 启动。
+  与 A9「让驱动真正可运行」的目的一致，现 chmod 为 100755（bin/deep-research-loop.sh）。

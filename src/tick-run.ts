@@ -816,6 +816,16 @@ export async function runChannelWrite(
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
   const postWriteState = applyCasOutcomes(state, result.casResults);
+  // ⛔（attempt 2 blocker）写后板面重建（applyCasOutcomes）只重写**已存在于写前快照**的卡，
+  //   本 tick 经 harvest 新发布的 clue（status=proposed，非终态）不在其中。若被收割的卡恰好是
+  //   最后一张非终态卡，postWriteState 会全为终态而 hasPendingWork=false，导致新发布的 proposed
+  //   clue 被**静默搁浅**（spec §3.2 禁止静默零结果 = 假装完成）。因此 hasPendingWork 必须把本 tick
+  //   新发布的 clue 一并计入：任一张卡发布了 clue（harvestReports[].cluesPublished>0）即视为仍有待处理
+  //   工作（新 clue 非终态 proposed，须由下一 tick 探索），不得只依赖写前快照上的旧卡重建。
+  const cluesPublished = result.harvestReports.reduce(
+    (n, r) => n + r.cluesPublished,
+    0,
+  );
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -824,7 +834,7 @@ export async function runChannelWrite(
     skipped: result.skipped,
     spawns: result.spawns,
     harvestReports: result.harvestReports,
-    hasPendingWork: hasPendingWork(postWriteState),
+    hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
   };
 }
 

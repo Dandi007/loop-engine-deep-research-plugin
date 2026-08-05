@@ -18,12 +18,21 @@ import {
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { parse } from "yaml";
 import { hasPendingWork } from "../src/tick";
 import type { BoardCard, BoardState } from "../src/tick";
+import { runChannelWrite } from "../src/tick-run";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+function jsonResponse(data: unknown) {
+  return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) };
+}
 
 const TICK_MD = join(
   ROOT,
@@ -381,5 +390,95 @@ describe("F9/F10: production TICK_ENTRY is a bare executable path (no embedded `
     expect(tpl).toMatch(/\$\{?tick_entry\}?/);
     expect(tpl).toMatch(/"\$tick_entry" --run/);
     expect(tpl).not.toMatch(/eval\s+\$tick_entry/);
+  });
+});
+
+// ── F9（生产路径）：收割把最后一张非终态卡推进终态 + 发布新 proposed clue ⇒ hasPendingWork 仍为 true ──
+// 评审 blocker：postWriteState（applyCasOutcomes）只重写写前快照里已有的卡，本 tick 经 harvest
+//   新发布的 clue（status=proposed）不在其中。若被收割的卡恰是最后一张非终态卡，写后板面全为终态，
+//   hasPendingWork 会错误地判 false，导致新发布的 proposed clue 被静默搁浅、续投被跳过。
+//   断言生产路径 runChannelWrite 返回的 hasPendingWork 必须为 true（不得只验单元层 hasPendingWork）。
+
+describe("F9 production path: harvest terminalizes last card + publishes clues ⇒ hasPendingWork stays true", () => {
+  it("runChannelWrite reports hasPendingWork=true when harvest publishes a new proposed clue", async () => {
+    const channel = "research:p02-smoke-1dce60";
+    const inFlightMsg = {
+      message_id: "msg_clue_1",
+      channel_id: channel,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: {
+        status: "in_flight",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+        run_id: "run-1",
+      },
+      entity_id: "card_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-1", exit_code: 0 },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_1",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-1",
+          evidence: [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: { items: [{ clue: "new idea" }] },
+        },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    let clueCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: inFlightMsg });
+        }
+        if (/\/v1\/channels\/[^/]+\/publish/.test(u)) {
+          return jsonResponse({ message_id: "p_x", channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${channel}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [inFlightMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          const hasAfterSeq = /[?&]after_seq=/.test(u);
+          return jsonResponse({ messages: hasAfterSeq ? [] : runsMessages });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const outcome = await runChannelWrite({
+      channelId: channel,
+      evidenceChannelId: `${channel}.evidence`,
+    });
+
+    // 判别性：收割确实发布了 1 条新 proposed clue，且把最后一张非终态卡 CAS 到 explored。
+    expect(outcome.harvestReports).toHaveLength(1);
+    expect(outcome.harvestReports[0].cluesPublished).toBe(1);
+    // ⛔ 关键断言：写后板面（仅含 explored 的旧卡）无待处理工作，但新发布的 proposed clue 必须
+    //   让 hasPendingWork 仍为 true，否则该 clue 会被静默搁浅（spec §1.3 / §3.2）。
+    expect(outcome.hasPendingWork).toBe(true);
   });
 });

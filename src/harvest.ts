@@ -105,25 +105,28 @@ export function assertWorkerResultShape(result: WorkerResultV1): void {
       "legacy singular 'evidence' field present (expected the plural array 'evidences')",
     );
   }
-  if (result.evidences !== undefined && !Array.isArray(result.evidences)) {
-    throw new WorkerResultShapeError(
-      "'evidences' must be an array (got " + typeof result.evidences + ")",
-    );
-  }
-  if (
-    result.proposed_clues !== undefined &&
-    !Array.isArray(result.proposed_clues)
-  ) {
-    throw new WorkerResultShapeError(
-      "'proposed_clues' must be a plain array, not wrapped as {items} (got " +
-        typeof result.proposed_clues +
-        ")",
-    );
-  }
-  if (result.materials !== undefined && !Array.isArray(result.materials)) {
-    throw new WorkerResultShapeError(
-      "'materials' must be an array (got " + typeof result.materials + ")",
-    );
+  // ⛔ A10 —— 注册 schema 的 required 键必须**全部存在**且为数组（spec §1.2 / C2）。
+  //    ⛔ 缺失任一键（undefined）即响亮失败：绝不静默 `evidences ?? []` 退化成空列表、
+  //    needed 塌缩到 1、零发布却被 CAS 到 explored——正是 C2 禁止的「0 发布 + CAS explored」。
+  //    「worker 确实无产出」只能由结果存在且 `evidences` 为**空数组**确立（见 harvestCard 正常分支，
+  //    C4 判别性），键缺失不是合法产物。
+  const required: Array<keyof WorkerResultV1> = [
+    "evidences",
+    "proposed_clues",
+    "materials",
+  ];
+  for (const key of required) {
+    const value = result[key];
+    if (value === undefined) {
+      throw new WorkerResultShapeError(
+        `missing required key '${key}' (registered worker-result.v1 requires 'evidences'/'proposed_clues'/'materials' as arrays)`,
+      );
+    }
+    if (!Array.isArray(value)) {
+      throw new WorkerResultShapeError(
+        `'${key}' must be an array (got ${typeof value})`,
+      );
+    }
   }
 }
 

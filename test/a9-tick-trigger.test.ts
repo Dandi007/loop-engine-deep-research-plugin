@@ -372,7 +372,32 @@ describe("F10: trigger id is unique across rounds", () => {
   });
 });
 
-// ── F9/F10 判别性：生产装配形状（裸可执行路径，无内嵌 `bash ` 前缀）────────────────
+// ── A10 交付 3：自然收敛（spec §1 / §0.4）────────────────────────────
+// 根因（真跑复现，2026-08-05）：单节点 tick 在 max_nodes:1 时完成即 `finish("max_nodes")`，
+// 非 halt/drained ⇒ fleet 的 claim.complete 判为异常终局 → `failure_status: open` 把已消费触发
+// **回退成 open** ⇒ seed/续投触发每轮都被重新认领（pending.status:open 每轮都数到它）⇒ drain 撞
+// max_passes 而非 `drained`。修复：tick 恒为单节点，max_nodes 必须 ≥2，让这一节点自然排空返回
+// `halt`，complete 走 `success_status: done` ⇒ 已消费触发走到终态，板面排空时 drain 以 drained 退出。
+// 这里以确定性方式断言装配层携带该收敛前置（无需真实 loop-engine/bus）。
+
+describe("A10 deliverable 3: single-node tick can complete naturally so the consumed trigger reaches a terminal state", () => {
+  const WORKFLOW = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
+
+  it("tick workflow max_nodes >= 2 so the single tick node returns halt, not max_nodes", () => {
+    const doc = parse(readFileSync(WORKFLOW, "utf8"));
+    const maxNodes = doc.limits?.max_nodes as number;
+    expect(maxNodes).toBeGreaterThanOrEqual(2);
+  });
+
+  it("fleet claim.complete success_status is a terminal state (done) so a clean tick closes the consumed trigger", () => {
+    const fleet = readFileSync(
+      join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"),
+      "utf8",
+    );
+    expect(fleet).toMatch(/success_status:\s*done/);
+  });
+});
+
 // 评审 finding：makeFakeTick 用裸路径而装配系统曾携带 `bash "…tick-entry.sh"` ⇒ 测试全绿而
 // 真实调用形状是坏的。这里断言生产 TICK_ENTRY 是裸可执行路径，且 tick.md 以单个引号词直接执行它。
 

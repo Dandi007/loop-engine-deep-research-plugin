@@ -750,24 +750,40 @@ describe("harvestCard budget boundary", () => {
 //   全部用**注册形状/固化的真实产物形状**求值，⛔ 不得手写旧夹具形状与代码共谋。
 // ════════════════════════════════════════════════════════════════════
 
-// C0 —— 夹具形状由注册 schema 的 required 集合导出，不得手写旧形状。
-describe("C0: fixture shape derived from the registered worker-result.v1 schema", () => {
+// C0 —— 夹具形状由「固化的真实产物 fixture」导出（spec §2：测试从 schema 或固化的真实产物
+//   fixture 读取字段名，⛔ 不得手写夹具形状与代码共谋）。
+//   ⛔ 本仓不含 `profiles/roles/schemas/worker-result.v1.json`（协议在 loop-engine 仓注册并已冻结），
+//   故用**固化的真实产物 fixture 文件** `test/fixtures/worker-result.v1.json` 作为锚点：
+//   它来自 2026-08-05 V1/F0 实测（evidences:list(6) / proposed_clues:list(2) / materials:list(0)），
+//   顶层键集合 === 注册 schema 的 required 集合。测试从这里读键名，绝不在测试体内手写产物形状。
+const FROZEN_FIXTURE = join(ROOT, "fixtures", "worker-result.v1.json");
+
+function frozenFixture(): Record<string, unknown> {
+  return JSON.parse(readFileSync(FROZEN_FIXTURE, "utf8")) as Record<
+    string,
+    unknown
+  >;
+}
+
+describe("C0: fixture shape derived from the registered worker-result.v1 schema / frozen real-bus fixture", () => {
+  // 注册 schema 的 required 集合（spec §0.1 已冻结注册：required:['evidences','proposed_clues','materials']）。
   const SCHEMA_REQUIRED = ["evidences", "proposed_clues", "materials"];
 
-  it("frozen real-payload fixture: top-level keys === schema required set", () => {
-    // 固化的真实产物 fixture（2026-08-05 V1/F0 实测：evidences:list(6) / proposed_clues:list(2) / materials:list(0)）。
-    // 顶层键集合必须正好等于 schema 的 required 集合（spec §2 C0）。
-    const frozenRealPayload = {
-      evidences: [
-        { quote: "q", claim: "c", source: "code", locator: "a", revision: "r" },
-      ],
-      proposed_clues: [{ clue: "idea" }],
-      materials: [],
-    };
-    expect(Object.keys(frozenRealPayload).sort()).toEqual([...SCHEMA_REQUIRED].sort());
+  it("frozen real-bus fixture file exists and its top-level keys === schema required set", () => {
+    expect(readFileSync(FROZEN_FIXTURE, "utf8")).toBeTruthy();
+    const fixture = frozenFixture();
+    // ⛔ 夹具的顶层键集合必须正好等于注册 schema 的 required 集合（spec §2 C0）。
+    expect(Object.keys(fixture).sort()).toEqual([...SCHEMA_REQUIRED].sort());
   });
 
-  it("resultWith fixture carries all three required keys as arrays", () => {
+  it("frozen fixture carries all three required keys as arrays", () => {
+    const fixture = frozenFixture();
+    for (const key of SCHEMA_REQUIRED) {
+      expect(Array.isArray(fixture[key])).toBe(true);
+    }
+  });
+
+  it("resultWith fixture still carries all three required keys as arrays", () => {
     const r = resultWith();
     for (const key of SCHEMA_REQUIRED) {
       expect(
@@ -838,6 +854,65 @@ describe("C2: legacy wrong shape is rejected loudly, never '0 publish + CAS expl
         materials: [],
       }),
     ).not.toThrow();
+  });
+});
+
+// C2（补）—— 注册 schema 的 required 键缺失 ⇒ 必须响亮失败，绝不静默 `?? []` ⇒ 0 发布 + CAS explored。
+describe("C2 required-key enforcement: missing registered required key is rejected loudly", () => {
+  it("missing `evidences` ⇒ WorkerResultShapeError, zero publish, zero CAS", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        Promise.resolve({
+          run_id: "run-1",
+          proposed_clues: [],
+          materials: [],
+        } as unknown as WorkerResultV1),
+      ),
+    });
+    const deps = writeDeps(hd);
+    await expect(runWrite(deps, [HARVEST_DECISION], 10)).rejects.toBeInstanceOf(
+      WorkerResultShapeError,
+    );
+    expect(hd.publishEvidence).not.toHaveBeenCalled();
+    expect(hd.publishClue).not.toHaveBeenCalled();
+    expect(deps.cas).not.toHaveBeenCalled();
+  });
+
+  it("missing `proposed_clues` ⇒ WorkerResultShapeError, zero publish, zero CAS", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        Promise.resolve({
+          run_id: "run-1",
+          evidences: [],
+          materials: [],
+        } as unknown as WorkerResultV1),
+      ),
+    });
+    const deps = writeDeps(hd);
+    await expect(runWrite(deps, [HARVEST_DECISION], 10)).rejects.toBeInstanceOf(
+      WorkerResultShapeError,
+    );
+    expect(hd.publishEvidence).not.toHaveBeenCalled();
+    expect(deps.cas).not.toHaveBeenCalled();
+  });
+
+  it("missing `materials` ⇒ WorkerResultShapeError, zero publish, zero CAS", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        Promise.resolve({
+          run_id: "run-1",
+          evidences: [],
+          proposed_clues: [],
+        } as unknown as WorkerResultV1),
+      ),
+    });
+    const deps = writeDeps(hd);
+    await expect(runWrite(deps, [HARVEST_DECISION], 10)).rejects.toBeInstanceOf(
+      WorkerResultShapeError,
+    );
+    expect(hd.publishEvidence).not.toHaveBeenCalled();
+    expect(hd.publishClue).not.toHaveBeenCalled();
+    expect(deps.cas).not.toHaveBeenCalled();
   });
 });
 

@@ -1,0 +1,11 @@
+{
+  "evidences": [
+    { "quote": "the quoted source text", "claim": "conclusion one", "source": "code", "locator": "repo/File.ts", "revision": "abc123" },
+    { "quote": "second quoted text", "claim": "conclusion two", "source": "wiki", "locator": "Page", "revision": "rev-1" }
+  ],
+  "proposed_clues": [
+    { "clue": "new idea 1" },
+    { "clue": "new idea 2" }
+  ],
+  "materials": []
+}

@@ -1,4 +1,10 @@
-limits: { max_nodes: 1, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# ⛔ A10 —— 自然收敛（spec §1 交付 3 / §0.4 根因）：max_nodes 必须是 ≥2 的紧上界，
+#   否则单节点 tick 完成即 `finish("max_nodes")`（非 halt/drained），fleet 的
+#   claim.complete 把它判为异常终局 → 经 `failure_status: open` 把已消费的触发**回退成 open**，
+#   于是 seed/续投触发每轮都重新可认领（pending.status:open 每轮都数到它）⇒ drain 撞 max_passes
+#   而非 `drained`。tick 恒为单节点，max_nodes:2 让这一节点自然排空返回 `halt`，complete 走
+#   `success_status: done` ⇒ 已消费触发走到终态，板面排空时 drain 以 `reason==="drained"` 退出。
+limits: { max_nodes: 2, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

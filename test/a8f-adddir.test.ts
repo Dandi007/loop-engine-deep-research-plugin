@@ -156,7 +156,9 @@ async function runDispatch(opts: {
   const cleanup: string[] = [dirname(stub)];
 
   let allowedRoot = opts.allowedRoot;
-  if (opts.gitDir) {
+  if (opts.gitDir && !allowedRoot) {
+    // 仅当调用方没有显式给 allowedRoot 时才新建仓库；否则沿用（promote）既有目录，
+    // 避免用第二个新仓库静默遮蔽调用方传入的 allowedRoot（revision 必须来自同一仓库）。
     allowedRoot = makeGitDir();
     cleanup.push(allowedRoot);
   }
@@ -269,7 +271,7 @@ describe("F4: payload revision equals git rev-parse HEAD of a real git dir", () 
     const d = makeGitDir();
     const sha = execFileSync("git", ["-C", d, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     try {
-      const { blocks } = await runDispatch({ sources: ["code-local"], allowedRoot: d, gitDir: true });
+      const { blocks } = await runDispatch({ sources: ["code-local"], allowedRoot: d });
       expect(blocks).toHaveLength(1);
       const parsed = JSON.parse(blocks[0].inputContent ?? "{}") as WorkerInputPayload;
       expect(parsed.revision).toBe(sha);

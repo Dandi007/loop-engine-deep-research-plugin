@@ -45,9 +45,10 @@ usage:
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
 --run 对显式传入的 channel 执行 CAS 认领/回收 + spawn + 收割（接线判别）：先 CAS 成功才按 role spawn，
      spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；
-     --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 5（--max-writes）；
-     --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
-     拒绝写 v1 冻结 channel。
+      --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 5（--max-writes）；
+      --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
+      拒绝写 v1 冻结 channel。
+  JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。
 `;
 
 interface SelfCheckOutput {

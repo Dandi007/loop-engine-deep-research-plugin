@@ -21,6 +21,7 @@ import { delimiter, join } from "node:path";
 import type { ClueV2 } from "./protocol";
 import {
   decideTick,
+  hasPendingWork,
   DEFAULT_TICK_CONFIG,
   type CasDecision,
   type Decision,
@@ -509,6 +510,11 @@ export interface RunWriteOutcome {
   spawns: SpawnRecord[];
   /** A8e——收割报告（exited(0) 卡的 evidence/clue 发布与跳过情况）。 */
   harvestReports: HarvestReport[];
+  /**
+   * A9 —— 板面是否仍有非终态 clue（proposed / open / in_flight），由板面状态确定性推出。
+   * tick 依它决定是否 `loop-store put` 下一条触发（spec §1.3 / F7/F8）。
+   */
+  hasPendingWork: boolean;
 }
 
 /**
@@ -813,6 +819,7 @@ export async function runChannelWrite(
     skipped: result.skipped,
     spawns: result.spawns,
     harvestReports: result.harvestReports,
+    hasPendingWork: hasPendingWork(state),
   };
 }
 

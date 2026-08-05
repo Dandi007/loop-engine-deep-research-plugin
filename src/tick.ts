@@ -145,6 +145,23 @@ export type Decision =
     }
   | { kind: "triage" };
 
+/**
+ * A9 —— 非终态 clue 状态集合：板面仍有待处理工作的判据（spec §1.3）。
+ * 终态为 explored / dropped / blocked；非终态（仍会继续消耗 tick）为 proposed / open / in_flight。
+ */
+export const PENDING_CLUE_STATUSES = ["proposed", "open", "in_flight"] as const;
+
+/**
+ * A9 —— 板面是否仍有非终态 clue（proposed / open / in_flight）。
+ * 由板面状态**确定性**推出（spec §1.3），供 tick 决定是否投下一条触发；
+ * ⛔ 不得靠猜、不得靠计时。纯函数：无 IO、无时钟、无随机（spec B1）。
+ */
+export function hasPendingWork(state: BoardState): boolean {
+  return state.cards.some((c) =>
+    (PENDING_CLUE_STATUSES as readonly string[]).includes(c.status),
+  );
+}
+
 /** CAS 结果（与 bus 层语义对齐：conflict = 别人抢先）。 */
 export interface CasDecision {
   success: boolean;

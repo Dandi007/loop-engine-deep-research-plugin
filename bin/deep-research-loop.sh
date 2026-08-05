@@ -55,18 +55,64 @@ render() {
     "$PLUGIN_ROOT/workflows/$MODE/fleet.yaml.tpl" "$RUNTIME_FLEET"
 }
 
+# A9 —— 解析驱动运行器（缺省 bun；可用 LOOP_ENGINE_RUNNER 覆盖）。
+# ⛔ loop-engine 的 `dist/cli.js` 用 extensionless import —— 只有 bun 能解析，node 会给出
+#    `ERR_MODULE_NOT_FOUND: .../dist/engine` 这种「指向不存在文件、实则是解析器不兼容」的误导性错误。
+# ⛔ 解析不到 ⇒ 响亮失败，⛔ 绝不回退 node（本 gate 首跑正因此误判为「构建残缺」）。
+resolve_runner() {
+  local candidate="$1"
+  if [ -x "$candidate" ]; then printf '%s' "$candidate"; return 0; fi
+  if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
+  return 1
+}
+
+LOOP_ENGINE_RUNNER="${LOOP_ENGINE_RUNNER:-}"
+if [ -z "$LOOP_ENGINE_RUNNER" ]; then
+  if resolve_runner bun >/dev/null 2>&1; then
+    LOOP_ENGINE_RUNNER="bun"
+  elif resolve_runner "$HOME/.bun/bin/bun" >/dev/null 2>&1; then
+    LOOP_ENGINE_RUNNER="$HOME/.bun/bin/bun"
+  fi
+fi
+if [ -n "$LOOP_ENGINE_RUNNER" ]; then
+  LOOP_ENGINE_RUNNER="$(resolve_runner "$LOOP_ENGINE_RUNNER")" || LOOP_ENGINE_RUNNER=""
+fi
+export LOOP_ENGINE_RUNNER
+
+# A9 —— LOOP_ENGINE_CLI / LOOP_STORE_CLI 的**派生与导出**必须在 render 之前发生：
+#    fleet.yaml.tpl 的 ${LOOP_STORE_CLI} / ${LOOP_ENGINE_RUNNER} 占位符需要非 undefined 值。
+#    （文件存在性校验只在非 dry-run 的真实跑里做，dry-run 不依赖 CLI 可执行，spec G1/G2。）
+LOOP_ENGINE_CLI="${LOOP_ENGINE_CLI:-/data/code/self/loop-engine/dist/cli.js}"
+# A9 —— loop-store 的 put/claim/list 契约 CLI（与 cli.js 同构、同 dist 根）。
+LOOP_STORE_CLI="${LOOP_STORE_CLI:-$(dirname "$LOOP_ENGINE_CLI")/lib/store-cli.js}"
+export LOOP_STORE_CLI
+
 if [ -n "$DRY_RUN" ]; then
   render
   cat "$RUNTIME_FLEET"
   exit 0
 fi
 
-LOOP_ENGINE_CLI="${LOOP_ENGINE_CLI:-/data/code/self/loop-engine/dist/cli.js}"
 if [ ! -f "$LOOP_ENGINE_CLI" ]; then
   echo "[deep-research-loop] missing LOOP_ENGINE_CLI: $LOOP_ENGINE_CLI (build loop-engine first)" >&2
   exit 3
 fi
+if [ ! -f "$LOOP_STORE_CLI" ]; then
+  echo "[deep-research-loop] missing loop-store CLI: $LOOP_STORE_CLI (build loop-engine first)" >&2
+  exit 3
+fi
+
+if [ -z "$LOOP_ENGINE_RUNNER" ]; then
+  echo "[deep-research-loop] cannot resolve the loop-engine runner: set LOOP_ENGINE_RUNNER to a bun-compatible executable (default 'bun'). Refusing to fall back to node (node yields the misleading ERR_MODULE_NOT_FOUND for extensionless imports)." >&2
+  exit 3
+fi
+
+# A9 —— drain 之前投下首个触发（status:"open"），否则 claimableCount() 恒 0 ⇒ 0 tick。
+# 实测 loop-store 契约：put '{"id":"...","status":"open","body":{...}}' → 落盘 <id>.json。
+TRIGGER_ID="a9-$(date +%s%N)-$$"
+"$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
+  "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"
-node "$LOOP_ENGINE_CLI" drain "$RUNTIME_FLEET" --label "$MODE"
+"$LOOP_ENGINE_RUNNER" "$LOOP_ENGINE_CLI" drain "$RUNTIME_FLEET" --label "$MODE"

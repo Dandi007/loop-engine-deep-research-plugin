@@ -7,6 +7,10 @@ pipelines:
       tick_channel: ${TICK_CHANNEL}
       evidence_channel: ${EVIDENCE_CHANNEL}
       allowed_root: ${ALLOWED_ROOT}
+      # A9 —— 触发存储一路注入到 tick.md：tick 依 hasPendingWork 决定是否续投下一条触发。
+      trigger_store_dir: ${TRIGGER_STORE_DIR}
+      loop_store_cli: ${LOOP_STORE_CLI}
+      loop_engine_runner: ${LOOP_ENGINE_RUNNER}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

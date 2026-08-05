@@ -1,10 +1,12 @@
-# A10b —— limits.max_nodes 必须 ≥ 2（§1.1 自然收敛）。
-# ⛔ max_nodes:1 会让「单 tick 节点正常完成」被 loop-engine 判成 reason="max_nodes"（先查
-#    done.size>=max_nodes 再查自然排空），而 fleet 的 claim.complete 把非 {halt,drained} 的终局
-#    当失败路由到 failure_status:open ⇒ seed 每轮被认领后又退回 open ⇒ 永不「已排空」（§0.1 实测）。
-#    设成 2（本板面单 seed 实际只跑 1 节点，不受影响）使单 tick 正常完成后 reason="drained"，
-#    complete 才把它落到 success_status:done ⇒ 板面全终态时不续投 ⇒ drain 以 reason="drained" 收敛。
-limits: { max_nodes: 2, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# A10b —— 收敛只由板面状态决定；max_nodes 是**非绑定**的失控预算护栏，不是收敛机制（§1.1）。
+# 根因（§0.1）：loop-engine 在主循环每圈顶部查 `done.size >= max_nodes ⇒ finish("max_nodes")`，
+#   而 fleet 的 claim.complete 把非 {halt,drained} 终局当失败路由回 failure_status:open ⇒
+#   seed 每轮被认领又退回 open ⇒ 永不「已排空」。上一版 max_nodes:1（后 2）会让「撞上 max_nodes」
+#   成为收敛触发器：板面一旦需 ≥2 个 tick pass（done.size>=max_nodes）就重演该失败循环。
+#   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
+#   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
+#   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

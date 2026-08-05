@@ -15,7 +15,7 @@
  * （node 起的 127.0.0.1 假 bus，零外网）。⛔ 不打桩 fetch —— 产品代码走真实 HTTP 读一个本地 bus。
  * 依赖缺失（bun / loop-engine worktree / node）时以显式 it.skip 标记，绝不裸 return 静默通过。
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -81,6 +81,32 @@ function runDriver(argv: string[], env: NodeJS.ProcessEnv): { code: number; out:
   }
 }
 
+// A10b —— 异步渲染：用 execFile（非 execFileSync）让 N 次渲染**真正并发**地跑（B6 ⛔ 不得串行化）。
+// execFile 只 spawn 子进程即返回，各子进程并行渲染；Promise.all 统一收尾。返回真实退出码，
+// 非零时（execFileSync 会抛）也如实带回，保证 B1 的 `expect(code).toBe(0)` 有判别力。
+function runDriverAsync(argv: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; out: string; err: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      "bash",
+      argv,
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { ...process.env, ...env },
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          const e = err as { status?: number };
+          resolve({ code: e.status ?? -1, out: String(stdout), err: String(stderr) });
+        } else {
+          resolve({ code: 0, out: String(stdout), err: String(stderr) });
+        }
+      },
+    );
+  });
+}
+
 function renderPath(): string {
   return join(ROOT, "bin", "deep-research-loop.sh");
 }
@@ -135,25 +161,39 @@ async function runRealE2E(opts: {
   seedPath?: string;
   env?: NodeJS.ProcessEnv;
 }): Promise<{ code: number; out: string; err: string }> {
-  startFakeBus(opts.port, opts.seedPath);
+  // ⛔ 必须 await startFakeBus：其就绪循环是异步轮询（内部 await fetch 端口探测）。若丢弃该
+  //    promise，紧接着的阻塞 execFileSync 会让就绪循环永远得不到事件循环机会（B1/B2 竞争 bus
+  //    启动，重新引入 §0.2 的验收命令不确定性）；bus 绑定失败也会变成 unhandled rejection 而非
+  //    响亮测试失败（§3.2 静默零结果）。
+  await startFakeBus(opts.port, opts.seedPath);
   const runRoot = mkdtempSync(join(tmpdir(), "a10b-e2e-"));
   const bun = resolveBun()!;
-  const res = execFileSync("bash", [SCRIPT], {
-    cwd: ROOT,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      AGENT_BUS_URL: `http://127.0.0.1:${opts.port}`,
-      LOOP_ENGINE_CLI,
-      LOOP_ENGINE_RUNNER: bun,
-      DD_RUN_ROOT: runRoot,
-      PATH: `${dirname(bun)}:${process.env.PATH ?? ""}`,
-      ...opts.env,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let code = 0;
+  let out = "";
+  let err = "";
+  try {
+    out = execFileSync("bash", [SCRIPT], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AGENT_BUS_URL: `http://127.0.0.1:${opts.port}`,
+        LOOP_ENGINE_CLI,
+        LOOP_ENGINE_RUNNER: bun,
+        DD_RUN_ROOT: runRoot,
+        PATH: `${dirname(bun)}:${process.env.PATH ?? ""}`,
+        ...opts.env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const ee = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+    code = ee.status ?? -1;
+    out = String(ee.stdout ?? "");
+    err = String(ee.stderr ?? "");
+  }
   rmSync(runRoot, { recursive: true, force: true });
-  return { code: 0, out: res, err: "" };
+  return { code, out, err };
 }
 
 function drainResult(out: string): unknown {
@@ -277,6 +317,9 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       const msgs = await readChannel(port, "research:p02-smoke-1dce60.evidence");
       const evidence = msgs.filter((m) => (m as { kind?: string }).kind === "research.evidence.v2");
       expect(evidence.length).toBeGreaterThan(0);
+      // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），
+      //    故增量 == 回读到的 evidence 条数；收割的 evidence+clue 发布都计入预算（src/tick-run.ts）。
+      expect(evidence.length).toBeLessThanOrEqual(5);
     });
   };
   guard(() => {});
@@ -382,8 +425,12 @@ describe("B5: two renders in the same second yield distinct RUN_ROOT", () => {
 describe("B6: concurrent renders do not pollute each other", () => {
   it("N>=5 concurrent renders each read back their own fleet.yaml correctly", async () => {
     const N = 6;
-    const procs = Array.from({ length: N }, () => runDriver([renderPath(), "--dry-run"], {}));
-    const results = procs.map((res) => {
+    // ⛔ 不得串行化：用 execFile 异步并发 spawn N 个子进程（runDriverAsync），Promise.all 统一收尾，
+    //    让几次渲染**真正同时**进行 —— 这正是 §0.2 的竞争场景（vitest 并行下同一批渲染互相覆盖）。
+    //    execFileSync 是同步阻塞，串行执行下每个渲染都拿到唯一 RUN_ROOT，读回必然不碰撞，判据零功率。
+    const procs = Array.from({ length: N }, () => runDriverAsync([renderPath(), "--dry-run"], {}));
+    const results = await Promise.all(procs);
+    const parsed = results.map((res) => {
       expect(res.code).toBe(0);
       const doc = parse(res.out);
       const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -391,10 +438,10 @@ describe("B6: concurrent renders do not pollute each other", () => {
       const fleetDir = dirname(dirname(triggerStoreDir));
       return { triggerStoreDir, fleetDir };
     });
-    const distinct = new Set(results.map((r) => r.triggerStoreDir));
+    const distinct = new Set(parsed.map((r) => r.triggerStoreDir));
     expect(distinct.size).toBe(N);
     // 每次读回自己的 fleet.yaml：文件存在，且其 trigger_store_dir 与该次渲染一致（无交叉污染）。
-    for (const r of results) {
+    for (const r of parsed) {
       const fleetFile = join(r.fleetDir, "fleet.yaml");
       expect(existsSync(fleetFile)).toBe(true);
       const doc2 = parse(readFileSync(fleetFile, "utf8"));
@@ -433,5 +480,31 @@ describe("B10: --selfcheck preserved and side-effect free", () => {
     expect(res.code).toBe(0);
     const obj = JSON.parse(res.out);
     expect(obj.ok).toBe(true);
+  });
+});
+
+// ── B1-guard（收敛成因）：max_nodes 不得是收敛触发器 ─────────────
+// 评审 finding：§0.1 的根因是「tick 节点一旦撞 max_nodes 就以非 {halt,drained} 终局结束，claim.complete
+// 把它路由回 failure_status:open ⇒ seed 永停在 open ⇒ 永不判已排空」。上一版只把 max_nodes 1→2，
+// 那是 limit 调参而非修根因：板面一旦需 ≥2 个 tick pass（done.size >= max_nodes）就重演 max_nodes
+// 失败。本测试把「max_nodes 必须是明显非绑定的预算护栏（不是收敛机制）」与「干净完成路由到 done」钉死，
+// 任何把 max_nodes 调回 1/2 的回归都会在此被拦截。
+describe("B1-guard: convergence is board-state driven, max_nodes is a non-binding budget guard", () => {
+  it("workflow limits.max_nodes is high enough to never be the convergence trigger", () => {
+    const wf = parse(readFileSync(join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml"), "utf8"));
+    const maxNodes = wf.limits?.max_nodes as number;
+    // 自然收敛要求每轮循环顶部 done.size < max_nodes，直到板面排空（drain → drained）。
+    // max_rounds=16 是真正的失控兜底；max_nodes 必须明显高于单次自然 drain 可能的 pass 数，
+    // 使收敛只由板面状态（tick 停止续投）决定，而非撞 max_nodes 提前终局（§0.1 根因）。
+    expect(maxNodes).toBeGreaterThanOrEqual(16);
+  });
+  it("fleet claim.complete routes a clean tick completion to the terminal success status", () => {
+    const tpl = readFileSync(join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"), "utf8");
+    // 干净完成（reason=halt/drained）→ success_status（done 终态），绝不回 open。
+    expect(tpl).toMatch(/success_status:\s*done/);
+    expect(tpl).not.toMatch(/success_status:\s*open/);
+    // 失败（reason∉{halt,drained} 的异常终局）才回 open 重投递 —— 这才是根因所在，
+    // 且只有在 max_nodes 变成收敛触发器时才会走到该分支。
+    expect(tpl).toMatch(/failure_status:\s*open/);
   });
 });

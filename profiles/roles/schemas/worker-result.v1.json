@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "worker-result.v1",
+  "title": "worker.result.v1",
+  "description": "Frozen worker.result.v1 payload registered on the bus (required: evidences/proposed_clues/materials; all three are arrays). A10a: fixture field names MUST be read from this file, never hand-written.",
+  "type": "object",
+  "required": ["evidences", "proposed_clues", "materials"],
+  "properties": {
+    "evidences": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quote", "claim", "source", "locator", "revision"],
+        "properties": {
+          "quote": { "type": "string" },
+          "claim": { "type": "string" },
+          "source": { "type": "string" },
+          "locator": { "type": "string" },
+          "revision": { "type": "string" },
+          "range": { "type": "string" }
+        }
+      }
+    },
+    "proposed_clues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["clue"],
+        "properties": {
+          "clue": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "materials": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": true
+}

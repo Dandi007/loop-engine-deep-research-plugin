@@ -40,8 +40,39 @@ export interface WorkerProposedClue {
 /** worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。 */
 export interface WorkerResultV1 {
   run_id?: string;
-  evidence?: WorkerEvidenceItem[];
-  proposed_clues?: { items?: WorkerProposedClue[] };
+  evidences: WorkerEvidenceItem[];
+  proposed_clues: WorkerProposedClue[];
+  materials: unknown[];
+}
+
+/**
+ * worker.result.v1 的 required 顶层键（A10a：与冻结 schema 对齐，全部为数组）。
+ * ⛔ 真实形状：`evidences` / `proposed_clues` / `materials` **三者均为数组**。
+ *    早期代码读 `result.evidence`（单数）与 `result.proposed_clues?.items` —— 字段名与
+ *    形状双双偏离真实，两处取到 undefined ⇒ needed=1 ≤ 预算 ⇒ 一条不发 ⇒ 卡被 CAS 到
+ *    explored，证据被静默丢弃。
+ */
+export const WORKER_RESULT_REQUIRED_KEYS = [
+  "evidences",
+  "proposed_clues",
+  "materials",
+] as const;
+
+/**
+ * 形状守卫（A10a §1 第 3 项）：required 键必须**齐全**，且均为数组。
+ * ⛔ 缺 `evidences` / `proposed_clues` / `materials` 任一 ⇒ **响亮失败**，
+ *    绝不当作「空产物」静默通过。旧错误形状（`evidence` 单数 / `proposed_clues: {items}`）
+ *    同样在这里被拒 —— 不得退回「0 发布 + CAS explored」。
+ */
+export function assertWorkerResultShape(result: WorkerResultV1): void {
+  for (const key of WORKER_RESULT_REQUIRED_KEYS) {
+    const value = (result as unknown as Record<string, unknown>)[key];
+    if (!Array.isArray(value)) {
+      throw new Error(
+        `A10a: worker.result.v1 missing required array key '${key}'; refusing to treat as an empty product (shape guard).`,
+      );
+    }
+  }
 }
 
 /** 收割所依赖的卡的最小视图（纯映射只需 clueId / depth / sources）。 */
@@ -229,7 +260,8 @@ export async function harvestCard(
 ): Promise<HarvestReport> {
   const result = await hd.readWorkerResult(runId);
   if (!result) {
-    // 该 run 无 worker.result ⇒ 无产物可收割；仍 CAS 到 explored（无产出即无事）。
+    // ⛔ A10a：`no_result` 不得写终态。「该 run 无 worker.result」≠「worker 确实无产出」。
+    //    找不到 worker.result ⇒ 卡留 in_flight、响亮报告、casExplored=false，下一 tick 重放安全。
     return {
       clueId: card.clueId,
       runId,
@@ -238,12 +270,16 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
-      casExplored: true,
+      casExplored: false,
     };
   }
 
-  const evItems = result.evidence ?? [];
-  const clueItems = result.proposed_clues?.items ?? [];
+  // ⛔ A10a 形状守卫：required 键（evidences/proposed_clues/materials）必须齐全且为数组，
+  //    否则响亮失败 —— 缺任一不得当作「空产物」静默通过。
+  assertWorkerResultShape(result);
+
+  const evItems = result.evidences;
+  const clueItems = result.proposed_clues;
   // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，

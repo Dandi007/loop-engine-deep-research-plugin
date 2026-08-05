@@ -256,7 +256,7 @@ export function findWorkerResult(
     if (msg.kind !== "worker.result.v1") continue;
     const payload = (msg.payload ?? {}) as Record<string, unknown>;
     if (payload.run_id !== runId) continue;
-    found = payload as WorkerResultV1;
+    found = payload as unknown as WorkerResultV1;
   }
   return found;
 }

@@ -28,6 +28,18 @@ import type { EvidenceV2, ClueV2 } from "../src/protocol";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
+// ⛔ A10a B1/B2：夹具字段名从 `profiles/roles/schemas/worker-result.v1.json` **读出**，
+//    不得手写。该 schema 是已冻结的 `worker.result.v1` 权威形状（required 三键，全为数组）。
+const workerResultSchema = JSON.parse(
+  readFileSync(
+    join(ROOT, "..", "profiles", "roles", "schemas", "worker-result.v1.json"),
+    "utf8",
+  ),
+) as { required: string[]; properties: Record<string, { type: string }> };
+
+// B1：required 键来自 schema 文件，绝不手写。
+const REQUIRED_KEYS: readonly string[] = workerResultSchema.required;
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -203,15 +215,22 @@ const HARVEST_DECISION: Decision = {
 };
 
 function resultWith(over: Partial<WorkerResultV1> = {}): WorkerResultV1 {
-  return {
-    run_id: "run-1",
-    evidence: [
-      { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
-      { quote: "q2", claim: "c2", source: "wiki", locator: "P", revision: "v" },
-    ],
-    proposed_clues: { items: [{ clue: "new idea 1" }, { clue: "new idea 2" }] },
-    ...over,
-  };
+  // ⛔ B2：夹具顶层键集合 === schema required 集合（精确相等）。夹具只由 schema 的
+  //    required 键构建，绝不带 `evidence`（单数）或 `proposed_clues:{items}` 这类错误形状。
+  const fixture: Record<string, unknown> = {};
+  for (const key of REQUIRED_KEYS) {
+    if (key === "evidences") {
+      fixture[key] = [
+        { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+        { quote: "q2", claim: "c2", source: "wiki", locator: "P", revision: "v" },
+      ];
+    } else if (key === "proposed_clues") {
+      fixture[key] = [{ clue: "new idea 1" }, { clue: "new idea 2" }];
+    } else {
+      fixture[key] = [];
+    }
+  }
+  return { ...fixture, ...(over as Record<string, unknown>) } as unknown as WorkerResultV1;
 }
 
 function harvestDeps(over: Partial<HarvestDeps> = {}): HarvestDeps {
@@ -357,18 +376,17 @@ describe("maxClues cap increments as clues are published (no overshoot)", () => 
     // 覆盖默认 resultWith 的 2 条 proposed_clues，改成 5 条。
     (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       run_id: "run-1",
-      evidence: [
+      evidences: [
         { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
       ],
-      proposed_clues: {
-        items: [
-          { clue: "c0" },
-          { clue: "c1" },
-          { clue: "c2" },
-          { clue: "c3" },
-          { clue: "c4" },
-        ],
-      },
+      proposed_clues: [
+        { clue: "c0" },
+        { clue: "c1" },
+        { clue: "c2" },
+        { clue: "c3" },
+        { clue: "c4" },
+      ],
+      materials: [],
     });
     const deps = writeDeps(hd);
     const result = await runWrite(deps, [HARVEST_DECISION], 10);
@@ -397,10 +415,11 @@ describe("maxClues cap accumulates across multiple harvest cards in one runWrite
     (hd.readWorkerResult as unknown as ReturnType<typeof vi.fn>).mockImplementation(
       async (runId: string) => ({
         run_id: runId,
-        evidence: [
+        evidences: [
           { quote: "q", claim: "c", source: "code", locator: "a", revision: "r" },
         ],
-        proposed_clues: { items: [{ clue: "idea" }] },
+        proposed_clues: [{ clue: "idea" }],
+        materials: [],
       }),
     );
     const deps = writeDeps(hd);
@@ -564,11 +583,12 @@ describe("H1: exited(0) + worker.result.v1 ⇒ one research.evidence.v2 per evid
         kind: "worker.result.v1",
         payload: {
           run_id: "run-1",
-          evidence: [
+          evidences: [
             { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
             { quote: "q2", claim: "c2", source: "wiki", locator: "P", revision: "v" },
           ],
-          proposed_clues: { items: [{ clue: "idea" }] },
+          proposed_clues: [{ clue: "idea" }],
+          materials: [],
         },
         entity_id: "run-1",
         supersedes: null,
@@ -672,10 +692,11 @@ describe("H14 production path: runChannelWrite without evidence channel ⇒ loud
         kind: "worker.result.v1",
         payload: {
           run_id: "run-1",
-          evidence: [
+          evidences: [
             { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
           ],
-          proposed_clues: { items: [{ clue: "idea" }] },
+          proposed_clues: [{ clue: "idea" }],
+          materials: [],
         },
         entity_id: "run-1",
         supersedes: null,
@@ -735,5 +756,142 @@ describe("harvestCard budget boundary", () => {
     expect(report.evidencePublished).toBe(2);
     expect(report.cluesPublished).toBe(2);
     expect(consumed).toBe(4); // 发布消耗 4，CAS 由上层执行（预算 1 已在此账户外）
+  });
+});
+
+// ── A10a §2 硬验收 B1–B8：夹具从 schema 读 + 真实形状 + 守卫 + no_result ──────────────
+
+function unlimitedBudget(): HarvestBudget {
+  return {
+    remaining: () => Number.MAX_SAFE_INTEGER,
+    consume: () => {},
+  };
+}
+
+describe("B1: fixture field names are read from profiles/roles/schemas/worker-result.v1.json (not hand-written)", () => {
+  it("required keys come from the schema file, not a literal array", () => {
+    // ⛔ B1：夹具字段名必须从 schema 读出。若 schema required 变化，夹具必须跟着变。
+    expect(REQUIRED_KEYS).toEqual(["evidences", "proposed_clues", "materials"]);
+    // 夹具构建函数（resultWith）用 REQUIRED_KEYS 驱动，字段名绝不手写。
+    const fixture = resultWith();
+    expect(Object.keys(fixture).sort()).toEqual([...REQUIRED_KEYS].sort());
+  });
+});
+
+describe("B2: fixture top-level key set === schema required set (exact equality)", () => {
+  it("default fixture has exactly the required keys, no evidence/{items} leftovers", () => {
+    const fixture = resultWith();
+    expect(Object.keys(fixture).sort()).toEqual([...REQUIRED_KEYS].sort());
+    expect(fixture as unknown as Record<string, unknown>).not.toHaveProperty("evidence");
+    expect((fixture as unknown as Record<string, unknown>).proposed_clues).toBeInstanceOf(Array);
+  });
+});
+
+describe("B3: real shape (all three arrays) ⇒ publish count === evidences.length", () => {
+  it("3 evidences + budget ⇒ publishEvidence called exactly 3 times", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        resultWith({
+          evidences: [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+            { quote: "q2", claim: "c2", source: "wiki", locator: "P", revision: "v" },
+            { quote: "q3", claim: "c3", source: "docs", locator: "D", revision: "w" },
+          ],
+        }),
+      ),
+    });
+    const report = await harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget());
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(3);
+    expect(report.evidencePublished).toBe(3);
+  });
+});
+
+describe("B4: proposed_clues as a bare array is read correctly (not .items)", () => {
+  it("3 bare proposed_clues ⇒ publishClue called exactly 3 times", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        resultWith({
+          proposed_clues: [{ clue: "a" }, { clue: "b" }, { clue: "c" }],
+        }),
+      ),
+    });
+    const report = await harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget());
+    expect(hd.publishClue).toHaveBeenCalledTimes(3);
+    expect(report.cluesPublished).toBe(3);
+  });
+});
+
+describe("B5: old wrong shape (evidence / {items}) ⇒ loud failure, never silent 0-publish + CAS", () => {
+  it("singular `evidence` key with no `evidences` ⇒ harvestCard rejects", async () => {
+    const hd = harvestDeps({
+      // 旧错误形状：`evidence`（单数），缺 `evidences`/`materials`。
+      readWorkerResult: vi.fn(async () =>
+        ({ run_id: "run-1", evidence: [] } as unknown as WorkerResultV1),
+      ),
+    });
+    await expect(
+      harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget()),
+    ).rejects.toThrow(/evidences|required array key/);
+    // 明亮失败 ⇒ 零发布、零 CAS（shape guard 在任何发布之前就抛）。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(0);
+    expect(hd.publishClue).toHaveBeenCalledTimes(0);
+  });
+
+  it("proposed_clues: { items: [...] } nested shape ⇒ harvestCard rejects", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        ({
+          run_id: "run-1",
+          evidences: [],
+          proposed_clues: { items: [{ clue: "x" }] },
+          materials: [],
+        } as unknown as WorkerResultV1),
+      ),
+    });
+    await expect(
+      harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget()),
+    ).rejects.toThrow(/proposed_clues|required array key/);
+  });
+});
+
+describe("B6: missing materials key ⇒ loud failure (guard checks required complete)", () => {
+  it("result without `materials` ⇒ harvestCard rejects", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        ({ run_id: "run-1", evidences: [], proposed_clues: [] } as unknown as WorkerResultV1),
+      ),
+    });
+    await expect(
+      harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget()),
+    ).rejects.toThrow(/materials/);
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(0);
+    expect(hd.publishClue).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("B7: no_result ⇒ zero publish, casExplored=false, skippedReason=no_result", () => {
+  it("readWorkerResult returns null ⇒ card stays in_flight, loud report", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () => null),
+    });
+    const report = await harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget());
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(0);
+    expect(hd.publishClue).toHaveBeenCalledTimes(0);
+    expect(report.skipped).toBe(true);
+    expect(report.skippedReason).toBe("no_result");
+    expect(report.casExplored).toBe(false); // ⛔ 不得写终态
+  });
+});
+
+describe("B8: result exists + empty evidences array ⇒ allows casExplored=true (differs from B7 by one item)", () => {
+  it("empty evidences array (worker genuinely produced nothing) ⇒ casExplored=true", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () => resultWith({ evidences: [], proposed_clues: [] })),
+    });
+    const report = await harvestCard(hd, { clueId: "card_x", depth: 0, sources: [] }, "run-1", unlimitedBudget());
+    expect(report.skipped).toBe(false);
+    expect(report.casExplored).toBe(true); // 判别性：与 B7 只差「结果是否存在」。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(0);
+    expect(hd.publishClue).toHaveBeenCalledTimes(0);
   });
 });

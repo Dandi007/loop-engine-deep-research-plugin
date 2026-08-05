@@ -212,7 +212,9 @@ describe("F1: ALLOWED_ROOT wired end-to-end through the production assembly", ()
     // 2) fleet 声明 allowed_root input，来源是 ${ALLOWED_ROOT}。
     expect(tpl).toMatch(/allowed_root:\s*\$\{ALLOWED_ROOT\}/);
     // 3) workflow seed payload 把 allowed_root 从 pipeline input namespace 注入。
-    expect(wf).toMatch(/allowed_root:\s*"\{\{allowed_root\}\}"/);
+    //    A9 评审修复：可选占位符 `{{allowed_root?}}` —— ALLOWED_ROOT 缺省为空（null）⇒ 必填
+    //    `{{allowed_root}}` 填充即抛「模板填充缺值」⇒ tick 节点无法起跑；`?` 渲成空串。
+    expect(wf).toMatch(/allowed_root:\s*"\{\{allowed_root\?\}\}"/);
     // 4) tick.md 在非空 allowed_root 时确实把 --allowed-root 传给 --run。
     expect(tickMd).toMatch(/\-\-allowed-root\s+"\$allowed_root"/);
   });

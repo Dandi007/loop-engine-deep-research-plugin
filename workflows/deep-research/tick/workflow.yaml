@@ -9,8 +9,8 @@ seed:
     payload:
       tick_entry: "{{tick_entry}}"
       tick_channel: "{{tick_channel}}"
-      evidence_channel: "{{evidence_channel}}"
-      allowed_root: "{{allowed_root}}"
+      evidence_channel: "{{evidence_channel?}}"
+      allowed_root: "{{allowed_root?}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

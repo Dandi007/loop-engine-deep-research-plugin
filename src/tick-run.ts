@@ -23,6 +23,7 @@ import {
   decideTick,
   hasPendingWork,
   DEFAULT_TICK_CONFIG,
+  type BoardState,
   type CasDecision,
   type Decision,
 } from "./tick";
@@ -811,6 +812,10 @@ export async function runChannelWrite(
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
+  //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
+  //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
+  const postWriteState = applyCasOutcomes(state, result.casResults);
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -819,8 +824,29 @@ export async function runChannelWrite(
     skipped: result.skipped,
     spawns: result.spawns,
     harvestReports: result.harvestReports,
-    hasPendingWork: hasPendingWork(state),
+    hasPendingWork: hasPendingWork(postWriteState),
   };
+}
+
+/**
+ * A9 —— 把一次 tick 的成功 CAS 写结果应用到写前板面，重建**写后**板面。
+ * 仅对 `success` 的 CAS 更新对应卡的 status；失败的 CAS（conflict 等）不改动，
+ * 保持写前状态（该卡未被本 tick 认领）。纯函数：不碰 IO、不修改入参。
+ */
+function applyCasOutcomes(
+  state: BoardState,
+  casResults: WriteResult["casResults"],
+): BoardState {
+  const statusById = new Map<string, ClueV2["status"]>();
+  for (const r of casResults) {
+    if (r.success) statusById.set(r.clueId, r.to);
+  }
+  const cards = state.cards.map((c) =>
+    statusById.has(c.clueId)
+      ? { ...c, status: statusById.get(c.clueId)! }
+      : c,
+  );
+  return { ...state, cards };
 }
 
 /** CLI --run 参数解析结果（channel 无默认值，M11）。 */

@@ -31,12 +31,16 @@ if [ -n "$tick_channel" ]; then
   printf '%s\n' "$run_output"
   # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
   #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
-  if [ -n "$trigger_store_dir" ] && [ -n "$loop_store_cli" ] && [ -n "$loop_engine_runner" ]; then
-    if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
-      next_id="a9-$(date +%s%N)-$$"
-      "$loop_engine_runner" "$loop_store_cli" "$trigger_store_dir" put \
-        "{\"id\":\"${next_id}\",\"status\":\"open\",\"body\":{\"tick\":true}}"
+  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在 hasPendingWork=true 时
+  #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
+  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+    if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
+      echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
+      exit 1
     fi
+    next_id="a9-$(date +%s%N)-$$"
+    "$loop_engine_runner" "$loop_store_cli" "$trigger_store_dir" put \
+      "{\"id\":\"${next_id}\",\"status\":\"open\",\"body\":{\"tick\":true}}"
   fi
 else
   "$tick_entry" --selfcheck

@@ -362,3 +362,24 @@ describe("F10: trigger id is unique across rounds", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+// ── F9/F10 判别性：生产装配形状（裸可执行路径，无内嵌 `bash ` 前缀）────────────────
+// 评审 finding：makeFakeTick 用裸路径而装配系统曾携带 `bash "…tick-entry.sh"` ⇒ 测试全绿而
+// 真实调用形状是坏的。这里断言生产 TICK_ENTRY 是裸可执行路径，且 tick.md 以单个引号词直接执行它。
+
+describe("F9/F10: production TICK_ENTRY is a bare executable path (no embedded `bash ` prefix)", () => {
+  it("bin/deep-research-loop.sh exports TICK_ENTRY without a `bash ` prefix", () => {
+    const src = readFileSync(SCRIPT, "utf8");
+    const line = src.split("\n").find((l) => /^export\s+TICK_ENTRY=/.test(l));
+    expect(line).toBeTruthy();
+    expect(line).not.toMatch(/bash\s+"/);
+    expect(line).toMatch(/tick-entry\.sh/);
+  });
+
+  it("tick.md invokes $tick_entry as a single quoted command word (bare path works)", () => {
+    const tpl = readFileSync(TICK_MD, "utf8");
+    expect(tpl).toMatch(/\$\{?tick_entry\}?/);
+    expect(tpl).toMatch(/"\$tick_entry" --run/);
+    expect(tpl).not.toMatch(/eval\s+\$tick_entry/);
+  });
+});

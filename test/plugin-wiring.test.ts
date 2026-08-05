@@ -250,7 +250,9 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     // 2) fleet 声明 evidence_channel input，来源是 ${EVIDENCE_CHANNEL} 环境变量。
     expect(tplText).toMatch(/evidence_channel:\s*\$\{EVIDENCE_CHANNEL\}/);
     // 3) workflow seed payload 把 evidence_channel 从 pipeline input namespace 注入。
-    expect(workflowText).toMatch(/evidence_channel:\s*"\{\{evidence_channel\}\}"/);
+    //    A9 评审修复：可选占位符 `{{evidence_channel?}}` —— EVIDENCE_CHANNEL 缺省为空（null）
+    //    ⇒ 必填 `{{evidence_channel}}` 填充即抛「模板填充缺值」⇒ tick 节点无法起跑；`?` 渲成空串。
+    expect(workflowText).toMatch(/evidence_channel:\s*"\{\{evidence_channel\?\}\}"/);
     // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run。
     expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"\s+\-\-evidence-channel\s+"\$evidence_channel"/);
     // 5) 渲染产物：pipeline input 里 evidence_channel 有非空值（真实 wiring 成立）。

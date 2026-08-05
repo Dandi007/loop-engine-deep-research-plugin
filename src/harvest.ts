@@ -37,11 +37,23 @@ export interface WorkerProposedClue {
   reason?: string;
 }
 
-/** worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。 */
+/**
+ * worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。
+ * ⛔ A10 —— 权威形状（注册在案的 schema worker-result.v1，required 为
+ * `['evidences','proposed_clues','materials']`，三者均为数组）：
+ *   `evidences` 复数数组、`proposed_clues` 直接是数组（**不是** `{items}`）、`materials` 数组。
+ * 旧形状（单数 `evidence` / `proposed_clues: {items}`）在此永久废弃，见 §0.1 根因。
+ */
 export interface WorkerResultV1 {
   run_id?: string;
-  evidence?: WorkerEvidenceItem[];
-  proposed_clues?: { items?: WorkerProposedClue[] };
+  /** ⛔ 复数数组（spec §0.1：真实 payload 是 `evidences: list(6)`）。 */
+  evidences?: WorkerEvidenceItem[];
+  /** ⛔ 直接是数组（spec §0.1：真实 payload 是 `proposed_clues: list(2)`，不是 `{items}`）。 */
+  proposed_clues?: WorkerProposedClue[];
+  /** ⛔ 数组（spec §0.1：真实 payload 是 `materials: list(0)`）。 */
+  materials?: unknown[];
+  /** 旧错误形状的 `evidence` 单数字段——保留以让形状校验能识别并响亮拒绝（C2）。 */
+  evidence?: unknown;
 }
 
 /** 收割所依赖的卡的最小视图（纯映射只需 clueId / depth / sources）。 */
@@ -64,6 +76,56 @@ export class MissingEvidenceChannelError extends Error {
 /** 超过 maxDepth 的新 clue 落 blocked 的明确 rationale（§1.6 / H11：不得静默丢弃）。 */
 export const OVER_MAX_DEPTH_RATIONALE =
   "clue depth exceeds maxDepth; blocked instead of silently dropped (spec §3.1)";
+
+/**
+ * A10 —— worker.result.v1 形状非法（旧形状 `evidence` / `{items}`，或字段非数组）。
+ * ⛔ C2：旧错误形状不得被当成有效产物静默通过（绝不允许「0 发布 + CAS explored」），
+ *    必须响亮失败，让卡留在 in_flight、零 CAS，由下一 tick 重试/人工介入。
+ */
+export class WorkerResultShapeError extends Error {
+  constructor(detail: string) {
+    super(
+      `A10: worker.result.v1 has an invalid shape — ${detail}. ` +
+        "Registered worker-result.v1 requires 'evidences'/'proposed_clues'/'materials' as arrays (not legacy singular 'evidence' / '{items}'). Refusing to treat it as a valid product.",
+    );
+    this.name = "WorkerResultShapeError";
+  }
+}
+
+/**
+ * A10 —— 校验 worker.result.v1 的形状（spec §1 / §0.1）。
+ * ⛔ 权威形状：`evidences` / `proposed_clues` / `materials` 均为数组。
+ *   - 旧单数 `evidence` 出现 ⇒ 响亮失败（C2）。
+ *   - `evidences` / `proposed_clues` 存在但非数组 ⇒ 响亮失败（C2，含 `{items}` 包裹）。
+ *   - 结果为 null（调用于 no_result 分支之前）不在此校验。
+ */
+export function assertWorkerResultShape(result: WorkerResultV1): void {
+  if (result.evidence !== undefined) {
+    throw new WorkerResultShapeError(
+      "legacy singular 'evidence' field present (expected the plural array 'evidences')",
+    );
+  }
+  if (result.evidences !== undefined && !Array.isArray(result.evidences)) {
+    throw new WorkerResultShapeError(
+      "'evidences' must be an array (got " + typeof result.evidences + ")",
+    );
+  }
+  if (
+    result.proposed_clues !== undefined &&
+    !Array.isArray(result.proposed_clues)
+  ) {
+    throw new WorkerResultShapeError(
+      "'proposed_clues' must be a plain array, not wrapped as {items} (got " +
+        typeof result.proposed_clues +
+        ")",
+    );
+  }
+  if (result.materials !== undefined && !Array.isArray(result.materials)) {
+    throw new WorkerResultShapeError(
+      "'materials' must be an array (got " + typeof result.materials + ")",
+    );
+  }
+}
 
 /**
  * 组合 evidence 的 anchor（spec §5.2 / §1.3）：
@@ -229,7 +291,10 @@ export async function harvestCard(
 ): Promise<HarvestReport> {
   const result = await hd.readWorkerResult(runId);
   if (!result) {
-    // 该 run 无 worker.result ⇒ 无产物可收割；仍 CAS 到 explored（无产出即无事）。
+    // ⛔ A10 —— 找不到 worker.result ⇒ 无产物可收割。不得写终态：留在 in_flight，
+    //    下一 tick 重试并响亮报告（C3）。⛔ 绝不 CAS 到 explored。
+    //    「worker 确实无产出」只能由**明确证据**确立——结果存在且 `evidences` 为空数组
+    //    （见下方正常分支，C4）。
     return {
       clueId: card.clueId,
       runId,
@@ -238,12 +303,16 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
-      casExplored: true,
+      casExplored: false,
     };
   }
 
-  const evItems = result.evidence ?? [];
-  const clueItems = result.proposed_clues?.items ?? [];
+  // ⛔ A10 —— 形状校验（C2）：旧形状 / 字段非数组 ⇒ 响亮失败，零 publish 零 CAS，
+  //    卡留 in_flight。绝不静默取到 undefined ⇒ 0 发布 + CAS explored。
+  assertWorkerResultShape(result);
+
+  const evItems = result.evidences ?? [];
+  const clueItems = result.proposed_clues ?? [];
   // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，

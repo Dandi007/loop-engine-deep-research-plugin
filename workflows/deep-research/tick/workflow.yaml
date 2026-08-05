@@ -1,4 +1,11 @@
-limits: { max_nodes: 1, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# A10b（§1.1）—— max_nodes 必须留出 1 个余量（2），否则引擎在跑完唯一的 seed 节点后
+# 立即以 reason:"max_nodes" 收场（done.size >= lim.max_nodes 的顶部守卫先于 drain 判定触发），
+# fleet 的 claim.complete 把 reason ∉ {halt,drained} 判为异常 ⇒ 把已认领的触发路由回
+# failure_status:"open" ⇒ seed 永不走到终态 ⇒ claimableCount 恒 > 0 ⇒ drain 永不判「已排空」，
+# 只能撞 max_passes 退出（spec §0.1 实测 max_rounds/16）。max_nodes:2 让引擎在 seed 节点
+# 完成后再走 drain 判定：板面无 pending ⇒ finish("drained") ⇒ complete 路由到 success_status:"done"。
+# 每 tick 仍只跑 1 个 seed 节点（多余余量不产生第二个节点），收敛依旧由板面状态确定性推出（spec §1.1）。
+limits: { max_nodes: 2, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

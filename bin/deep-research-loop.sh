@@ -16,7 +16,12 @@ DRY_RUN=""
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 
 MODE="deep-research"
-RUN_ID="${DD_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+# A10b（§1.2）—— RUN_ID 缺省值必须**每次渲染唯一**，不得只到秒。
+# 旧值 `$(date +%Y%m%d-%H%M%S)` 只有秒级粒度：本仓有 5 个测试文件会在 vitest 并行下渲染本脚本，
+# 同一秒内渲染的两个文件共用同一个 RUN_ROOT ⇒ 互相覆盖/读到对方写了一半的 fleet.yaml ⇒ 断言读出 null
+# （spec §0.2 实测 20% 假红）。改用纳秒时间戳 + PID（与 tick.md 已用的 `a9-$(date +%s%N)-$$` 同源范式），
+# 保证每次渲染的 RUN_ROOT 唯一；DD_RUN_ID / DD_RUN_ROOT 的显式覆盖语义保持不变（spec §1.2 / B7）。
+RUN_ID="${DD_RUN_ID:-$(date +%s%N)-$$}"
 RUN_ROOT="${DD_RUN_ROOT:-$PLUGIN_ROOT/.runtime/$MODE/$RUN_ID}"
 RUNTIME_FLEET="$RUN_ROOT/fleet.yaml"
 

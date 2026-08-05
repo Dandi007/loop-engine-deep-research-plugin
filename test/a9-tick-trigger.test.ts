@@ -436,10 +436,11 @@ describe("F9 production path: harvest terminalizes last card + publishes clues â
         kind: "worker.result.v1",
         payload: {
           run_id: "run-1",
-          evidence: [
+          evidences: [
             { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
           ],
-          proposed_clues: { items: [{ clue: "new idea" }] },
+          proposed_clues: [{ clue: "new idea" }],
+          materials: [],
         },
         entity_id: "run-1",
         supersedes: null,

@@ -40,8 +40,28 @@ export interface WorkerProposedClue {
 /** worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。 */
 export interface WorkerResultV1 {
   run_id?: string;
-  evidence?: WorkerEvidenceItem[];
-  proposed_clues?: { items?: WorkerProposedClue[] };
+  /** 真实形状：三者均为数组（worker-result.v1.json：`required` = evidences/proposed_clues/materials）。 */
+  evidences?: WorkerEvidenceItem[];
+  proposed_clues?: WorkerProposedClue[];
+  materials?: Array<{ uri?: string; digest?: string }>;
+}
+
+/** worker.result.v1 的 required 顶层键（读自 profiles/roles/schemas/worker-result.v1.json）。 */
+export const RESULT_REQUIRED_KEYS = ["evidences", "proposed_clues", "materials"] as const;
+
+/**
+ * ⛔ A10a 形状守卫：`worker.result.v1` 的 required 键（evidences/proposed_clues/materials）
+ * 必须**齐全**。缺任一 ⇒ 响亮失败，⛔ 不得当作「空产物」静默通过（spec §1.3 / B6）。
+ * 旧错误形状（`evidence` 单数 / `proposed_clues.items`）因缺 `evidences` / 形状不符而触发。
+ */
+export function assertResultShape(result: WorkerResultV1): void {
+  for (const key of RESULT_REQUIRED_KEYS) {
+    if (result[key] === undefined) {
+      throw new Error(
+        `A10a: worker.result.v1 missing required key "${key}"; refusing to treat as empty output (loud failure).`,
+      );
+    }
+  }
 }
 
 /** 收割所依赖的卡的最小视图（纯映射只需 clueId / depth / sources）。 */
@@ -229,7 +249,9 @@ export async function harvestCard(
 ): Promise<HarvestReport> {
   const result = await hd.readWorkerResult(runId);
   if (!result) {
-    // 该 run 无 worker.result ⇒ 无产物可收割；仍 CAS 到 explored（无产出即无事）。
+    // ⛔ A10a：找不到 worker.result ⇒ 留 in_flight（不写终态），响亮报告，零 publish。
+    //    「worker 确实无产出」只能由明确证据确立（结果存在且 evidences 为空数组），
+    //    因此这里不 CAS 到 explored（spec §1.2 / B7）。
     return {
       clueId: card.clueId,
       runId,
@@ -238,12 +260,15 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
-      casExplored: true,
+      casExplored: false,
     };
   }
 
-  const evItems = result.evidence ?? [];
-  const clueItems = result.proposed_clues?.items ?? [];
+  // ⛔ A10a 形状守卫：required 键齐全才允许继续；缺任一 ⇒ 响亮失败（spec §1.3 / B6）。
+  assertResultShape(result);
+
+  const evItems = result.evidences ?? [];
+  const clueItems = result.proposed_clues ?? [];
   // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，

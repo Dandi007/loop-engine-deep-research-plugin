@@ -14,7 +14,7 @@
  * ⛔ CAS 一律走 A8b 的 `realCas`，不得绕过另写 CAS（spec §4.1 纪律 8）。
  */
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -50,6 +50,43 @@ export const FROZEN_CHANNEL_PATTERNS = [
 
 export function isFrozenChannel(channelId: string): boolean {
   return FROZEN_CHANNEL_PATTERNS.some((re) => re.test(channelId));
+}
+
+/** A8f——`code-local` role：唯一需要 `allowed_root` 的 worker（spec §1.2）。 */
+export const CODE_LOCAL_ROLE = "dr-worker-code-local";
+
+/**
+ * A8f——一个 dispatch 决策映射到 `dr-worker-code-local` 而 `allowed_root` 未配置 ⇒
+ * 当场响亮失败（spec §1.2），⛔ 绝不照常 spawn（那会产出零证据且看起来正常）。
+ * 错误文本点名 `allowed-root`。
+ */
+export class MissingAllowedRootError extends Error {
+  constructor(role: string) {
+    super(
+      `A8f: dispatch mapped to "${role}" requires --allowed-root (the code-local worker reads sources from the repo root). Refusing to spawn a zero-evidence worker.`,
+    );
+    this.name = "MissingAllowedRootError";
+  }
+}
+
+/**
+ * A8f——在 `allowed_root` 下执行 `git rev-parse HEAD`，取引擎权威的 `revision`（spec §1.3）。
+ * ⛔ 失败（非 git 目录等）⇒ 返回 `undefined`（**省略**该可选字段），⛔ **绝不返回空串**
+ *   （空串会通过下游「非空」检查，与 A8e 的 `"://@"` 退化 anchor 同族）；
+ *   ⛔ 也绝不因 git 失败而阻断派发（`revision` 是可选字段，persona 有 Read 回退路径）。
+ * ⛔ 用 `execFileSync` 读退出码（非零即抛），命令后不接管道（spec §6）。
+ */
+export function resolveRevision(allowedRoot: string): string | undefined {
+  try {
+    const out = execFileSync(
+      "git",
+      ["-C", allowedRoot, "rev-parse", "HEAD"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return out.length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** 写入上限已到——响亮报错，非静默截断（M10）。 */
@@ -160,13 +197,15 @@ export interface WorkerInputPayload {
   clue_id: string;
   clue_text: string;
   allowed_root?: string;
+  /** A8f——引擎权威 `git rev-parse HEAD`（spec §1.3）；失败时**省略**、绝不填空串。 */
+  revision?: string;
   depth: number;
   sources: string[];
 }
 
 /**
  * A8d——按 R1c 形状构造 worker 输入载荷（spec §1.2）。
- * 只产出 `clue_id` / `clue_text` / `depth` / `sources`（及可选 `allowed_root`），
+ * 只产出 `clue_id` / `clue_text` / `depth` / `sources`（及可选 `allowed_root` / `revision`），
  * 绝不注入任何调度元数据。
  */
 export function buildWorkerInput(
@@ -175,6 +214,7 @@ export function buildWorkerInput(
   depth: number,
   sources: string[],
   allowedRoot?: string,
+  revision?: string,
 ): WorkerInputPayload {
   const input: WorkerInputPayload = {
     clue_id: clueId,
@@ -183,6 +223,7 @@ export function buildWorkerInput(
     sources: [...sources],
   };
   if (allowedRoot) input.allowed_root = allowedRoot;
+  if (revision) input.revision = revision;
   return input;
 }
 
@@ -368,7 +409,12 @@ export async function runWrite(
             // ⛔ spec §1.4 / P8：`agent-run` 解析不到 ⇒ **响亮失败**（非零退出 + 点名 agent-run），
             //    绝不静默 CAS 回 open（评审 finding：静默回退会让调度器看到 spawned:false、exit 0，
             //    而实际什么都没跑，形成 §0.1 的震荡危害）。仅对**其他** spawn 失败做 S2 补偿。
-            if (err instanceof AgentRunUnresolvedError) {
+            //    A8f：`code-local` 无 `allowed_root` 同样属配置错误 ⇒ 响亮失败（点名 allowed-root），
+            //    不 CAS 回 open、不静默产出零证据（spec §1.2 / F5）。
+            if (
+              err instanceof AgentRunUnresolvedError ||
+              err instanceof MissingAllowedRootError
+            ) {
               throw err;
             }
             // ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿规则，真实路径兑现 N5）。
@@ -449,6 +495,8 @@ export interface RunWriteOptions {
   spawnWorker?: WriteDeps["spawnWorker"];
   /** `agent-run` 可执行路径（argv[0]）；缺省 `resolveAgentRunBin()`（`AGENT_RUN_BIN`/PATH）。 */
   workerCmd?: string;
+  /** A8f——worker 可读的 repo 根（`code-local` 必需；经 `--add-dir` 授予目录读）。 */
+  allowedRoot?: string;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -608,7 +656,8 @@ export function defaultWorkerCmd(): string {
 
 /**
  * A8d——构造真实 `agent-run` 的完整 argv（spec §1.1）：
- * `agent-run --role <role> --run-id <runId> --input <payloadPath> -- "<clue_text>"`
+ * `agent-run --role <role> --run-id <runId> [--add-dir <allowed_root>] --input <payloadPath> -- "<clue_text>"`
+ * A8f——`--add-dir <allowed_root>` 仅当有值时追加（spec §1.3 / F2 / F10）。
  * 返回的数组 [0] 即 argv[0]（agent-run 可执行路径），供 P1–P7 逐项断言。
  */
 export function buildAgentRunArgv(opts: {
@@ -617,18 +666,20 @@ export function buildAgentRunArgv(opts: {
   runId: string;
   inputPath: string;
   clueText: string;
+  allowedRoot?: string;
 }): string[] {
-  return [
+  const args = [
     opts.agentRunBin,
     "--role",
     opts.role,
     "--run-id",
     opts.runId,
-    "--input",
-    opts.inputPath,
-    "--",
-    opts.clueText,
   ];
+  if (opts.allowedRoot) {
+    args.push("--add-dir", opts.allowedRoot);
+  }
+  args.push("--input", opts.inputPath, "--", opts.clueText);
+  return args;
 }
 
 /**
@@ -653,6 +704,7 @@ export async function spawnAgentRunWorker(opts: {
   role: string;
   runId: string;
   input: WorkerInputPayload;
+  allowedRoot?: string;
 }): Promise<SpawnedWorker> {
   const payloadPath = writeWorkerInputFile(opts.input);
   const argv = buildAgentRunArgv({
@@ -661,6 +713,7 @@ export async function spawnAgentRunWorker(opts: {
     runId: opts.runId,
     inputPath: payloadPath,
     clueText: opts.input.clue_text,
+    allowedRoot: opts.allowedRoot,
   });
   // ⛔ 载荷文件的寿命绑定到**子进程退出**（onExit），而不是就绪计时器。
   //    `spawnWorkerProcess` 在 SPAWN_READY_GRACE_MS 后就 unref 并 resolve，真实 `agent-run`
@@ -707,13 +760,29 @@ export async function runChannelWrite(
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
       opts.spawnWorker ??
-      ((clueId, role, runId, input) =>
-        spawnAgentRunWorker({
+      ((clueId, role, runId, input) => {
+        // A8f——`code-local` 无 `allowed_root` ⇒ 当场响亮失败（spec §1.2 / F5），零 spawn。
+        const allowedRoot = opts.allowedRoot;
+        if (role === CODE_LOCAL_ROLE && !allowedRoot) {
+          throw new MissingAllowedRootError(role);
+        }
+        // A8f——生产调用点真实传入 allowedRoot，并取引擎权威 revision（spec §1.3 / F3/F4）。
+        const augmented = buildWorkerInput(
+          input.clue_id,
+          input.clue_text,
+          input.depth,
+          input.sources,
+          allowedRoot,
+          allowedRoot ? resolveRevision(allowedRoot) : undefined,
+        );
+        return spawnAgentRunWorker({
           agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
           role,
           runId,
-          input,
-        }).then(() => undefined)),
+          input: augmented,
+          allowedRoot,
+        }).then(() => undefined);
+      }),
     // A8e——收割写依赖：证据 channel 显式传入（无默认值）；readWorkerResult 读 board:agent-runs。
     harvest: {
       evidenceChannelId: opts.evidenceChannelId ?? "",
@@ -753,11 +822,13 @@ export interface RunCliOptions {
   maxWrites: number;
   /** A8e——证据 channel（--evidence-channel）；可选，缺失时仅当有 harvest 决策才报错（§1.4 / H14）。 */
   evidenceChannelId?: string;
+  /** A8f——worker 可读 repo 根（--allowed-root）；`code-local` 必需（§1.2 / F5）。 */
+  allowedRoot?: string;
 }
 
 /**
  * 解析 `--run` 之后的参数：
- * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>]`。
+ * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>]`。
  * ⛔ 不传 channel → 抛 MissingChannelError（exit ≠ 0，M11）。
  * ⛔ 冻结 channel → 抛 FrozenChannelError（M12）。
  */
@@ -768,6 +839,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   }
   let maxWrites = DEFAULT_MAX_WRITES;
   let evidenceChannelId: string | undefined;
+  let allowedRoot: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -784,10 +856,18 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
         );
       }
       i += 1;
+    } else if (args[i] === "--allowed-root") {
+      allowedRoot = args[i + 1];
+      if (!allowedRoot) {
+        throw new Error(
+          "A8f: invalid --allowed-root (must specify a repo root path).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
     throw new FrozenChannelError(channelId);
   }
-  return { channelId, maxWrites, evidenceChannelId };
+  return { channelId, maxWrites, evidenceChannelId, allowedRoot };
 }

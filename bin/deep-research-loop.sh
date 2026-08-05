@@ -35,6 +35,11 @@ export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
 #    **已核实存在**的证据 channel。未配置时留空，`--run` 一旦遇到 harvest 决策会响亮失败
 #    （§1.4 / H13/H14），绝不静默写进由字符串推导的错 channel。
 export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"
+# A8f——worker 可读的 repo 根：从 pipeline input namespace 注入 tick.md 供 `--run --allowed-root` 使用；
+# 可用 ALLOWED_ROOT 覆盖。⛔ **无派生默认值**（同 §1.4 判据：猜根目录与猜 channel 同样危险）——
+# 未配置时留空，`--run` 一旦遇到 code-local dispatch 会响亮失败（§1.2 / F5），绝不静默零证据。
+# 其余 role（wiki / feishu / code-remote）不需要它，不会因缺失被阻断。
+export ALLOWED_ROOT="${ALLOWED_ROOT:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

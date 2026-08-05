@@ -889,7 +889,11 @@ async function runDefaultSpawnWithText(clueText: string): Promise<{
     }),
   );
   try {
-    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+    // A8f——code-local 的默认生产 spawn 要求 allowed_root（spec §1.2 / F5）；给一个临时目录。
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      allowedRoot: dirname(stub),
+    });
     readUntilMarker(marker);
     return { outcome, blocks: readAgentRunBlocks(marker) };
   } finally {
@@ -1178,8 +1182,9 @@ describe("P9: unresolvable agent-run never falls back to placeholder, no spawned
       // 安全性 + 响亮失败（spec §1.4 / P8 / 评审 finding）：`agent-run` 解析不到 ⇒
       // 生产缺省路径（runChannelWrite 未注入 spawnWorker）必须**响亮抛错**（非零退出 +
       // 点名 agent-run），而不是静默 CAS 回 open、打印 spawned:false 后 exit 0。
+      // A8f——给 code-local 提供 allowed_root，使错误来源纯化到 agent-run 解析（而非缺 allowed_root）。
       await expect(
-        runChannelWrite({ channelId: WIRE_CLUE_CHANNEL }),
+        runChannelWrite({ channelId: WIRE_CLUE_CHANNEL, allowedRoot: dirname(stub) }),
       ).rejects.toBeInstanceOf(AgentRunUnresolvedError);
       // 未启动任何进程（marker 未创建），也绝不产生 spawned:true。
       expect(existsSync(marker)).toBe(false);
@@ -1274,7 +1279,10 @@ describe("P11: spawnWorker widened — clue text really reaches the prompt (disc
     );
 
     try {
-      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+      const outcome = await runChannelWrite({
+        channelId: WIRE_CLUE_CHANNEL,
+        allowedRoot: dirname(stub),
+      });
       expect(outcome.spawns).toHaveLength(2);
       expect(outcome.spawns.every((s) => s.spawned === true)).toBe(true);
       readUntilMarker(marker);

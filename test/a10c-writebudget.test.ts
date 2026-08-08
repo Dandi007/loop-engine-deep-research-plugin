@@ -29,6 +29,27 @@ const WORKFLOW = join(ROOT, "..", "workflows", "deep-research", "tick", "workflo
 const TICK_MD = join(ROOT, "..", "workflows", "deep-research", "tick", "templates", "tick.md");
 const DEFAULT_MAX_WRITES = 64;
 
+// G1 —— 一张真实卡的写入需求 = evidences + proposed_clues + 1(CAS open→explored)。
+// 三次真实 worker 产出实测：6 / 9 / 10 条 evidence（wf-dc0c15 findings）。
+// 取观测上界 10 evidence + 2 clue + 1 CAS = 13。
+const MIN_VIABLE_BUDGET = 13;
+
+// G1 —— 从**删除了 MAX_WRITES** 的子环境跑 bin --dry-run，取生产实际会吃到的缺省预算。
+// ⛔ 生产链路不设 MAX_WRITES（bin/deep-research-loop.sh 是入口，无上游导出该变量），
+//    生产吃到的恰是这里渲染出的缺省值。不得写字面量 64。
+function renderedDefaultMaxWrites(): number {
+  const childEnv = { ...process.env };
+  delete childEnv.MAX_WRITES;
+  const out = execFileSync("bash", [BIN, "--dry-run"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: childEnv,
+  });
+  const doc = parse(out);
+  const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
+  return input?.max_writes;
+}
+
 // ── D3：四层逐层断言：--max-writes 一路从 bin 传到 tick-entry --run ──
 
 describe("A10c D3: --max-writes plumbed from bin → fleet → workflow → tick.md", () => {
@@ -166,5 +187,87 @@ describe("A10c P2-guard: default budget must be able to harvest a real card", ()
     expect(result.harvestReports[0].skipped).toBe(false);
     expect(result.harvestReports[0].evidencePublished).toBe(6);
     expect(result.harvestReports[0].casExplored).toBe(true);
+  });
+});
+
+// ── G1 D1/D2：把「缺省预算可用」从文本断言升级为行为断言 ─────────────
+
+describe("G1 D1: default budget is a finite positive integer >= MIN_VIABLE_BUDGET", () => {
+  it("bin --dry-run from a child env with MAX_WRITES removed renders a default max_writes >= MIN_VIABLE_BUDGET", () => {
+    const childEnv = { ...process.env };
+    delete childEnv.MAX_WRITES;
+    // ⛔ 自证子环境真的没有 MAX_WRITES，否则本用例会重蹈它要修的那个错（声称删了、实际没删 ⇒ 恒绿）。
+    expect(childEnv).not.toHaveProperty("MAX_WRITES");
+
+    const out = execFileSync("bash", [BIN, "--dry-run"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: childEnv,
+    });
+    const doc = parse(out);
+    const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
+    const maxWrites = input?.max_writes;
+    // 是有限正整数（不是 Infinity、不是 0、不是字符串）。
+    expect(typeof maxWrites).toBe("number");
+    expect(Number.isInteger(maxWrites)).toBe(true);
+    expect(maxWrites).toBeGreaterThan(0);
+    expect(Number.isFinite(maxWrites)).toBe(true);
+    // 缺省必须足以收割一张真实卡。
+    expect(maxWrites).toBeGreaterThanOrEqual(MIN_VIABLE_BUDGET);
+  });
+});
+
+describe("G1 D2: default budget harvests a real card end-to-end", () => {
+  const harvestDecision = (runId: string): Decision => ({
+    kind: "harvest",
+    clueId: "card_harvest",
+    runId,
+    text: "investigate X",
+    depth: 0,
+    sources: ["code-local"],
+  });
+
+  // 10 evidence + 2 proposed_clue = needed 13（观测上界，见 MIN_VIABLE_BUDGET 依据）。
+  function tenEvidenceTwoClueDeps(): { deps: WriteDeps } {
+    const hd = {
+      evidenceChannelId: "research:v1-tick-reclaim.evidence",
+      boardChannelId: "research:v1-tick-reclaim.index",
+      maxClues: 64,
+      maxDepth: 3,
+      boardClueCount: { value: 0 },
+      readWorkerResult: async () => ({
+        run_id: "run-10ev2clue",
+        evidences: Array.from({ length: 10 }, (_, i) => ({
+          quote: `q${i}`,
+          claim: `c${i}`,
+          source: "code",
+          locator: "a",
+          revision: "r",
+        })),
+        proposed_clues: Array.from({ length: 2 }, (_, i) => ({ clue: `clue ${i}` })),
+        materials: [{ uri: "m1" }],
+      }),
+      publishEvidence: async () => {},
+      publishClue: async () => {},
+    };
+    return {
+      deps: {
+        cas: async () => ({ success: true }),
+        spawnWorker: async () => {},
+        harvest: hd,
+      },
+    };
+  }
+
+  it("default budget (from D1 path, not a literal) harvests 10 evidence + 2 clues", async () => {
+    const { deps } = tenEvidenceTwoClueDeps();
+    // ⛔ 预算取 D1 那条路径实际渲染出的值（不得写字面量 64）。
+    const budget = renderedDefaultMaxWrites();
+    const result = await runWrite(deps, [harvestDecision("run-10ev2clue")], budget);
+    const report = result.harvestReports[0];
+    expect(report.skipped).toBe(false);
+    expect(report.evidencePublished).toBe(10);
+    expect(report.cluesPublished).toBe(2);
+    expect(report.casExplored).toBe(true);
   });
 });

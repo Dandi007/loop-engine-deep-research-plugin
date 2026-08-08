@@ -29,6 +29,11 @@ const WORKFLOW = join(ROOT, "..", "workflows", "deep-research", "tick", "workflo
 const TICK_MD = join(ROOT, "..", "workflows", "deep-research", "tick", "templates", "tick.md");
 const DEFAULT_MAX_WRITES = 64;
 
+// 一张真实卡的写入需求 = evidences + proposed_clues + 1(CAS open→explored)。
+// 三次真实 worker 产出实测：6 / 9 / 10 条 evidence（wf-dc0c15 findings）。
+// 取观测上界 10 evidence + 2 clue + 1 CAS = 13。
+const MIN_VIABLE_BUDGET = 13;
+
 // ── D3：四层逐层断言：--max-writes 一路从 bin 传到 tick-entry --run ──
 
 describe("A10c D3: --max-writes plumbed from bin → fleet → workflow → tick.md", () => {
@@ -165,6 +170,88 @@ describe("A10c P2-guard: default budget must be able to harvest a real card", ()
     const result = await runWrite(deps, [harvestDecision("run-243d00ce")], DEFAULT_MAX_WRITES);
     expect(result.harvestReports[0].skipped).toBe(false);
     expect(result.harvestReports[0].evidencePublished).toBe(6);
+    expect(result.harvestReports[0].casExplored).toBe(true);
+  });
+});
+
+// ── D1：缺省值的行为断言（本包存在理由）──────────────────────────────
+// ⛔ 从「删除了 MAX_WRITES 的子环境」跑 --dry-run，断言渲染出的缺省预算：
+//    · 有限正整数（不是 Infinity、不是 0、不是字符串）
+//    · >= MIN_VIABLE_BUDGET
+// ⛔ 用例必须自证子环境里真的没有 MAX_WRITES（否则又会重蹈「声称删了、实际没删」的恒绿用例）。
+
+// 从删除了 MAX_WRITES 的子环境跑一次 --dry-run，返回渲染出的 tick input.max_writes。
+function defaultMaxWritesFromDryRun(): number {
+  const childEnv = { ...process.env };
+  delete childEnv.MAX_WRITES;
+  expect(childEnv).not.toHaveProperty("MAX_WRITES");
+  const out = execFileSync("bash", [BIN, "--dry-run"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    env: childEnv,
+  });
+  const doc = parse(out);
+  const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
+  return input?.max_writes;
+}
+
+describe("A10c D1: default budget is a finite positive integer >= MIN_VIABLE_BUDGET", () => {
+  it("dry-run from a child env without MAX_WRITES renders a viable finite default", () => {
+    const maxWrites = defaultMaxWritesFromDryRun();
+    expect(typeof maxWrites).toBe("number");
+    expect(Number.isFinite(maxWrites)).toBe(true);
+    expect(maxWrites).toBeGreaterThan(0);
+    expect(maxWrites).toBeGreaterThanOrEqual(MIN_VIABLE_BUDGET);
+  });
+});
+
+// ── D2：缺省值必须与收割行为接上 ───────────────────────────────────
+// ⛔ 预算取 D1 那条路径实际渲染出的 max_writes（不得写字面量 64）。
+// 卡的 worker 产出 10 evidence + 2 proposed_clue（needed = 13）：
+//   skipped === false、evidencePublished === 10、cluesPublished === 2、casExplored === true。
+// 缺省若被调小到 13 以下，D1 与 D2 会各自独立地挂（一条查值域、一条查行为）。
+
+describe("A10c D2: default budget connects to harvest behavior", () => {
+  it("harvests a 10-evidence + 2-clue card (needed 13) using the D1 default budget", async () => {
+    const maxWrites = defaultMaxWritesFromDryRun();
+    const hd = {
+      evidenceChannelId: "research:v1-tick-reclaim.evidence",
+      boardChannelId: "research:v1-tick-reclaim.index",
+      maxClues: 64,
+      maxDepth: 3,
+      boardClueCount: { value: 0 },
+      readWorkerResult: async () => ({
+        run_id: "run-d2-default",
+        evidences: Array.from({ length: 10 }, (_, i) => ({
+          quote: `q${i}`,
+          claim: `c${i}`,
+          source: "code",
+          locator: "a",
+          revision: "r",
+        })),
+        proposed_clues: [{ clue: "nc1" }, { clue: "nc2" }],
+        materials: [{ uri: "m1" }],
+      }),
+      publishEvidence: async () => {},
+      publishClue: async () => {},
+    };
+    const deps: WriteDeps = {
+      cas: async () => ({ success: true }),
+      spawnWorker: async () => {},
+      harvest: hd,
+    };
+    const decision: Decision = {
+      kind: "harvest",
+      clueId: "card_harvest",
+      runId: "run-d2-default",
+      text: "investigate X",
+      depth: 0,
+      sources: ["code-local"],
+    };
+    const result = await runWrite(deps, [decision], maxWrites);
+    expect(result.harvestReports[0].skipped).toBe(false);
+    expect(result.harvestReports[0].evidencePublished).toBe(10);
+    expect(result.harvestReports[0].cluesPublished).toBe(2);
     expect(result.harvestReports[0].casExplored).toBe(true);
   });
 });

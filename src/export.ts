@@ -45,13 +45,15 @@ function slugify(topic: string): string {
 
 /**
  * 纯函数：路径派生（spec §2 落点 + §4 幂等）。
- * 落点 `<vaultRoot>/研究报告/<YYYY-MM-DD>-<topic-slug>.md`。
+ * 落点 `<vaultRoot>/DeepThought/<topic-slug>/<YYYY-MM-DD>-<topic-slug>.md`。
+ * （2026-08-09 用户拍板：导出件落 `DeepThought/<主题>/`，带 `source_message_id` 与终态标记，
+ * 与旧产物区分；vaultRoot 由部署配置注入，不得硬编码。）
  * 给定同一输入 + 同一 vaultRoot ⇒ 同一路径。不依赖任何桩。
  */
 export function deriveExportPath(input: ExportInput, vaultRoot: string): string {
   const date = input.createdAt.slice(0, 10);
   const slug = slugify(input.topic);
-  return `${vaultRoot}/研究报告/${date}-${slug}.md`;
+  return `${vaultRoot}/DeepThought/${slug}/${date}-${slug}.md`;
 }
 
 /**

@@ -21,8 +21,13 @@ function run(argv: string[], env: NodeJS.ProcessEnv = {}): string {
   });
 }
 
+// D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；测试统一显式提供。
+const TEST_TICK_CHANNEL = "research:v1-test.index";
+
 function dryRun(): string {
-  return run([join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"]);
+  return run([join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"], {
+    TICK_CHANNEL: TEST_TICK_CHANNEL,
+  });
 }
 
 describe("G1 dry-run exits 0 without network", () => {
@@ -262,7 +267,7 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     const explicit = "research:p02-smoke-1dce60.evidence";
     const rendered = run(
       [join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"],
-      { EVIDENCE_CHANNEL: explicit },
+      { EVIDENCE_CHANNEL: explicit, TICK_CHANNEL: TEST_TICK_CHANNEL },
     );
     const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;

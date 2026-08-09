@@ -223,7 +223,7 @@ describe("F1: ALLOWED_ROOT wired end-to-end through the production assembly", ()
     const explicit = "/data/code/self/agent-runtime";
     const rendered = runShell(
       [join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"],
-      { ALLOWED_ROOT: explicit },
+      { ALLOWED_ROOT: explicit, TICK_CHANNEL: "research:v1-test.index" },
     );
     const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;

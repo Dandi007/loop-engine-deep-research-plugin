@@ -40,6 +40,8 @@ const MIN_VIABLE_BUDGET = 13;
 function renderedDefaultMaxWrites(): number {
   const childEnv = { ...process.env };
   delete childEnv.MAX_WRITES;
+  // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
+  childEnv.TICK_CHANNEL = "research:v1-test.index";
   const out = execFileSync("bash", [BIN, "--dry-run"], {
     cwd: ROOT,
     encoding: "utf8",
@@ -120,7 +122,7 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,
       encoding: "utf8",
-      env: { ...process.env, MAX_WRITES: "64" },
+      env: { ...process.env, MAX_WRITES: "64", TICK_CHANNEL: "research:v1-test.index" },
     });
     const doc = parse(out);
     const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -198,6 +200,8 @@ describe("G1 D1: default budget is a finite positive integer >= MIN_VIABLE_BUDGE
     delete childEnv.MAX_WRITES;
     // ⛔ 自证子环境真的没有 MAX_WRITES，否则本用例会重蹈它要修的那个错（声称删了、实际没删 ⇒ 恒绿）。
     expect(childEnv).not.toHaveProperty("MAX_WRITES");
+    // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
+    childEnv.TICK_CHANNEL = "research:v1-test.index";
 
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,

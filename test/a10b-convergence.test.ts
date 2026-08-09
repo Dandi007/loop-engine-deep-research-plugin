@@ -112,7 +112,11 @@ function renderPath(): string {
 }
 
 function renderFleet(env: NodeJS.ProcessEnv = {}): { triggerStoreDir: string; fleetDir: string } {
-  const res = runDriver([renderPath(), "--dry-run"], env);
+  // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；测试统一显式提供。
+  const res = runDriver([renderPath(), "--dry-run"], {
+    TICK_CHANNEL: "research:v1-test.index",
+    ...env,
+  });
   if (res.code !== 0) throw new Error(`render failed: ${res.err}`);
   const doc = parse(res.out);
   const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -181,6 +185,9 @@ async function runRealE2E(opts: {
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
         DD_RUN_ROOT: runRoot,
+        // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
+        // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。
+        TICK_CHANNEL: "research:p02-smoke-1dce60",
         PATH: `${dirname(bun)}:${process.env.PATH ?? ""}`,
         ...opts.env,
       },
@@ -241,6 +248,7 @@ describe("B1-guard: dependency-missing B1 must not silently pass", () => {
     const res = runDriver([SCRIPT], {
       LOOP_ENGINE_CLI: join(tmpdir(), "does-not-exist-loop-engine-cli.js"),
       LOOP_ENGINE_RUNNER: resolveBun() ?? "bun",
+      TICK_CHANNEL: "research:v1-test.index",
     });
     // ⛔ 不可能是 pass：必须非零 + 响亮点名缺失。
     expect(res.code).not.toBe(0);
@@ -428,7 +436,10 @@ describe("B6: concurrent renders do not pollute each other", () => {
     // ⛔ 不得串行化：用 execFile 异步并发 spawn N 个子进程（runDriverAsync），Promise.all 统一收尾，
     //    让几次渲染**真正同时**进行 —— 这正是 §0.2 的竞争场景（vitest 并行下同一批渲染互相覆盖）。
     //    execFileSync 是同步阻塞，串行执行下每个渲染都拿到唯一 RUN_ROOT，读回必然不碰撞，判据零功率。
-    const procs = Array.from({ length: N }, () => runDriverAsync([renderPath(), "--dry-run"], {}));
+    const procs = Array.from(
+      { length: N },
+      () => runDriverAsync([renderPath(), "--dry-run"], { TICK_CHANNEL: "research:v1-test.index" }),
+    );
     const results = await Promise.all(procs);
     const parsed = results.map((res) => {
       expect(res.code).toBe(0);

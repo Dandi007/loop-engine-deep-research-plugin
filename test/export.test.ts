@@ -98,10 +98,12 @@ describe("N3 header carries read-only declaration (F8)", () => {
   });
 });
 
-describe("N3 location under vaultRoot/研究报告 (F9)", () => {
-  it("path starts with the vaultRoot/研究报告 prefix", () => {
+describe("N3 location under vaultRoot/DeepThought/<topic> (F9)", () => {
+  it("path starts with the vaultRoot/DeepThought/<slug> prefix", () => {
     const root = "/tmp/vault";
-    expect(deriveExportPath(input(), root)).toMatch(new RegExp(`^${root}/研究报告/`));
+    expect(deriveExportPath(input(), root)).toMatch(new RegExp(`^${root}/DeepThought/`));
+    // D1 —— 落点含主题目录（slug），与旧产物区分（spec §1.3）。
+    expect(deriveExportPath(input(), root)).toContain("/DeepThought/光伏并网-谐波治理/");
   });
 });
 

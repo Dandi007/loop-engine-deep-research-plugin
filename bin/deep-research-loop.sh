@@ -12,8 +12,48 @@ set -euo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# D1 —— 参数解析：--dry-run（只渲染）/ --profile <name>（受版本管理的部署配置）。
+# profile 也可经 DEPLOY_PROFILE 选择（--profile 优先于 DEPLOY_PROFILE）。
+_args=("$@")
 DRY_RUN=""
-if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
+PROFILE=""
+for ((_i=0; _i<${#_args[@]}; _i++)); do
+  case "${_args[$_i]}" in
+    --dry-run) DRY_RUN=1 ;;
+    --profile)
+      _i=$((_i+1))
+      PROFILE="${_args[$_i]:-}"
+      ;;
+  esac
+done
+if [ -z "$PROFILE" ] && [ -n "${DEPLOY_PROFILE:-}" ]; then
+  PROFILE="$DEPLOY_PROFILE"
+fi
+
+# D1 —— 受版本管理的部署配置（profile 形式，进 git / 可 diff / 可 review）。
+# 选择：--profile <name> 或 DEPLOY_PROFILE=<name> → profiles/deploy/<name>.env。
+# 加载顺序：显式 env > profile 文件 > 内置缺省。加载了哪个 profile 打印到 stderr（可观测）。
+# ⛔ profile 只填**环境里尚未显式设置**的变量（显式 env 优先），绝不覆盖已显式给的 env。
+if [ -n "$PROFILE" ]; then
+  PROFILE_FILE="$PLUGIN_ROOT/profiles/deploy/$PROFILE.env"
+  if [ ! -f "$PROFILE_FILE" ]; then
+    echo "[deep-research-loop] unknown deploy profile '$PROFILE': $PROFILE_FILE not found. Available: $(ls "$PLUGIN_ROOT/profiles/deploy" 2>/dev/null | sed 's/\.env$//' | tr '\n' ' ')" >&2
+    exit 3
+  fi
+  while IFS= read -r _line; do
+    case "$_line" in
+      ''|\#*) continue ;;
+      *=*)
+        _key="${_line%%=*}"
+        _val="${_line#*=}"
+        if [ -z "${!_key+x}" ]; then
+          export "$_key=$_val"
+        fi
+        ;;
+    esac
+  done < "$PROFILE_FILE"
+  echo "[deep-research-loop] loaded deploy profile: $PROFILE ($PROFILE_FILE)" >&2
+fi
 
 MODE="deep-research"
 # A10b —— 每次渲染的缺省 RUN_ID 必须唯一（§0.2/§1.2）。
@@ -28,12 +68,18 @@ export PLUGIN_ROOT RUN_ROOT RUNTIME_FLEET MODE
 export TRIGGER_STORE_DIR="$RUN_ROOT/stores/trigger"
 export TICK_ENTRY="${TICK_ENTRY:-$PLUGIN_ROOT/bin/tick-entry.sh}"
 # A8c——tick 的 clue 板 channel：从 pipeline input namespace 注入 tick.md 供 `--run` 使用。
-# ⛔ spec §2 只允许在 research:p02-smoke-1dce60 上做真机写入验证；可用 TICK_CHANNEL 覆盖。
-export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"
+# D1 —— ⛔ 内置缺省不再是 smoke channel（§1.2 / §2 E1/E2）。
+#   bus 是 append-only 无 DELETE ⇒ 一个「缺省写到某个真实 channel」的值**不可回退**。
+#   未受 profile 或显式 env 指定 ⇒ 响亮失败拒绝启动（与 EVIDENCE_CHANNEL 无默认同一条道理）。
+export TICK_CHANNEL="${TICK_CHANNEL:-}"
+if [ -z "$TICK_CHANNEL" ]; then
+  echo "[deep-research-loop] TICK_CHANNEL is not set. Refusing to start: the bus is append-only with no DELETE, so a default that writes to a real channel is irreversible. Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set TICK_CHANNEL explicitly." >&2
+  exit 3
+fi
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
 # ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：
-#    `research:p02-smoke-1dce60` 存在且「无任何后缀」——没有 `.evidence` 兄弟 channel）。
+#    真实证据 channel 存在且「无任何后缀」——没有 `.evidence` 兄弟 channel）。
 #    由板名做 `.board`→`.evidence` 之类推导在真实 channel 上静默推不出，且发布是 append-only
 #    无 DELETE、不可回退。因此这里**不给派生默认值**；部署方必须显式配置 EVIDENCE_CHANNEL 到
 #    **已核实存在**的证据 channel。未配置时留空，`--run` 一旦遇到 harvest 决策会响亮失败
@@ -49,6 +95,9 @@ export ALLOWED_ROOT="${ALLOWED_ROOT:-}"
 #    旧默认 5 让任何产出 ≥5 条 evidence 的卡永远收割不了 ⇒ 恒 max_rounds 死锁（本包根因）。
 #    预算仍是**不可回退写的有限护栏**，绝不设成无穷大（spec §4 非目标）；显式覆盖语义保留（MAX_WRITES）。
 export MAX_WRITES="${MAX_WRITES:-64}"
+# D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
+# 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
+export EXPORT_ROOT="${EXPORT_ROOT:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

@@ -2,7 +2,7 @@
 
 development_id: `dev_ledr_g4b2_termination_wiring_01`
 attempt: `implement`（rework of attempt_01KZJWJN8MC1B1MVFJTN66D9DX）
-input_commit: `__DELIVERY_COMMIT_PLACEHOLDER__`
+input_commit: `08e8d2d3a2461d032d18848b34436d1ea072a23c`
 
 > **Rework note (attempt 3, this commit).** 前 two attempt 的 continuous review 均为 REJECT，
 > 且 finding **全部聚焦在 dev-note 的 `input_commit` 不变量**（spec §5 footnote），

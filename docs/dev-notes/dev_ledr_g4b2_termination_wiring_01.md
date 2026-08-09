@@ -1,26 +1,30 @@
 # G4b(v2) —— 终态贯通：生产 `--run` 计算终止判定 + 跨 tick 计数经 trigger body 传递
 
 development_id: `dev_ledr_g4b2_termination_wiring_01`
-attempt: `implement`（rework of attempt_01KZJVF7CM2NTVK9V2065392Z8）
-input_commit: `d365557d34b0b7bb2b2a199a19775530a55c60cc`
+attempt: `implement`（rework of attempt_01KZJWJN8MC1B1MVFJTN66D9DX）
+input_commit: `__DELIVERY_COMMIT_PLACEHOLDER__`
 
-> **Rework note (attempt 2, this commit).** 上一 attempt（`attempt_01KZJVF7CM2NTVK9V2065392Z8`）
-> 的 continuous review（`rc-attempt_01KZJVF7CM2NTVK9V2065392Z8`，REJECT）给出两条 major finding，
-> 均为本 dev-note 的落点/字段问题，**与产品代码（`src/`、`test/`、`workflows/`、`bin/`）无关**：
+> **Rework note (attempt 3, this commit).** 前 two attempt 的 continuous review 均为 REJECT，
+> 且 finding **全部聚焦在 dev-note 的 `input_commit` 不变量**（spec §5 footnote），
+> 产品代码（`src/`、`test/`、`workflows/`、`bin/`）在前两次 review 中已被核实完整正确（R1–R6、变异矩阵、§4 均通过）：
 >
-> 1. **dev-note 在错误路径**：上一 attempt 把本 development 的内容写进了
->    `docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`（被取消的上一 development 的文件名），
->    而 spec §5 要求的落点 `docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md`（与本 development_id 一致）不存在。
->    修复：删除错误路径文件，在本路径重立本 note（即本文件）。
-> 2. **dev-note 的 `input_commit` 陈旧**：上一 attempt 的 note 记录 `input_commit: ae4847a1…`
->    （H0 bootstrap commit），而实际交付/subject commit 为 `8375a958…`，不符 spec §5 footnote 的不变量。
->    修复：本 note 的 `input_commit` 记录**本次 rework attempt 的 dispatch `input_commit`**
->    （即 `d365557d…`，本 attempt worktree 的起点 HEAD），与本 attempt 的 seal 校验口径一致。
->    spec §5 footnote：「input_commit 必须等于最终交付 commit；中途 rework 则 note 必须同步更新」——
->    本 note 即随本次 rework 同步更新，记录本 attempt 的 input_commit。
+> 1. attempt 1（`attempt_01KZJVF7CM2NTVK9V2065392Z8`，subject `8375a958…`）：两条 major ——
+>    (a) dev-note 写在被取消的上一 development 的文件名 `dev_ledr_g4b_termination_wiring_01.md`（已在 attempt 2 修复到本路径）；
+>    (b) note 的 `input_commit` 记 `ae4847a1…`（H0 bootstrap / dispatch input），而非交付 commit，违反不变量。
+> 2. attempt 2（`attempt_01KZJWJN8MC1B1MVFJTN66D9DX`，subject `c83a9c31…`）：路径已修；唯一剩余 major ——
+>    note 的 `input_commit` 仍记 dispatch input `d365557d…`，而非交付 commit。reviewer 明确否决了
+>    「记 dispatch input_commit」的口径（spec §5 footnote："input_commit 必须等于最终交付 commit；中途 rework 则 note 必须同步更新"），
+>    并确认 R1–R6 / 变异矩阵 / §4 / dev-note 路径**全部正确完整，仅此 evidence 不变量未满足**。
+>
+> **本次 (attempt 3) 修复：** note 的 `input_commit` 记录**本次 rework 的最终交付 commit**（即承载本 note 与全部产品改动的
+> actor 交付 commit `work_head_commit`）。由于 git commit hash 是其内容的函数，note 无法在自身所处的 commit 内
+> 预知该 commit 的 hash（自引用无固定点）；故采用两步工序：先提交 note 正文（含占位符），读得其 hash `H_body`，
+> 再以一个仅更新 `input_commit` 字段的 follow-up commit 把 `H_body` 写入本字段。本字段因此精确等于承载 note 正文的
+> 交付 commit，且 `H_body` 是本 rework 链中真实存在、可被 `git cat-file -e` 验证的交付 commit —— 不再是 attempt 1/2 那种
+> 陈旧的 dispatch input 祖先。最终 actor envelope 报告的 `work_head_commit` 为该 follow-up commit（其直接父即 `H_body`）。
 >
 > 产品代码（`7d1cb5a` 的全部 src/test/workflows/bin 改动）**逐字保留**，未做任何产品逻辑改动；
-> 本次 rework 只修正 dev-note 的路径与字段（纯产品文档，`.dev-dispatch/**` 全程字节未变）。
+> 本次 rework 只修正 dev-note 的 `input_commit` 字段（纯产品文档，`.dev-dispatch/**` 全程字节未变）。
 
 ## 结论先行
 
@@ -87,8 +91,10 @@ tick.md 现在合法地要求 `trigger_body`（跨 tick 计数载体）。所有
 - `src/` 只新增（`parsePrevCounters` / `InvalidTriggerBodyError` / `termination` 字段 / `--prev-*` 参数），不改判定语义。
 - `workflows/` 只新增（`trigger_body` 读取/写回；seed body 加字段）。
 - `test/` 改动均为「补 `trigger_body` 与 `termination`」的必要适配，无断言删除。
-- 本次 rework 的唯一删除是**错误路径的 dev-note 文件**（`docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`，
-  被取消的上一 development 的文件名），并在正确路径（本文件）重立。该删除的必要性即 review finding 1 本身。
+- 本次 rework（attempt 3）**无任何删除**（仅改本 dev-note 的 `input_commit` 字段 + rework 说明）。
+  上一 rework（attempt 2）的唯一删除是**错误路径的 dev-note 文件**
+  （`docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`，被取消的上一 development 的文件名），
+  并在正确路径（本文件）重立。该删除的必要性即 review finding 1 本身。
 
 ## 硬验收（spec §2 逐条）
 
@@ -138,14 +144,20 @@ rework 未改产品代码，故计数不变；本次 rework 实跑 `npm run type
 
 ## R8 —— 还原证据
 
-本次 rework 的 `git status --porcelain`（提交前）只含 dev-note 路径修正，无 `.dev-dispatch/**`、无 `.bak` 残留：
+本次 rework（attempt 3）的 `git status --porcelain`（提交前）只含本 dev-note 的 `input_commit` 字段修正，无 `.dev-dispatch/**`、无 `.bak` 残留、无产品代码改动：
 
 ```
- D docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md   (错误路径文件删除)
-?? docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md  (正确路径文件新增，即本文件)
+ M docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md   (仅 input_commit 字段 + rework 说明同步更新)
 ```
 
-产品代码（`src/`、`test/`、`workflows/`、`bin/`）逐字未变。
+> attempt 2 的 porcelain（路径修正）为：
+> ```
+>  D docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md   (错误路径文件删除)
+> ?? docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md  (正确路径文件新增，即本文件)
+> ```
+> attempt 1 的原始产品改动 porcelain 见其 review `rc-attempt_01KZJVF7CM2NTVK9V2065392Z8`（11 文件，src/test/workflows/bin）。
+
+产品代码（`src/`、`test/`、`workflows/`、`bin/`）自 attempt 1（`7d1cb5a`）起逐字未变。
 
 ## 验证命令
 

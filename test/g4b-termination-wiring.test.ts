@@ -83,6 +83,35 @@ function clueMsg(
 }
 
 /**
+ * 写一个「假 tick-entry」脚本到 dir/tick-entry：
+ *  - `--parse-trigger-body <body>` 分支委托给**真实** tick-entry（vite-node 跑 src/tick-entry.ts），
+ *    这样 bash 层用例跑的是权威 parseTerminationFromBody（attempt 2 评审 minor：单源真相，不再
+ *    让 tick.md 内嵌的第二份解析器与 TS 端静默发散）。
+ *  - 其余分支（`--run …`）按 fakeRunBody 的 JSON 输出 + 把 argv 记进 argvLog，用于断言 --prev-*。
+ *
+ * G4b（attempt 2）：tick.md 现在通过 `$tick_entry --parse-trigger-body` 解析 trigger body，
+ * 故 fake tick-entry 必须尊重同一契约；否则 tick.md 拿不到 --prev-* 参数。
+ */
+function writeFakeTickEntry(opts: {
+  tickEntryPath: string;
+  argvLog: string;
+  fakeRunBody: string;
+}): void {
+  const realEntry = join(ROOT, "src", "tick-entry.ts");
+  const viteNode = join(ROOT, "node_modules", ".bin", "vite-node");
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "--parse-trigger-body" ]; then
+  exec "${viteNode}" "${realEntry}" --parse-trigger-body "$2"
+fi
+printf '%s\\n' "$@" > "${opts.argvLog}"
+printf '%s\\n' '${opts.fakeRunBody}'
+`;
+  writeFileSync(opts.tickEntryPath, script);
+  chmodSync(opts.tickEntryPath, 0o755);
+}
+
+/**
  * 构造一条 research.evidence.v2 消息（覆盖某 clue_id）。
  */
 function evidenceMsg(clueId: string, seq: number): InspectMessage {
@@ -278,7 +307,11 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     const parsed = parseTerminationFromBody(
       JSON.stringify({ tick: true, coverage: 3, zeroGrowthRounds: 2 }),
     );
-    expect(parsed).toEqual({ prevCoverage: 3, prevZeroGrowthRounds: 2 });
+    expect(parsed).toEqual({
+      prevCoverage: 3,
+      prevZeroGrowthRounds: 2,
+      firstRound: false,
+    });
   });
 
   it("runChannelWrite outcome.termination carries the values to write into next trigger body", async () => {
@@ -305,6 +338,7 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     expect(parseTerminationFromBody(nextBody)).toEqual({
       prevCoverage: r.termination.coverage,
       prevZeroGrowthRounds: r.termination.zeroGrowthRounds,
+      firstRound: false,
     });
   });
 
@@ -315,12 +349,14 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     const argvLog = join(dir, "tick-entry.argv.log");
     const runnerLog = join(dir, "puts.log");
     const tickEntry = join(dir, "tick-entry");
-    // 假 tick-entry：记录 argv，输出含 termination 的 JSON，hasPendingWork=true 触发续投
-    writeFileSync(
-      tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": true, "decisions": [], "termination": {"state": null, "coverage": 7, "zeroGrowthRounds": 3, "capHit": false}}'\n`,
-    );
-    chmodSync(tickEntry, 0o755);
+    // 假 tick-entry：--parse-trigger-body 委托真实解析器；--run 记录 argv 并输出含 termination 的
+    // JSON（hasPendingWork=true 触发续投，使 tick.md 把本轮计数写进下一条 trigger body）。
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": true, "decisions": [], "termination": {"state": null, "coverage": 7, "zeroGrowthRounds": 3, "capHit": false}}',
+    });
     const runner = join(dir, "runner");
     writeFileSync(
       runner,
@@ -369,11 +405,12 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     const dir = mkdtempSync(join(tmpdir(), "g4b-r4-seed-"));
     const argvLog = join(dir, "tick-entry.argv.log");
     const tickEntry = join(dir, "tick-entry");
-    writeFileSync(
-      tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
-    );
-    chmodSync(tickEntry, 0o755);
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+    });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl
       .replace(/\{\{tick_entry\}\}/g, tickEntry)
@@ -391,7 +428,7 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     chmodSync(outShell, 0o755);
     execFileSync("bash", [outShell], { cwd: dir, encoding: "utf8" });
     const argv = readFileSync(argvLog, "utf8").trim().split("\n");
-    // ⛔ 首轮不传 --prev-*（seed body 无计数字段）
+    // ⛔ 首轮不传 --prev-*（seed body 由 parseTerminationFromBody 判为 firstRound）
     expect(argv).not.toContain("--prev-coverage");
     expect(argv).not.toContain("--prev-zero-growth");
     rmSync(dir, { recursive: true, force: true });
@@ -447,11 +484,14 @@ describe("R5: trigger body missing/malformed ⇒ loud failure (no silent 0/0 fal
     // bash 层：损坏的 trigger body ⇒ tick.md 非零退出，错误消息点名 trigger_body / G4b。
     const dir = mkdtempSync(join(tmpdir(), "g4b-r5-"));
     const tickEntry = join(dir, "tick-entry");
-    writeFileSync(
-      tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
-    );
-    chmodSync(tickEntry, 0o755);
+    // --parse-trigger-body 委托真实解析器：not-valid-json ⇒ 真实 parseTerminationFromBody 抛
+    // TriggerBodyTerminationError（消息含 trigger_body/G4b）⇒ tick.md exit 1。
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog: join(dir, "tick-entry.argv.log"),
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+    });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl
       .replace(/\{\{tick_entry\}\}/g, tickEntry)
@@ -522,5 +562,273 @@ describe("R6: capped and converged remain distinguishable", () => {
     // ⛔ R6：零增长收敛 ⇒ converged（不是 capped）
     expect(r.termination.state).toBe("converged");
     expect(r.termination.state).not.toBe("capped");
+  });
+});
+
+// ── R7（attempt 2 blocker）：harvest 本 tick 发布新 proposed clue 时不得假报 converged ──
+// 评审 blocker（src/tick-run.ts:1300-1308）：runChannelWrite 原先用 postWriteState.cards（不含
+//   本 tick 经 harvest 新发布的 proposed clue）调用 decideTermination。当被收割的卡恰为最后一张
+//   非终态卡（in_flight→explored，inFlight 变 0），新发布的 proposed clue 又不可见 ⇒ 终止输入看到
+//   inFlight===0 && proposed===0，一旦 zeroGrowthRounds 达阈就在「正创建新待处理工作」的 tick 报
+//   state==='converged' —— 正是 spec §0.2/§3.4 禁止的完备性误报。hasPendingWork 已为此补偿
+//   （cluesPublished>0），终止判定 attempt 1 未补偿 ⇒ 本用例钉死该补偿。
+
+describe("R7 (attempt 2 blocker): harvest publishing new clues must not falsely report converged", () => {
+  it("harvest terminalizes the last in_flight card AND publishes a proposed clue ⇒ termination.state !== 'converged'", async () => {
+    // 板面：1 张 in_flight 卡（run-1，已 exited(0)，有待收割的 worker.result）。
+    //   - decideTick 产生 harvest 决策；runWrite 把 evidence 发到 evidence channel、把新 proposed clue
+    //     发到板 channel、把该卡 CAS 到 explored。
+    //   - 写后板面（applyCasOutcomes）只剩 explored 的旧卡；本 tick 新发的 proposed clue 不在写前快照里。
+    //   - 传 prevCoverage/prevZeroGrowthRounds 使其「本应达阈」（prevZgr=1 ⇒ 本轮 +1 = 2 ≥ 阈值）。
+    // ⛔ 改动前（attempt 1）：termination 看到全终态板面 ⇒ 假报 state==='converged'。
+    //    改动后（attempt 2）：终止板面并入本 tick 新发的 proposed clue（proposed>0）⇒ 不得收敛。
+    const EVIDENCE_CHANNEL = `${CHANNEL}.evidence`;
+    const inFlightMsg: InspectMessage = {
+      message_id: "msg_clue_inflight",
+      channel_id: CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: {
+        status: "in_flight",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+        run_id: "run-1",
+      },
+      entity_id: "card_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages: InspectMessage[] = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-1", exit_code: 0 },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_1",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-1",
+          evidences: [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: [{ clue: "new idea" }],
+          materials: [{ uri: "m1" }],
+        },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    let boardCalls = 0;
+    let evidenceCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, _init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: inFlightMsg });
+        }
+        if (/\/v1\/channels\/[^/]+\/publish/.test(u)) {
+          return jsonResponse({ message_id: "p_x", channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${CHANNEL}/messages`)) {
+          boardCalls += 1;
+          return jsonResponse({ messages: boardCalls === 1 ? [inFlightMsg] : [] });
+        }
+        if (u.includes(`/v1/channels/${EVIDENCE_CHANNEL}/messages`)) {
+          evidenceCalls += 1;
+          return jsonResponse({ messages: evidenceCalls === 1 ? [] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          const hasAfterSeq = /[?&]after_seq=/.test(u);
+          return jsonResponse({ messages: hasAfterSeq ? [] : runsMessages });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const outcome = await runChannelWrite({
+      channelId: CHANNEL,
+      evidenceChannelId: EVIDENCE_CHANNEL,
+      prevCoverage: 1,
+      prevZeroGrowthRounds: 1, // 本轮零增长 ⇒ zgr=2 ≥ 阈值（若板面误判全终态则会假收敛）
+    });
+
+    // 前置判别：确实发生了「最后一张非终态卡被收割 + 发布新 proposed clue」。
+    expect(outcome.harvestReports).toHaveLength(1);
+    expect(outcome.harvestReports[0].cluesPublished).toBe(1);
+    expect(outcome.hasPendingWork).toBe(true); // F9 已钉死
+    // ⛔ R7 核心断言：本 tick 创建了新待处理工作 ⇒ 终态不得为 converged（完备性不得被误报）。
+    expect(outcome.termination.state).not.toBe("converged");
+    // 终态同样不得误判 capped（板面远未触顶，capHit=false）。
+    expect(outcome.termination.state).not.toBe("capped");
+  });
+});
+
+// ── R8（attempt 2 major）：生产证据 channel 与板 channel 分离时覆盖度仍可算 ──
+// 评审 major（src/tick-run.ts:1188-1194）：--run 原先只读板 channel，而生产 harvest 把
+//   research.evidence.v2 发到独立 EVIDENCE_CHANNEL（profiles/deploy/production.env）。
+//   ⇒ 生产覆盖度结构性恒 0，「coverage > prevCoverage」永不成立、zeroGrowthRounds 无条件递增、
+//   R3 的「覆盖增长 ⇒ 重置」分支在生产不可达。本用例把 evidence 放到独立 channel，断言覆盖度被读到。
+
+describe("R8 (attempt 2 major): coverage reads the separate production evidence channel", () => {
+  it("evidence on a distinct evidence channel drives coverage (>0) and resets zeroGrowthRounds on growth", async () => {
+    // 板 channel：1 张 explored 卡（无 evidence）。evidence channel：1 条覆盖它的 evidence。
+    // 生产拓扑：板 channel ≠ evidence channel。改动前只读板 channel ⇒ coverage=0。
+    const EVIDENCE_CHANNEL = "research:v1-deep-research.evidence";
+    const boardMsgs: InspectMessage[] = [
+      clueMsg("c1", { status: "explored" }, 1),
+    ];
+    const evidenceMsgs: InspectMessage[] = [
+      {
+        message_id: "ev_c1_1",
+        channel_id: EVIDENCE_CHANNEL,
+        channel_seq: 1,
+        kind: "research.evidence.v2",
+        payload: { clue_id: "c1", quote: "q", claim: "c", source: "code", locator: "l", revision: "r" },
+        entity_id: "c1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    let boardCalls = 0;
+    let evCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: boardMsgs[0] });
+        }
+        if (u.includes("/publish")) {
+          return jsonResponse({ message_id: "p", channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${CHANNEL}/messages`)) {
+          boardCalls += 1;
+          return jsonResponse({ messages: boardCalls === 1 ? boardMsgs : [] });
+        }
+        if (u.includes(`/v1/channels/${EVIDENCE_CHANNEL}/messages`)) {
+          evCalls += 1;
+          return jsonResponse({ messages: evCalls === 1 ? evidenceMsgs : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    // prevCoverage=0，本轮 coverage=1（增长）⇒ zeroGrowthRounds 重置为 0（R3 分支在生产可达）。
+    const r = await runChannelWrite({
+      channelId: CHANNEL,
+      evidenceChannelId: EVIDENCE_CHANNEL,
+      prevCoverage: 0,
+      prevZeroGrowthRounds: 2, // 即便上一轮已达阈，本轮覆盖增长 ⇒ 重置
+    });
+    // ⛔ R8 核心断言：独立 evidence channel 的覆盖被读到 ⇒ coverage=1（不是结构性 0）。
+    expect(r.termination.coverage).toBe(1);
+    // 覆盖增长 ⇒ zeroGrowthRounds 重置为 0、不收敛（R3 在生产拓扑下可达）。
+    expect(r.termination.zeroGrowthRounds).toBe(0);
+    expect(r.termination.state).not.toBe("converged");
+  });
+
+  it("without evidenceChannelId, coverage falls back to board-channel-only (single-channel test topology)", async () => {
+    // 未配 evidence channel（单 channel 拓扑，如既有 R2/R3 用例）⇒ 退化为只读板 channel 的覆盖，
+    // 保持既有行为（evidence 与 clue 同 channel）。evidence 在板 channel 上 ⇒ coverage=1。
+    const msgs = [
+      clueMsg("c1", { status: "explored" }, 1),
+      evidenceMsg("c1", 2),
+    ];
+    stubBoard(msgs);
+    const r = await runChannelWrite({
+      channelId: CHANNEL,
+      prevCoverage: 0,
+      prevZeroGrowthRounds: 0,
+    });
+    expect(r.termination.coverage).toBe(1);
+  });
+});
+
+// ── R9（attempt 2 minor 4）：丢了计数器的续投 body 不得被静默当作首轮 ──
+// 评审 minor（tick.md:71-76）：解析器原先只特殊处理「两字段都缺」= 首轮，从不检查 seed 标记 ⇒
+//   一个丢了计数器的续投 body（如 {"tick":true}）被静默当作首轮 0/0，zeroGrowthRounds 被无声重置
+//   —— 正是 R5 禁止的静默回落形态。改动后首轮判定基于 seed 标记，其余无计数 body 响亮失败。
+
+describe("R9 (attempt 2 minor): continuation body that lost its counters fails loudly (no silent first-round reset)", () => {
+  it('parseTerminationFromBody throws on {"tick":true} (continuation body missing counters, no seed)', () => {
+    // ⛔ 改动前：两字段都缺 ⇒ 被当成首轮 ⇒ 静默 0/0（zeroGrowthRounds 被无声重置）。
+    //    改动后：无 seed 标记 ⇒ 响亮失败。
+    expect(() =>
+      parseTerminationFromBody(JSON.stringify({ tick: true })),
+    ).toThrow(TriggerBodyTerminationError);
+  });
+
+  it('parseTerminationFromBody accepts {"seed":true} as first-round (returns 0/0 + firstRound:true)', () => {
+    // 显式 seed 标记 ⇒ 首轮语义（合法）。
+    expect(parseTerminationFromBody(JSON.stringify({ seed: true }))).toEqual({
+      prevCoverage: 0,
+      prevZeroGrowthRounds: 0,
+      firstRound: true,
+    });
+  });
+
+  it('parseTerminationFromBody treats {seed:true} with extraneous counters still as first-round', () => {
+    // seed 标记优先：即便带上计数字段，seed:true 仍认定首轮（seed 是权威的首轮信号）。
+    expect(
+      parseTerminationFromBody(JSON.stringify({ seed: true, coverage: 9, zeroGrowthRounds: 9 })),
+    ).toEqual({ prevCoverage: 0, prevZeroGrowthRounds: 0, firstRound: true });
+  });
+
+  it('tick.md with a lost-counters continuation body {"tick":true} exits non-zero naming trigger_body', () => {
+    // bash 层：丢了计数器的续投 body ⇒ tick-entry --parse-trigger-body 抛 ⇒ tick.md 非零退出，
+    // stderr 点名 trigger_body/G4b（不得静默回落 0/0）。
+    const dir = mkdtempSync(join(tmpdir(), "g4b-r9-"));
+    const tickEntry = join(dir, "tick-entry");
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog: join(dir, "tick-entry.argv.log"),
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+    });
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, CHANNEL)
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, "/tmp/x")
+      .replace(/\{\{loop_store_cli\}\}/g, "/tmp/c")
+      .replace(/\{\{loop_engine_runner\}\}/g, "/tmp/r")
+      .replace(/\{\{trigger_body\}\}/g, JSON.stringify({ tick: true }));
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+    let errCode = 0;
+    let errText = "";
+    try {
+      execFileSync("bash", [outShell], {
+        cwd: dir,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      const ee = e as { status?: number; stderr?: string | Buffer };
+      errCode = ee.status ?? -1;
+      errText = String(ee.stderr ?? "");
+    }
+    expect(errCode).not.toBe(0);
+    expect(errText).toMatch(/G4b.*trigger_body/i);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

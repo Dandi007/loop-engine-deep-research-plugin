@@ -24,6 +24,7 @@ import {
   decideTermination,
   hasPendingWork,
   DEFAULT_TICK_CONFIG,
+  type BoardCard,
   type BoardState,
   type CasDecision,
   type Decision,
@@ -317,7 +318,7 @@ export class MissingChannelError extends Error {
 export class TriggerBodyTerminationError extends Error {
   constructor(reason: string) {
     super(
-      `G4b: trigger body is missing or malformed termination counters (${reason}). Refusing to silently fall back to 0/0 — that would silently reset zeroGrowthRounds and re-introduce the very defect this package fixes. Pass valid {coverage, zeroGrowthRounds} (first tick legitimately uses 0/0).`,
+      `G4b: trigger_body is missing or malformed termination counters (${reason}). Refusing to silently fall back to 0/0 — that would silently reset zeroGrowthRounds and re-introduce the very defect this package fixes. Pass valid {coverage, zeroGrowthRounds} (first tick legitimately uses 0/0, via a {"seed":true} body).`,
     );
     this.name = "TriggerBodyTerminationError";
   }
@@ -328,21 +329,29 @@ export class TriggerBodyTerminationError extends Error {
  *
  * 约定（spec §1.2 表）：
  *   - 续投写出的 trigger body 形如 `{"tick":true,"coverage":<n>,"zeroGrowthRounds":<m>}`。
- *   - 首个 seed 触发的 body 形如 `{"seed":true}`（无计数字段）⇒ 调用方应显式传 0/0，不经过本函数。
+ *   - 首个 seed 触发的 body 形如 `{"seed":true}`（无计数字段）⇒ 首轮语义（prev=0/0）。
  *
- * ⛔ 本函数的契约：**body 字符串一旦传入且声称承载计数，就必须可解析且字段齐全**，否则响亮失败。
- *    具体语义（spec §1.2 R5）：
- *      - body 解析失败（非法 JSON） ⇒ 抛。
- *      - 解析成功但缺 `coverage` / `zeroGrowthRounds` 任一字段 ⇒ 抛。
- *      - 字段存在但类型错（非有限非负数）⇒ 抛。
- *    不得静默回落到 0/0（那是本包根因的复发形态）。
+ * ⛔ 本函数是 trigger body 计数的**唯一权威解析器**（attempt 2 评审 minor finding：
+ *    生产路径原先用 tick.md 内嵌的 node 脚本另写一份解析，与本 TS 解析器可静默发散。
+ *    attempt 2 起 tick.md 改为通过 tick-entry `--parse-trigger-body` 调用本函数，单源真相）。
+ *
+ * ⛔ 首轮判定基于 **seed 标记**，而非「无计数字段」（attempt 2 评审 minor finding）：
+ *    一个丢了计数器的续投 body（如 `{"tick":true}`）不再被静默当作首轮 0/0——
+ *    那会让 zeroGrowthRounds 被无声重置，正是 R5 禁止的静默回落形态。只有显式
+ *    `seed:true` 才认定首轮；其余无计数 body 一律响亮失败。
+ *
+ * 契约（spec §1.2 R5）：
+ *   - body 空/undefined ⇒ 抛。
+ *   - body 非 JSON / 非对象 ⇒ 抛。
+ *   - body 含 `seed:true` ⇒ 首轮语义，返回 `{prevCoverage:0, prevZeroGrowthRounds:0, firstRound:true}`。
+ *   - body 不含 `seed:true` 时，`coverage` / `zeroGrowthRounds` **必须齐全且为非负整数**，否则抛。
  *
  * @param body trigger body 字符串（loop-engine `claim.bind` 把 `body` 绑进 pipeline input）。
- * @returns 解析出的 {prevCoverage, prevZeroGrowthRounds}。
+ * @returns 解析出的 {prevCoverage, prevZeroGrowthRounds, firstRound}。
  */
 export function parseTerminationFromBody(
   body: string | undefined | null,
-): { prevCoverage: number; prevZeroGrowthRounds: number } {
+): { prevCoverage: number; prevZeroGrowthRounds: number; firstRound: boolean } {
   if (body === undefined || body === null || body === "") {
     throw new TriggerBodyTerminationError("body is empty/undefined");
   }
@@ -358,11 +367,16 @@ export function parseTerminationFromBody(
     throw new TriggerBodyTerminationError("body is not a JSON object");
   }
   const obj = parsed as Record<string, unknown>;
+  // ⛔ 首轮判定基于 seed 标记：只有显式 {"seed":true} 才认定首轮（返回 0/0 + firstRound:true）。
+  //    续投 body 丢了计数器（如 {"tick":true}）不被当成首轮 ⇒ 落到下面的字段校验并响亮失败。
+  if (obj.seed === true) {
+    return { prevCoverage: 0, prevZeroGrowthRounds: 0, firstRound: true };
+  }
   const cov = obj.coverage;
   const zgr = obj.zeroGrowthRounds;
   if (cov === undefined || zgr === undefined) {
     throw new TriggerBodyTerminationError(
-      "body is missing coverage/zeroGrowthRounds fields",
+      "body is missing coverage/zeroGrowthRounds fields (and is not a seed body {seed:true}); a continuation body that lost its counters would silently reset zeroGrowthRounds — refusing",
     );
   }
   if (
@@ -385,7 +399,7 @@ export function parseTerminationFromBody(
       `zeroGrowthRounds is not a non-negative finite integer (got ${JSON.stringify(zgr)})`,
     );
   }
-  return { prevCoverage: cov, prevZeroGrowthRounds: zgr };
+  return { prevCoverage: cov, prevZeroGrowthRounds: zgr, firstRound: false };
 }
 
 /** 一次 CAS 写动作的最小输入。 */
@@ -1192,6 +1206,24 @@ export async function runChannelWrite(
   const runsMessages = await readChannelMessages(runsChannelId);
   const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
+  // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
+  //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
+  //   （profiles/deploy/production.env: research:v1-deep-research.evidence，与板 channel
+  //   research:v1-deep-research.index 不同），而 --run 路径原先只读板 channel ⇒ 覆盖度
+  //   在生产结构性恒为 0、'coverage > prevCoverage' 永不成立、zeroGrowthRounds 无条件递增，
+  //   R3 断言的「覆盖增长 ⇒ 重置」分支在生产不可达。这里显式读证据 channel 并把其
+  //   research.evidence.v2 的 clue_id 并入覆盖集合；证据 channel 未配置时退化为仅板 channel
+  //   的覆盖（保持单 channel 测试场景的既有行为；生产配置总是显式传入 evidence channel）。
+  const evidenceChannelId = opts.evidenceChannelId;
+  let coveredClueIds = assembled.coveredClueIds;
+  if (evidenceChannelId && evidenceChannelId !== opts.channelId) {
+    const evidenceMessages = await readChannelMessages(evidenceChannelId);
+    const extra = collectEvidenceClueIds(evidenceMessages);
+    if (extra.length > 0) {
+      const merged = new Set([...coveredClueIds, ...extra]);
+      coveredClueIds = [...merged];
+    }
+  }
   const state = assembled.state;
   const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
@@ -1293,14 +1325,30 @@ export async function runChannelWrite(
   // G4b —— 用本轮真实（写后）板面调用 decideTermination（spec §1.1）。
   //   ⛔ 不得新造判定逻辑：decideTermination / computeCoverage 是已交付纯函数，调用它们。
   //   ⛔ prevCoverage / prevZeroGrowthRounds 跨 tick 传递（spec §1.2）：本轮从 opts 读取
-  //      （生产由 tick.md 从 {{trigger_body}} 解析后以 --prev-coverage/--prev-zero-growth 传入；
-  //       首轮无前值传 0）。用写后板面 postWriteState + assembled.coveredClueIds 作为「本轮真实板面」。
-  //   coverage 取本轮 evidence 已覆盖的 clue_id 集合大小（assembled.coveredClueIds 经
-  //      Set 去重后的大小，与 decideTermination 内部 computeCoverage 一致）。
+  //      （生产由 tick.md 从 {{trigger_body}} 经 tick-entry --parse-trigger-body 解析后
+  //       以 --prev-coverage/--prev-zero-growth 传入；首轮无前值传 0）。
+  //   ⛔（attempt 2 blocker finding）写后板面 postWriteState 只重写**已存在于写前快照**的卡，
+  //      本 tick 经 harvest 新发布的 proposed clue 不在其中。若被收割的卡恰为最后一张非终态卡，
+  //      postWriteState 会全为终态（inFlight=0, proposed=0），decideTermination 一旦
+  //      zeroGrowthRounds 达阈就会在本 tick（正创建新待处理工作）报 state==='converged' ——
+  //      正是 spec §0.2/§3.4 禁止的完备性误报。hasPendingWork 已为此补偿（cluesPublished>0），
+  //      终止判定必须同样补偿：把本 tick 新发布的 clue 作为 proposed 卡并入终止输入板面
+  //      （任一 proposed>0 ⇒ converged/capped-drained 均不成立 ⇒ 不会假收敛）。
+  //      合成卡只参与 status 计数（proposed++）；depth 取 0（新 proposed clue 不应虚假抬高
+  //      maxDepth 触顶判定——其真实 depth 要等下一 tick 读回板 channel 才纳入）。
+  const termCards =
+    cluesPublished > 0
+      ? [
+          ...postWriteState.cards,
+          ...synthesizePublishedClueCards(cluesPublished),
+        ]
+      : postWriteState.cards;
+  //   coverage 取本轮 evidence 已覆盖的 clue_id 集合大小（coveredClueIds 已并入证据 channel
+  //      的覆盖；经 Set 去重后的大小，与 decideTermination 内部 computeCoverage 一致）。
   const termination = decideTermination(
     {
-      cards: postWriteState.cards,
-      coveredClueIds: assembled.coveredClueIds,
+      cards: termCards,
+      coveredClueIds,
       prevCoverage: opts.prevCoverage ?? 0,
       prevZeroGrowthRounds: opts.prevZeroGrowthRounds ?? 0,
     },
@@ -1339,6 +1387,46 @@ function applyCasOutcomes(
       : c,
   );
   return { ...state, cards };
+}
+
+/**
+ * G4b（attempt 2 major finding）—— 从证据 channel 的消息里收集 research.evidence.v2 的
+ * clue_id 集合。生产 harvest 把 evidence 发到独立的 EVIDENCE_CHANNEL（与板 channel 不同），
+ * --run 路径必须读证据 channel 才能算出非零覆盖度。纯函数：不碰 IO，只折叠已读消息数组。
+ */
+function collectEvidenceClueIds(messages: InspectMessage[]): string[] {
+  const ids: string[] = [];
+  for (const msg of messages) {
+    if (msg.kind !== "research.evidence.v2") continue;
+    const clueId = (msg.payload as Partial<{ clue_id: string }> | null)?.clue_id;
+    if (typeof clueId === "string" && clueId.length > 0) ids.push(clueId);
+  }
+  return ids;
+}
+
+/**
+ * G4b（attempt 2 blocker finding）—— 合成 n 张「本 tick 新发布、写后板面不可见」的 proposed 卡。
+ * 用于把 harvest 本 tick 发布的 proposed clue 并入 decideTermination 的输入板面，避免在
+ * 「被收割卡恰为最后一张非终态卡」时假报 converged（spec §0.2/§3.4 完备性误报）。
+ *
+ * 合成卡只参与 status 计数（让 proposed>0 ⇒ converged/capped-drained 均不成立）；depth 取 0
+ * 以免虚假抬高 maxDepth 触顶判定（真实 depth 待下一 tick 读回板 channel 才纳入）。clueId
+ * 仅需在板面内唯一（decideTermination 不依赖其值，只数 status）。
+ */
+function synthesizePublishedClueCards(n: number): BoardCard[] {
+  const cards: BoardCard[] = [];
+  for (let i = 0; i < n; i += 1) {
+    cards.push({
+      clueId: `__g4b_published_${i}__`,
+      text: "",
+      status: "proposed",
+      depth: 0,
+      sources: [],
+      retries: 0,
+      runId: null,
+    });
+  }
+  return cards;
 }
 
 /** CLI --run 参数解析结果（channel 无默认值，M11）。 */

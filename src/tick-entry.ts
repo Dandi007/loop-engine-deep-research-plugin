@@ -26,6 +26,7 @@ import {
 import { runInspect } from "./tick-inspect";
 import {
   parseRunCliArgs,
+  parseTerminationFromBody,
   runChannelWrite,
   type RunWriteOutcome,
 } from "./tick-run";
@@ -40,8 +41,16 @@ usage:
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
   ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>]
                      写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
-                     G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 解析后传入，
-                            首轮无前值不传（runChannelWrite 缺省 0）；JSON 输出含 termination（与 hasPendingWork 并列）。
+                     G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经
+                            本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；
+                            JSON 输出含 termination（与 hasPendingWork 并列）。
+  ... --parse-trigger-body <body_json>
+                     G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：
+                     tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为
+                     统一调用 parseTerminationFromBody，单源真相）。
+                     输出（stdout，制表符分隔）：首轮 body（{"seed":true}）⇒ 空串（调用方不传 --prev-*）；
+                     续投 body（含 coverage/zeroGrowthRounds）⇒ "--prev-coverage\\t<n>\\t--prev-zero-growth\\t<m>"。
+                     body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
@@ -101,6 +110,35 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
     return await runInspect(channelId);
+  }
+  if (arg === "--parse-trigger-body") {
+    // G4b（attempt 2 评审 minor）—— trigger body 计数的**唯一权威解析器**入口：
+    // tick.md 改为调用本子命令（而非内嵌一份 node 解析脚本），消除两份解析器的静默发散。
+    // 失败 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（parseTerminationFromBody 抛
+    // TriggerBodyTerminationError，其消息文本已含 trigger_body/G4b 字样）。
+    const body = argv[1];
+    if (body === undefined) {
+      process.stderr.write(
+        "G4b: --parse-trigger-body requires a <body_json> argument. Refusing to silently fall back to 0/0.\n",
+      );
+      return 1;
+    }
+    try {
+      const parsed = parseTerminationFromBody(body);
+      // 首轮（seed body）⇒ 空输出，调用方据此不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。
+      // 续投 body ⇒ 输出 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，调用方按制表符切开追加。
+      if (parsed.firstRound) {
+        process.stdout.write("");
+      } else {
+        process.stdout.write(
+          `--prev-coverage\t${parsed.prevCoverage}\t--prev-zero-growth\t${parsed.prevZeroGrowthRounds}`,
+        );
+      }
+      return 0;
+    } catch (err) {
+      process.stderr.write(`${(err as Error).message}\n`);
+      return 1;
+    }
   }
   if (arg === "--run") {
     try {

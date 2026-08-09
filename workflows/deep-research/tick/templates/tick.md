@@ -48,50 +48,27 @@ if [ -n "$tick_channel" ]; then
   tick_args+=(--max-writes "$max_writes")
   if [ -n "$research_question" ]; then tick_args+=(--question "$research_question"); fi
   # G4b —— 从 trigger_body 解析上一轮的 coverage / zeroGrowthRounds 并传给 tick-entry。
-  #   ⛔ body 一旦非空就必须是合法 JSON 且含 coverage/zeroGrowthRounds 两个非负整数字段，否则响亮失败
-  #      （exit 1，点名 trigger_body 与缺失字段）；不得静默回落 0/0（那是本包根因 zeroGrowthRounds
-  #      无跨 tick 记忆的原样复发，spec §1.2 R5）。
-  #   首个 seed 触发 body 形如 {"seed":true}（无计数字段）⇒ 不传 --prev-*，tick-entry 缺省 0（首轮语义）。
-  #   用 node 解析（装配系统已带 node；与 tick-entry.sh 同一运行时），避免 bash 无原生 JSON 解析。
-  #   ⛔ JS 脚本经 heredoc 喂给 node stdin（node - <<'G4B_PARSE_EOF'），避免单/双引号在 bash 里的
-  #      引号冲突（node -e '...' 里的 JS 字符串含单引号会过早闭合 bash 单引号）。
+  #   ⛔ body 一旦非空就必须是合法 JSON。首轮判定基于 **seed 标记**（{"seed":true}）：
+  #      seed body ⇒ 不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。
+  #      续投 body（含 {"tick":true,...}）必须带齐 coverage/zeroGrowthRounds 两个非负整数字段，
+  #      否则响亮失败（exit 1，点名 trigger_body 与 G4b）；不得静默回落 0/0
+  #      （那是本包根因 zeroGrowthRounds 无跨 tick 记忆的原样复发，spec §1.2 R5）。
+  #      ⛔ 一个丢了计数器的续投 body（如 {"tick":true}）不被当成首轮 —— 那会让 zeroGrowthRounds
+  #      被无声重置，正是 R5 禁止的形态。
+  #   ⛔（attempt 2 评审 minor）解析走 tick-entry --parse-trigger-body（调用 TS 端
+  #      parseTerminationFromBody 单源真相），不再在 tick.md 内嵌一份 node 解析脚本——
+  #      两份解析器会静默发散，且原内嵌脚本用 fixed-name scratch file trigger_body_err.txt
+  #      写入 tick 节点 CWD，CWD 不可写时 redirect 失败被误归因为「trigger body 坏」。
+  #      现改为直接捕获子进程 stderr（command substitution 内 2>&1 不可靠，故用临时文件经 mktemp）。
   prev_args=()
   if [ -n "$trigger_body" ]; then
-    if ! prev_line=$(node - "$trigger_body" <<'G4B_PARSE_EOF' 2>trigger_body_err.txt
-      const b = process.argv[2];
-      let o;
-      try { o = JSON.parse(b); } catch (e) {
-        console.error("G4b: trigger_body is not valid JSON: " + e.message + " Refusing to silently fall back to 0/0 (that would reset zeroGrowthRounds).");
-        process.exit(1);
-      }
-      if (o === null || typeof o !== "object") {
-        console.error("G4b: trigger_body is not a JSON object. Refusing to silently fall back to 0/0.");
-        process.exit(1);
-      }
-      const hasCov = Object.prototype.hasOwnProperty.call(o, "coverage");
-      const hasZgr = Object.prototype.hasOwnProperty.call(o, "zeroGrowthRounds");
-      if (!hasCov && !hasZgr) {
-        // 首个 seed 触发（{"seed":true}）无计数字段 ⇒ 不打印，以空输出表示「首轮，不传 --prev-*」。
-        process.exit(0);
-      }
-      if (!hasCov || !hasZgr) {
-        console.error("G4b: trigger_body is missing coverage/zeroGrowthRounds fields (one present, one absent). Refusing to silently fall back to 0/0.");
-        process.exit(1);
-      }
-      const cov = o.coverage, zgr = o.zeroGrowthRounds;
-      if (typeof cov !== "number" || !Number.isFinite(cov) || cov < 0 || !Number.isInteger(cov) ||
-          typeof zgr !== "number" || !Number.isFinite(zgr) || zgr < 0 || !Number.isInteger(zgr)) {
-        console.error("G4b: trigger_body coverage/zeroGrowthRounds must be non-negative integers. Refusing to silently fall back to 0/0.");
-        process.exit(1);
-      }
-      process.stdout.write("--prev-coverage\t" + cov + "\t--prev-zero-growth\t" + zgr);
-G4B_PARSE_EOF
-    ); then
-      cat trigger_body_err.txt >&2
-      rm -f trigger_body_err.txt
+    parse_err="$(mktemp -t g4b_parse_err.XXXXXX)" || { echo "[tick] mktemp failed for trigger_body parse stderr" >&2; exit 1; }
+    if ! prev_line="$("$tick_entry" --parse-trigger-body "$trigger_body" 2>"$parse_err")"; then
+      cat "$parse_err" >&2
+      rm -f "$parse_err"
       exit 1
     fi
-    rm -f trigger_body_err.txt
+    rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
       # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
       IFS=$'\t' read -r -a prev_arr <<< "$prev_line"

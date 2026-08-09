@@ -22,6 +22,17 @@ import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
 
+/** anchor-check 未接线时的专属错误（spec §1.4：可观测的未接线）。 */
+export class AnchorCheckNotWiredError extends Error {
+  constructor() {
+    super(
+      "G4c: anchor-check is not wired in this package (real implementation deferred to G4d). " +
+      "The report head will correctly render 'unavailable' instead of fabricating a rate.",
+    );
+    this.name = "AnchorCheckNotWiredError";
+  }
+}
+
 /** 单个生成角色：role（persona）+ route（模型）。 */
 export interface GenerateRoleSpec {
   role: string;
@@ -327,9 +338,9 @@ export interface GenerateDeps {
   spawnRuntime?: GenerateSpawnRuntime;
   /** anchor-check：返回缺陷数与核验率（核验率用于报告头部标注，软闸门 <90% 不阻断导出）。 */
   spawnAnchorCheck(route: string): Promise<{ defects: number; verificationRate: number }>;
-  spawnExport(body: string): Promise<void>;
-  /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。 */
-  writeDoc(doc: DocV2, idempotencyKey: string): Promise<void>;
+  spawnExport(body: string, sourceMessageId: string): Promise<void>;
+  /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。返回发布出的 message_id。 */
+  writeDoc(doc: DocV2, idempotencyKey: string): Promise<string>;
   /**
    * 单例 lock：串行化（wait-then-run），而不是拿不到就跳过。
    * 返回一个 release 函数；调用方拿到锁后必须跑 synthesizer，再释放。
@@ -425,11 +436,12 @@ export async function runGenerate(
   const reportBody = renderReportHead(marker, anchorRate) + synthBody;
 
   // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
-  await deps.writeDoc(
+  // §1.3：writeDoc 返回 message_id，传给导出使 source_message_id 等于真实 message id。
+  const reportMessageId = await deps.writeDoc(
     buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
     `dr-doc:${cfg.synthesizer.role}:${origin}`,
   );
 
   // 导出：最后（D8）。
-  await deps.spawnExport(reportBody);
+  await deps.spawnExport(reportBody, reportMessageId);
 }

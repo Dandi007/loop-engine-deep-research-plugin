@@ -91,6 +91,15 @@ if [ -z "$RESEARCH_QUESTION" ]; then
   echo "[deep-research-loop] RESEARCH_QUESTION is not set. Refusing to start: an invented or derived default question would send the whole research astray, and bus writes are append-only (irreversible). Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set RESEARCH_QUESTION explicitly." >&2
   exit 3
 fi
+# G4c —— 研究 origin：生成段产物回写的 origin。取值来源必须显式且稳定（同一次研究的多个 tick
+# 必须得到同一个 origin，否则 writeDoc 的幂等键失效）。可用 RESEARCH_ORIGIN 覆盖；缺省时由
+# RESEARCH_QUESTION 确定性派生（sha256 前 16 位），保证同一 question 多次 tick 得到同一 origin。
+# ⛔ 无内置缺省：编造的 origin 会让 writeDoc 幂等键失效（同一次研究的不同 tick 拿到不同 origin
+#   ⇒ 重复发布 doc），且 bus 写入 append-only 不可回退。
+export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
+if [ -z "$RESEARCH_ORIGIN" ]; then
+  RESEARCH_ORIGIN="dr-$(printf '%s' "$RESEARCH_QUESTION" | sha256sum | cut -c1-16)"
+fi
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
 # ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：
@@ -113,6 +122,10 @@ export MAX_WRITES="${MAX_WRITES:-64}"
 # D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
 # 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
 export EXPORT_ROOT="${EXPORT_ROOT:-}"
+# G4c —— doc 发布目标 channel（--doc-channel）：生成段发布 research.doc.v2 的目标 channel。
+# ⛔ 无内置缺省：doc channel 不得静默默认到板 channel（bus 写入 append-only 无 DELETE，不可回退）。
+#    未受 profile 或显式 env 指定 ⇒ 生成段遇 doc 写入即响亮失败。
+export DOC_CHANNEL="${DOC_CHANNEL:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

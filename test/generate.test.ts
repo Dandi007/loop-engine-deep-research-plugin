@@ -105,7 +105,7 @@ function baseDeps(over: Partial<GenerateDeps> = {}): GenerateDeps {
     spawnRole: vi.fn(async () => ({ body: "role output" })),
     spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
     spawnExport: vi.fn(async () => {}),
-    writeDoc: vi.fn(async () => {}),
+    writeDoc: vi.fn(async () => "msg-doc-1"),
     lockSynthesizer: async () => async () => {},
     ...over,
   };
@@ -412,6 +412,7 @@ describe("G2a D2: doc_kind is derived from role, never from payload", () => {
       }),
       writeDoc: vi.fn(async (doc: DocV2) => {
         written.push(doc);
+        return "msg-doc-1";
       }),
     });
     await runGenerate(deps, cfg);
@@ -556,6 +557,7 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
         spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: rate })),
         writeDoc: vi.fn(async (doc: DocV2) => {
           written.push(doc);
+          return "msg-doc-1";
         }),
         spawnExport: vi.fn(async () => {}),
       });
@@ -590,6 +592,7 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
       spawnAnchorCheck: vi.fn(async () => ({ defects: 99, verificationRate: 0 })),
       writeDoc: vi.fn(async (doc: DocV2) => {
         genuine.push(doc);
+        return "msg-doc-1";
       }),
     });
     await runGenerate(okDeps, cfg);
@@ -603,6 +606,7 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
       }),
       writeDoc: vi.fn(async (doc: DocV2) => {
         crashed.push(doc);
+        return "msg-doc-1";
       }),
     });
     await runGenerate(crashDeps, cfg);

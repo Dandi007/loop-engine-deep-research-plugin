@@ -136,6 +136,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
   capturedTriageRunId = "";
   agentRunsReadCount = 0;
+  delete process.env.AGENT_RESULT_TIMEOUT_MS;
+  delete process.env.AGENT_RESULT_POLL_MS;
 });
 
 // ─── P1: 判别性 —— spawn 之后才出现的 triage 结果仍能被读到 ───────────────
@@ -261,7 +263,9 @@ describe("P2: retry exhausted ⇒ loud failure naming runId", () => {
 
   it("P2 discriminant: production-assembly readResult throws when no triage result ever appears on channel", async () => {
     capturedTriageRunId = "";
-    vi.useFakeTimers();
+    process.env.AGENT_RESULT_TIMEOUT_MS = "50";
+    process.env.AGENT_RESULT_POLL_MS = "10";
+
     try {
       const cards = [
         clueMsg("c1", { status: "proposed" }, 1),
@@ -298,15 +302,12 @@ describe("P2: retry exhausted ⇒ loud failure naming runId", () => {
         maxWrites: 10,
       });
 
-      const rejectionCheck = expect(promise).rejects.toThrow(
+      await expect(promise).rejects.toThrow(
         /G5: timed out waiting for triage result for run/,
       );
-
-      await vi.advanceTimersByTimeAsync(35000);
-
-      await rejectionCheck;
     } finally {
-      vi.useRealTimers();
+      delete process.env.AGENT_RESULT_TIMEOUT_MS;
+      delete process.env.AGENT_RESULT_POLL_MS;
     }
   });
 });
@@ -351,6 +352,8 @@ describe("P3: empty decisions is NOT treated as read-failure", () => {
 
   it("P3 discriminant: production-assembly readResult returns [] when agent returns empty decisions", async () => {
     capturedTriageRunId = "";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
 
     const cards = [
       clueMsg("c1", { status: "proposed" }, 1),
@@ -440,6 +443,8 @@ describe("P4: triageReport.runId equals the actual spawn runId", () => {
 
   it("P4 discriminant: runId is set to the actual spawn runId in production assembly", async () => {
     capturedTriageRunId = "";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
 
     const cards = [
       clueMsg("c1", { status: "proposed" }, 1),
@@ -656,6 +661,8 @@ describe("P6: assertions drive production assembly (readResult uses readTriageRe
   it("P6: runChannelWrite without spawnTriage/triageSpawnRuntime uses production default readResult and re-reads board:agent-runs post-spawn", async () => {
     capturedTriageRunId = "";
     agentRunsReadCount = 0;
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
 
     const cards = [
       clueMsg("c1", { status: "proposed" }, 1),

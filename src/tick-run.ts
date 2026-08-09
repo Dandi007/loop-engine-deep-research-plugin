@@ -70,6 +70,32 @@ import { runExport, slugify, type ExportInput } from "./export";
  */
 export const DEFAULT_MAX_WRITES = 64;
 
+/**
+ * G6 —— 等待 agent 结果的总时间预算（ms），缺省 15 分钟。
+ * 观测最大值 390s（dr-triage），900s ≈ 2.3× 最大值，覆盖 triage 与 worker 两个分布的全部样本。
+ * 可由 `AGENT_RESULT_TIMEOUT_MS` 环境变量覆盖。
+ */
+export const DEFAULT_AGENT_RESULT_TIMEOUT_MS = 900_000;
+
+/**
+ * G6 —— 轮询 agent 结果的间隔（ms），缺省 3 秒。
+ * 1s 轮询在 15 分钟预算下会产生 900 次无谓请求，3s 足够。
+ * 可由 `AGENT_RESULT_POLL_MS` 环境变量覆盖。
+ */
+export const DEFAULT_AGENT_RESULT_POLL_MS = 3_000;
+
+/**
+ * G6 —— 从环境变量读取超时与轮询配置。
+ * 返回值：{ timeoutMs, pollMs }，均为正整数；缺省 `DEFAULT_AGENT_RESULT_TIMEOUT_MS` / `DEFAULT_AGENT_RESULT_POLL_MS`。
+ * 测试可注入极小值（`AGENT_RESULT_TIMEOUT_MS` / `AGENT_RESULT_POLL_MS`），
+ * 从而不靠真实等待把用例拖慢（R5）。
+ */
+export function resolveAgentResultTimeout(): { timeoutMs: number; pollMs: number } {
+  const timeoutMs = Number(process.env.AGENT_RESULT_TIMEOUT_MS) || DEFAULT_AGENT_RESULT_TIMEOUT_MS;
+  const pollMs = Number(process.env.AGENT_RESULT_POLL_MS) || DEFAULT_AGENT_RESULT_POLL_MS;
+  return { timeoutMs, pollMs };
+}
+
 /** v1 冻结只读 channel 前缀（spec §2 / §8：不得触碰）。 */
 export const FROZEN_CHANNEL_PATTERNS = [
   /^research:loop-mcp-semantics\./,
@@ -1281,10 +1307,12 @@ export function assembleGenerateDeps(
         return {};
       },
       readBody: async (runId: string) => {
-        for (let i = 0; i < 30; i++) {
+        const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
-          await new Promise((r) => setTimeout(r, 1000));
+          await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
           `G4c: timed out waiting for generate result for run ${runId}`,
@@ -1519,13 +1547,15 @@ export async function runChannelWrite(
               return {};
             },
             readResult: async (runId) => {
-              for (let i = 0; i < 30; i++) {
+              const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+              const deadline = Date.now() + timeoutMs;
+              while (Date.now() < deadline) {
                 const result = await readTriageResult(runId);
                 if (result !== null) return result;
-                await new Promise((r) => setTimeout(r, 1000));
+                await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(
-                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after 30 retries`,
+                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
               );
             },
           };

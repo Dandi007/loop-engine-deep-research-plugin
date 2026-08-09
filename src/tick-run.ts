@@ -1297,7 +1297,7 @@ export function assembleGenerateDeps(
     },
     spawnRole: undefined,
     spawnRuntime: {
-      agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+      get agentRunBin() { return opts.workerCmd ?? resolveAgentRunBin(); },
       runId: randomUUID(),
       spawnProcess: async (argv, env) => {
         await spawnWorkerProcess({

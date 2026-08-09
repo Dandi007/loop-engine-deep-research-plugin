@@ -256,7 +256,10 @@ describe("G4c U1: reachability — runGenerate is called when termination non-nu
         oneShotDir,
       });
 
-      expect(generateSpy).toHaveBeenCalledTimes(1);
+      const markerKey = `test-origin:${CHANNEL}`;
+      const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
+      const markerPath = join(oneShotDir, `generated-${markerHash}`);
+      expect(existsSync(markerPath)).toBe(true);
     } finally {
       generateSpy.mockRestore();
       rmSync(oneShotDir, { recursive: true, force: true });
@@ -501,48 +504,26 @@ describe("G4c U4: export carries source_message_id equal to writeDoc's message_i
 
 describe("G4c U5: export path + EXPORT_ROOT check", () => {
   it("production deps throw MissingExportRootError when EXPORT_ROOT is not set", async () => {
-    const cards = [clueMsg("c1", { status: "explored" }, 1)];
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/messages")) return messagesResponse(cards);
-      if (url.includes("/entities")) return jsonResponse({ head: null });
-      return emptyMessagesResponse();
-    });
-
     const prevExportRoot = process.env.EXPORT_ROOT;
     delete process.env.EXPORT_ROOT;
 
     const oneShotDir = uniqueOneShotDir("u5");
-
-    // Mirror the production spawnExport check: EXPORT_ROOT unset ⇒ MissingExportRootError
-    const generateDeps: GenerateDeps = {
-      readTermination: async () => term(),
-      countBlocked: async () => 0,
-      readQuestion: async () => "test",
-      readOrigin: async () => "test-origin",
-      readEvidences: async () => [],
-      spawnRole: vi.fn(async () => ({ body: "output" })),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
-      spawnExport: async () => {
-        const exportRoot = process.env.EXPORT_ROOT;
-        if (!exportRoot) throw new MissingExportRootError();
-      },
-      writeDoc: vi.fn(async () => "msg-1"),
-      lockSynthesizer: async () => async () => {},
-    };
+    const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
 
     try {
-      await expect(
-        runChannelWrite({
+      const deps = assembleGenerateDeps(
+        {
           channelId: CHANNEL,
           origin: "test-origin",
           docChannelId: "research:doc",
           question: "test question",
-          prevZeroGrowthRounds: 2,
           oneShotDir,
-          generateDeps,
-        }),
-      ).rejects.toThrow(MissingExportRootError);
+        },
+        term(),
+        postWriteState,
+      );
+
+      await expect(deps.spawnExport("test", "msg-1")).rejects.toThrow(MissingExportRootError);
     } finally {
       if (prevExportRoot) process.env.EXPORT_ROOT = prevExportRoot;
       rmSync(oneShotDir, { recursive: true, force: true });

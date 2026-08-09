@@ -118,8 +118,8 @@ describe("U1: reachability — runChannelWrite triggers runGenerate when termina
 
   beforeEach(() => {
     resetGeneratedOrigins();
-    clearOneShotMarker("research-u1-positive");
-    clearOneShotMarker("research-u1-negative");
+    clearOneShotMarker("research-u1-positive", U1_CHANNEL);
+    clearOneShotMarker("research-u1-negative", U1_CHANNEL);
   });
 
   it("U1 positive: converged board + --origin triggers runGenerate and calls deps", async () => {
@@ -189,7 +189,7 @@ describe("U2: one-shot — same origin triggers generate only once", () => {
 
   beforeEach(() => {
     resetGeneratedOrigins();
-    clearOneShotMarker("research-u2");
+    clearOneShotMarker("research-u2", U2_CHANNEL);
   });
 
   it("U2: two runChannelWrite calls with same origin only trigger generate once", async () => {
@@ -217,6 +217,9 @@ describe("U2: one-shot — same origin triggers generate only once", () => {
 
     const outcome1 = await runChannelWrite(opts);
     expect(outcome1.generateTriggered).toBe(true);
+
+    // Simulate a fresh tick process: clear in-memory Set, leaving only the file marker.
+    resetGeneratedOrigins();
 
     // Re-stub for fresh board messages on second call
     stubBoard(U2_CHANNEL, msgs);
@@ -322,7 +325,7 @@ describe("U4: export path under EXPORT_ROOT/DeepThought/<topic-slug>", () => {
   });
 
   it("U4: MissingExportRootError is thrown when EXPORT_ROOT is not set", async () => {
-    clearOneShotMarker("research-u4-negative");
+    clearOneShotMarker("research-u4-negative", U1_CHANNEL);
     const msgs = [clueMsg("c1", { status: "explored" })];
     stubBoard(U1_CHANNEL, msgs);
 
@@ -440,6 +443,45 @@ describe("U5: anchor-check not wired ⇒ head shows 'unavailable', not '0%'", ()
     ).not.toBe(
       unavailable.find((d) => d.doc_kind === "report")!.body
     );
+  });
+
+  it("U5: production default spawnAnchorCheck throws AnchorCheckNotWiredError through runChannelWrite", async () => {
+    const channel = "research:g4c-test-u5-prod";
+    clearOneShotMarker("research-u5-prod", channel);
+    const msgs = [clueMsg("c1", { status: "explored" })];
+    stubBoard(channel, msgs);
+
+    const prevExportRoot = process.env.EXPORT_ROOT;
+    process.env.EXPORT_ROOT = "/tmp/test-vault";
+
+    const written: { doc_kind: string; body: string }[] = [];
+
+    try {
+      const outcome = await runChannelWrite({
+        channelId: channel,
+        origin: "research-u5-prod",
+        question: "test question",
+        prevCoverage: 1,
+        prevZeroGrowthRounds: 2,
+        docChannelId: channel,
+        generateDeps: {
+          spawnRole: vi.fn(async () => ({ body: "test body" })),
+          writeDoc: vi.fn(async (doc: DocV2) => {
+            written.push({ doc_kind: doc.doc_kind, body: doc.body });
+            return "msg-test";
+          }),
+          spawnExport: vi.fn(async () => {}),
+          lockSynthesizer: async () => async () => {},
+        },
+      });
+      expect(outcome.generateTriggered).toBe(true);
+      const report = written.find((d) => d.doc_kind === "report");
+      expect(report).toBeDefined();
+      expect(report!.body).toContain("dr-anchor-rate unavailable");
+    } finally {
+      if (prevExportRoot) process.env.EXPORT_ROOT = prevExportRoot;
+      else delete process.env.EXPORT_ROOT;
+    }
   });
 });
 
@@ -590,5 +632,44 @@ describe("G4c CLI: --origin parsing", () => {
 
   it("--origin without value throws", () => {
     expect(() => parseRunCliArgs(["test:channel", "--origin"])).toThrow(/origin/i);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+// Assembly chain: --origin flows through production assembly (bin → fleet → workflow → tick.md)
+// ════════════════════════════════════════════════════════════════════
+describe("G4c assembly: --origin flows through production chain", () => {
+  it("tick.md contains --origin wiring in tick_args", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const tmplPath = fileURLToPath(
+      new URL("../workflows/deep-research/tick/templates/tick.md", import.meta.url),
+    );
+    const source = readFileSync(tmplPath, "utf-8");
+    expect(source).toContain("research_origin");
+    expect(source).toContain("--origin");
+    expect(source).toContain("$research_origin");
+  });
+
+  it("fleet.yaml.tpl contains research_origin input", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const fleetPath = fileURLToPath(
+      new URL("../workflows/deep-research/fleet.yaml.tpl", import.meta.url),
+    );
+    const source = readFileSync(fleetPath, "utf-8");
+    expect(source).toContain("research_origin");
+    expect(source).toContain("RESEARCH_ORIGIN");
+  });
+
+  it("workflow.yaml seed payload contains research_origin", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const wfPath = fileURLToPath(
+      new URL("../workflows/deep-research/tick/workflow.yaml", import.meta.url),
+    );
+    const source = readFileSync(wfPath, "utf-8");
+    expect(source).toContain("research_origin");
+    expect(source).toContain("{{research_origin}}");
   });
 });

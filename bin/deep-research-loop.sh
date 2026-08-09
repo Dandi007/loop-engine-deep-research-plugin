@@ -122,6 +122,10 @@ export MAX_WRITES="${MAX_WRITES:-64}"
 # D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
 # 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
 export EXPORT_ROOT="${EXPORT_ROOT:-}"
+# G4c —— doc 发布目标 channel（--doc-channel）：生成段发布 research.doc.v2 的目标 channel。
+# ⛔ 无内置缺省：doc channel 不得静默默认到板 channel（bus 写入 append-only 无 DELETE，不可回退）。
+#    未受 profile 或显式 env 指定 ⇒ 生成段遇 doc 写入即响亮失败。
+export DOC_CHANNEL="${DOC_CHANNEL:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

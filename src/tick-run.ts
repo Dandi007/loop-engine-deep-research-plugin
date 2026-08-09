@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findWorkerResult,
   readChannelMessages,
+  readWorkerResult,
   type InspectMessage,
 } from "./tick-inspect";
 import {
@@ -358,29 +359,31 @@ export function resetGeneratedOrigins(): void {
 }
 
 /** G4c —— 测试/重置用：清除指定 origin 的跨进程持久标记文件。 */
-export function clearOneShotMarker(origin: string): void {
-  const path = oneShotMarkerPath(origin);
+export function clearOneShotMarker(origin: string, channelId: string): void {
+  const path = oneShotMarkerPath(origin, channelId);
   if (existsSync(path)) rmSync(path, { force: true });
 }
 
 /**
  * G4c —— 跨进程持久的一次性保证：基于文件标记。
  * 内存 Set 覆盖同进程内的重复调用；文件标记覆盖跨 tick（跨进程）的重复调用。
- * 标记文件路径由 origin 确定性派生（同一 origin ⇒ 同一路径，跨进程共享）。
+ * 标记文件路径由 origin + channelId 确定性派生（同一 origin ⇒ 同一路径，跨进程共享）。
+ * ⛔ 标记文件以 channelId 为命名空间，防止不同研究 run 的同一 origin 互相污染。
  */
-function oneShotMarkerPath(origin: string): string {
-  const safe = origin.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return join(tmpdir(), `g4c-generated-${safe}.marker`);
+function oneShotMarkerPath(origin: string, channelId: string): string {
+  const safeOrigin = origin.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const safeChannel = channelId.replace(/[^a-zA-Z0-9_:]/g, "_");
+  return join(tmpdir(), `g4c-generated-${safeChannel}-${safeOrigin}.marker`);
 }
 
-function hasGeneratedInAnyProcess(origin: string): boolean {
+function hasGeneratedInAnyProcess(origin: string, channelId: string): boolean {
   if (generatedOrigins.has(origin)) return true;
-  return existsSync(oneShotMarkerPath(origin));
+  return existsSync(oneShotMarkerPath(origin, channelId));
 }
 
-function markGeneratedInAnyProcess(origin: string): void {
+function markGeneratedInAnyProcess(origin: string, channelId: string): void {
   generatedOrigins.add(origin);
-  const path = oneShotMarkerPath(origin);
+  const path = oneShotMarkerPath(origin, channelId);
   const dir = join(path, "..");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, "1", "utf8");
@@ -1442,12 +1445,12 @@ export async function runChannelWrite(
   );
 
   // G4c —— 生成段触发边：终态非 null 且 origin 已配置且同一次研究尚未生成过 ⇒ 调用 runGenerate。
-  // ⛔ 一次性保证：同 origin 只跑一次（幂等——writeDoc 的 idempotencyKey 保护 bus 写入，
+  // ⛔ 一次性保证：同 origin 同 channel 只跑一次（幂等——writeDoc 的 idempotencyKey 保护 bus 写入，
   //    但导出与 spawn 的重复执行不受它保护，此处杜绝重复触发）。
+  // ⛔ 标记在 runGenerate 成功完成后才写入，失败不得永久阻塞重试（spec §1.3 响亮失败）。
   let generateTriggered = false;
   const origin = opts.origin;
-  if (origin && decideGenerate(termination) && !hasGeneratedInAnyProcess(origin)) {
-    markGeneratedInAnyProcess(origin);
+  if (origin && decideGenerate(termination) && !hasGeneratedInAnyProcess(origin, opts.channelId)) {
     generateTriggered = true;
     const cfg = opts.generateConfig ?? DEFAULT_GENERATE_CONFIG;
     const blockCount = postWriteState.cards.filter((c) => c.status === "blocked").length;
@@ -1481,9 +1484,9 @@ export async function runChannelWrite(
               return {};
             },
             readBody: async (runId) => {
-              const results = findWorkerResult(runId, runsMessages);
-              if (results) {
-                const body = (results as Record<string, unknown>).body;
+              const result = await readWorkerResult(runId);
+              if (result) {
+                const body = (result as Record<string, unknown>).body;
                 if (typeof body === "string") return body;
               }
               throw new Error(`generate role ${role} result not found for run ${runId}`);
@@ -1498,10 +1501,14 @@ export async function runChannelWrite(
           const exportRoot = process.env.EXPORT_ROOT;
           if (!exportRoot) throw new MissingExportRootError();
           const question = opts.question ?? "untitled";
+          const docChannelId = opts.docChannelId ?? opts.channelId;
+          const messages = await readChannelMessages(docChannelId);
+          const reportMsg = messages.find((m) => m.message_id === sourceMessageId);
+          const createdAt = reportMsg?.created_at ?? new Date().toISOString();
           const input: ExportInput = {
             report: { doc_kind: "report", digest: "", body, origin },
             sourceMessageId,
-            createdAt: new Date().toISOString(),
+            createdAt,
             topic: question,
           };
           await runExport(
@@ -1512,21 +1519,37 @@ export async function runChannelWrite(
         }),
       writeDoc: opts.generateDeps?.writeDoc ??
         (async (doc, key) => {
-          const channelId = opts.docChannelId ?? opts.channelId;
-          const resp = await publishDoc(channelId, doc, key);
+          if (!opts.docChannelId) {
+            throw new Error(
+              "G4c: --doc-channel is required when generating docs. Refusing to silently default to the board channel (bus writes are append-only with no DELETE).",
+            );
+          }
+          const resp = await publishDoc(opts.docChannelId, doc, key);
           return resp.message_id;
         }),
       lockSynthesizer: opts.generateDeps?.lockSynthesizer ??
         (async () => {
-          let released = false;
-          return async () => {
-            if (released) return;
-            released = true;
-          };
+          const lockDir = join(tmpdir(), "g4c-synthesizer-lock");
+          const maxRetries = 30;
+          const retryDelayMs = 1000;
+          for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+              mkdirSync(lockDir);
+              return async () => {
+                try { rmSync(lockDir, { recursive: true }); } catch { /* already released */ }
+              };
+            } catch {
+              if (attempt < maxRetries - 1) {
+                await new Promise((r) => setTimeout(r, retryDelayMs));
+              }
+            }
+          }
+          throw new Error("G4c: failed to acquire synthesizer lock after max retries");
         }),
       spawnRuntime: opts.generateDeps?.spawnRuntime,
     };
     await runGenerate(generateDeps, cfg);
+    markGeneratedInAnyProcess(origin, opts.channelId);
   }
 
   return {

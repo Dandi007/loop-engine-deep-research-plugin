@@ -1,204 +1,143 @@
-# G4d(v2) —— anchor-check 确定性接线：核验率的来源自己必须是机械的
+# G4e —— 播种入口：一次没有播种的运行会**安静地成功退出**
 
-> 派发方：`line-deep-research`。前置：G4c(v2) 已合入 main `f286f0e`。
->
-> ⚠️ **这是重开包。上一个 development（`dev_ledr_g4d_anchor_check_01`，PR #41）由派发方主动取消，
-> 原因是我在 spec 里写了一条实现方不可能满足的要求。详见 §0.1 —— 那不是实现方的问题。**
+> 派发方：`line-deep-research`。前置：G4d(v2) 已合入 main `3f6e8ce`。
 
 ---
 
-## 0　先读这两节
+## ⛔ 先读：前几包实付的学费 + 本包必须一并收掉的两条尾巴
 
-### 0.1 ⛔ 上一包为什么被取消：**我要求了一件你做不到的事**
+### A. 测试必须驱动**生产**的组装，不能各自注入 stub
+`runChannelWrite` 在 `opts.generateDeps` 存在时走注入分支、**完全跳过 `assembleGenerateDeps`**。
+前面三个包都栽在这里（「验收项看着有、变异杀不掉」）。
+**已交付的正确机制：`assembleGenerateDeps` 是导出函数**，用例可直接调用它拿生产 deps 再断言。
+⛔ 凡涉及生产行为的验收项一律照此写。
 
-上一版 spec §3.1 要求把 `anchor-check.py` / `anchor-check-selftest.sh` / `fixtures/`
-**从 katana 仓搬入本仓**。但 dd 的工作区**只含本插件仓**，`env_allowlist` 只有 `PATH` / `HOME`
-⇒ **实现方根本读不到那些源文件**。
+### B. ⛔ 源码字符串匹配一律不算数
+`expect(source).toContain("--seed")` / `readFileSync(测试文件).toContain(...)` 这类断言**不构成任何证据**。
+本包所有验收项必须打在**行为**上（假 bus 记录 publish 调用、假子进程记 argv、进程退出码等）。
 
-面对一条不可满足的指令，上一轮的实现方**自己写了一个校验器**。评审逐条证实它是坏的：
+### C. `workflow.yaml` 新增的可选 pipeline input 必须带 `?`
+既有正确写法 `"{{evidence_channel?}}"`；缺 `?` 会让值为空时模板按必填渲染、tick 节点报错，
+**而 loop 照报 `drained` 且 exit 0**（曾致一个包在 dd acceptance 上判死）。
+验收须在相关 env 均未设置的**干净环境**下跑全量。
 
-| 评审 finding | 后果 |
+### D. ⛔ 本包必须一并收掉的两条尾巴（G4d(v2) gate 记录的非阻断缺陷）
+
+**D1 —— anchor-check 落盘失败当前完全不可见。**
+`src/generate.ts` 落盘失败被 catch 后只写了 `anchorJsonWritten = false`，**该变量此后从未被使用**；
+`renderReportHead(marker, anchorRate, anchorTail)` 只接 `anchorTail`（用于 `sums_ok=false` / `no-repo-root`）。
+⇒ spec 要求的「落盘失败**不阻断导出、但必须可见**」只做到了前半句。
+**本包必须让落盘失败在报告头部（或落盘件）可见，并配一条判别性用例**（令落盘抛错 ⇒ 断言头部出现该标记）。
+⛔ 不得只是把变量删掉了事——那是把「不可见」变成「不存在」。
+
+**D2 —— 删掉 `test/g4d-anchor-check.test.ts` 里那条零功率的 V10 用例。**
+它 `readFileSync` 另一个测试文件再 `toContain("msg-nonexistent")`，是被明令禁止的源码字符串匹配。
+它守护的属性已由 `test/g4c-generate-wiring.test.ts` 中真正的判别性用例覆盖
+（驱动生产 `assembleGenerateDeps` + `rejects.toThrow(/cannot find doc message/)`），**故该 V10 用例是纯冗余**。
+⇒ **删除它**，并在 dev-note 说明（零功率检查比没有更坏：它会让后来者以为这条被守着）。
+
+---
+
+## 0　现状：没有任何生产入口能把初始线索放上板
+
+| 事实 | 证据 |
 |---|---|
-| `current_verified_hit` 的 `validate_anchor` **只检查文件存在且行数够** | **evidence 的 quote 从未被读取** ⇒ 任何指向足够长文件的锚点都算「已核验」 |
-| `sums_ok` 是恒真式，生产中永不为 false | spec 要求的「无声丢弃」守卫成了死代码 |
-| `fixtures/` 只有一个占位 README | 校验器自带的有牙回归**根本没搬过来** |
+| `tick-entry` 只有四个子命令 | `src/tick-entry.ts:82-114`：`--help` / `--selfcheck` / `--inspect` / `--run`，**没有播种** |
+| `publishClue` 存在但只被派生路径用 | `src/bus.ts:124` 定义；调用者只有 `harvest.ts:350`（从 worker 结果派生新 clue）与 `scripts/smoke-cas.ts`（测试夹具） |
+| npm scripts 里也没有 | `tick` / `tick:help` / `tick:selfcheck` / `deep-research:dry-run` / `smoke:cas` |
 
-> ### ⛔ 判据：**一个自己不核验的校验器，比没有校验器更坏。**
-> **核验率是软闸门的判据来源**（`golden-order` 2026-08-09 拍板：核验率 < 90% ⇒ V2 验收判不过）。
-> 一个恒报高分的校验器会**凭空制造闸门的证据**，让「验过了」这句话本身失去含义。
+### ⛔ 失败形态：安静地成功
 
-**⇒ 本包据此改设计（见 §2）：校验器留在原处，经环境变量以确定性子进程调用。
-⛔ 本包严禁自行实现、改写或"等价重写"任何校验逻辑。**
-
-### 0.2 ⛔ 上一包实付的其它学费（直接照用）
-
-1. **测试必须驱动生产的 dep 组装。** `runChannelWrite` 在 `opts.generateDeps` 存在时走注入分支、
-   **完全跳过 `assembleGenerateDeps`**。已交付的正确机制：**`assembleGenerateDeps` 是导出函数**，
-   用例可直接调用它拿**生产组装出的 deps** 再断言。⛔ 凡涉及生产 dep 的验收项一律照此写。
-2. **`workflow.yaml` 新增的可选 pipeline input 必须带 `?`**（既有正确写法 `"{{evidence_channel?}}"`）；
-   验收须在相关 env 均未设置的**干净环境**下跑全量。
-3. **`--json` 输出的核验率单位要统一**：`renderReportHead` 原样字符串化该数值且不带单位标记，
-   而软闸门口径是「< 90%」。**本包必须明确它是百分数还是分数，并在报告头部无歧义地体现**，
-   且与既有用例写入同字段的形式一致（现存用例写的是 `100` / `95` / `0` 这样的百分数）。
+板空 ⇒ `claimableCount()` 恒 0 ⇒ 循环立刻 drain、**exit 0**、看起来「跑完了」。
+> 与本线反复出现的「空结果不像失败」同族：**一次没有播种的研究，从外面看和一次瞬间收敛的研究一模一样。**
 
 ---
 
-## 1　现状：`spawnAnchorCheck` 被建模成 **agent route**
+## 1　要做什么
 
-`src/generate.ts` 的 `GenerateConfig` 有 `anchorCheckRoute: "anchor-check"`（占位）。
-G2a 把 debater/synthesizer 的占位 route 换成了真实 route，**唯独这一条没换** —— 因为它根本不该是 route。
+**新增一个显式的播种入口**，把「研究主问题 + 3–6 条初始线索」发到板 channel。
 
-> ### ⛔ 判据：**拿 LLM route 去跑一个确定性校验器，等于把「机械核验」换成「模型说它核验了」。**
-> **一个判据的来源，自己必须是机械的。**
-
-G4c(v2) 交付的生产 `spawnAnchorCheck` 目前抛 `AnchorCheckNotWiredError` ⇒ 报告头部如实标 `unavailable`。
-**本包把它换成真实的确定性调用。**
-
----
-
-## 2　⛔ 改后的设计：校验器留在原处，经 `ANCHOR_CHECK_BIN` 调用
-
-**不搬运。** 校验器（v3，含自带 selftest 与 fixtures）留在 katana 仓
-`plugins/deep-research/skills/deep-research/loop-orchestration/tools/`，由**部署方**通过环境变量指向它。
-
-| 键 | 语义 |
-|---|---|
-| `ANCHOR_CHECK_BIN` | 校验器可执行文件的绝对路径。**无内置缺省。** |
-
-**调用形状（校验器的真实接口，派发方读过源码，不要照文档猜）**：
-
+形状（**实现方可调整命名，但三件事必须齐**：显式子命令 / 幂等 / 响亮失败）：
 ```
-<ANCHOR_CHECK_BIN> --corpus <json 文件> --repo-root <path> --json
+tick-entry --seed <channel_id> --clue "<线索文本>" [--clue "<线索文本>" …] [--source <name> …]
 ```
+或等价的 `bin/` 入口。每条线索发一条 `research.clue.v2`，`status: "open"`、`depth: 0`。
 
-`--json` 输出的字段（逐字）：
+⛔ **复用 `src/bus.ts` 的 `publishClue`**，不要另写发布路径。
 
-```jsonc
-{ "total": N, "current_parsed": N, "current_verified_hit": N, "current_failed": N,
-  "old_format": N, "unparseable": N, "discarded": N, "sums_ok": bool,
-  "loud_failures": [ {"anchor": …, "error": …} ] }
-```
+### 1.1 ⛔ 幂等：重复播种不得翻倍
 
-要点：
-- 把引擎已读到的 evidences（`readEvidences` 的结果）序列化成**临时 JSON** → `--corpus <file>`；临时文件在 `finally` 清理。
-- `--repo-root` 用 `ALLOWED_ROOT`。**它对现行格式锚点是必需的**（locator 是仓内相对路径）。
-- ⛔ **不得**再经 `agent-run` / route 派发；`GenerateConfig` 的 `anchorCheckRoute` 字段随之移除
-  （⛔ 不得留一个没有消费者的 route 字段）。
-- ⛔ **`ANCHOR_CHECK_BIN` 未配置 ⇒ 核验率 `null`（`unavailable`）**，走既有的 `generate.ts` catch 路径。
-  ⛔ **不得**编造核验率；⛔ **不得**返回 `0`（`0%` 与 `unavailable` 是两件事，既有代码明确区分）。
+`publishClue` 已收 idempotency key（`bus.ts:124`）。
+⇒ 播种的 key 必须**由输入确定性派生**（如 `dr-seed:<channel>:<index>:<clue 文本 digest>`），
+使**同一组线索重播两次 ⇒ bus 侧去重、板上仍是那几张卡**。
 
-### 2.1 ⛔ 严禁自行实现校验逻辑
+> **理由**：bus **append-only 无 DELETE**。播种是不可回退的写入，
+> 而部署/重试场景下人一定会重跑一次。⛔ **靠「记得别跑两次」不是保障。**
 
-⛔ **不得**在本仓新建任何 `anchor-check.py` / 等价校验脚本 / 内联的锚点校验实现。
-⛔ **不得**"顺手实现一个简化版以便测试" —— 测试用**假子进程**（记录 argv、返回构造好的 JSON）即可。
-若你认为校验器接口与本 spec 不符，**停下在 review 里说明，不要自己写一个**。
+### 1.2 ⛔ 不得隐式建 channel
 
----
+channel 不存在时 bus 返回 **404**（派发方实测：`GET /v1/channels/<不存在>/messages` ⇒ `NOT_FOUND`）。
+⇒ 播种入口遇到不存在的 channel **必须响亮失败并点名**，
+⛔ **不得自动创建** —— 建 channel 是**不可回退的部署动作**，必须是人/部署方的显式决定，不是播种的副作用。
 
-## 3　⛔ 核验率的口径（本包最重要的一条判断）
+### 1.3 ⛔ 空线索集响亮失败
 
-**`verificationRate = current_verified_hit / total`。**
-
-⛔ **分母必须是 `total`，不得用 `current_parsed`。**
-
-> **理由**：若分母取 `current_parsed`（只算「能解析的那些」），那么一份 90% 锚点不可解析、
-> 剩下 10% 全部命中的证据集，会报出 **100% 核验率**。
-> **分母偷偷变小 = 软闸门被架空**，而软闸门正是 V2 验收的硬判据。
-> ⇒ 不可解析、旧格式、被丢弃的锚点**全部计入分母**：它们就是「没核验成」。
-
-**`defects = total - current_verified_hit`**（实现方可用等价表达式，但**必须在 dev-note 写明你采用的式子**）。
-
-**⛔ `total === 0` 时不得报 100%**：没有锚点可核验**不是「全部核验通过」**。此时核验率为 **`null`（unavailable）**。
-> 与 R2a 那次「`decisions: []` 通过 schema 校验」是同一个错的形状：**空集合不是成功。**
-
-**⛔ `sums_ok === false` 必须响亮**：发生无声丢弃时不得折算进一个看起来正常的核验率
-⇒ 核验率 `null`，**且必须在报告头部或落盘件里点名 `sums_ok=false`**（⛔ 不得只是一个和崩溃无法区分的裸 `unavailable`）。
+未给任何 `--clue` ⇒ 非零退出并点名。
+⛔ 不得「播种 0 条并返回成功」——那正是 §0 描述的那种安静成功。
 
 ---
 
-## 4　还要做的两件事
-
-### 4.1 报告落盘（plan §0 产物 3）
-
-把 `--json` 的**完整输出**写到导出件**同目录** `<EXPORT_ROOT>/DeepThought/<主题-slug>/`，文件名可判别（如 `anchor-check.json`）。
-⛔ 落盘失败**不得**阻断导出（软闸门语义），但必须在报告头部或落盘件里可见。
-⛔ **目录推导必须复用 `src/export.ts` 既有的 slug / 路径推导**（`slugify` / `deriveExportPath`），
-不得另抄一份 —— 两份拷贝当前一致只是巧合，会静默发散。
-
-### 4.2 继承缺口：`createdAt` 的响亮失败没有用例
-
-`assembleGenerateDeps` 的 `spawnExport` 里「doc channel 回读不到该 `sourceMessageId` ⇒ 响亮失败」
-这条支路**没有任何用例**（G4c(v2) 遗留）。原 U6 用例是对 **`src/export.ts`** 做源码字符串匹配 ——
-**查错了文件**（风险在 `src/tick-run.ts`）且是被判定不算数的形状。
-
-⇒ 补一条**判别性**用例：驱动**生产** `spawnExport`，令 doc channel 里**不存在**该 `sourceMessageId`，
-断言**响亮失败**且不落回系统时钟。⛔ 不得用源码字符串匹配充当该断言。
-⛔ 同时**删掉或改写**那条零功率的源码匹配用例，并在 dev-note 说明（零功率检查比没有更坏）。
-
----
-
-## 5　硬验收（缺一不可）
+## 2　硬验收（缺一不可）
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **V1** | ⛔ **不再经 route/agent-run**：生产路径 grep 无 `anchorCheckRoute` 消费者；`spawnAnchorCheck` 是子进程调用 | 读代码到行号 + **假子进程记 argv**，断言 argv[0] === `ANCHOR_CHECK_BIN` 的值且含 `--json` |
-| **V2** | ⭐ **核验率口径**：分母是 `total`。判别性用例：`total=10 / current_parsed=1 / current_verified_hit=1` ⇒ 核验率**必须是 10%，不得是 100%** | §3 的唯一执行点，⛔ 杀不掉即判零功率 |
-| **V3** | ⛔ `total===0` ⇒ 核验率 `null`（`unavailable`），不得是 100% | 判别性用例 |
-| **V4** | ⛔ `sums_ok===false` ⇒ 核验率 `null` **且点名 `sums_ok=false`**，不得是裸 `unavailable`（须与崩溃可区分） | 判别性用例，断言点名字面 |
-| **V5** | ⛔ **`ANCHOR_CHECK_BIN` 未配置 ⇒ `unavailable`**，⛔ 不得编造核验率、⛔ 不得是 `0%` | 正反两例；⭐ **必须打在生产 `assembleGenerateDeps` 组装出的 dep 上**（见 §0.2-1） |
-| **V6** | ⛔ **软闸门不变**：核验率 < 90% **仍然导出**，但必须标在报告头部 | 正反两例（<90% 与 ≥90%） |
-| **V7** | ⛔ **`--repo-root` 真的被传**（用 `ALLOWED_ROOT`）；子进程非零退出/输出不可解析 ⇒ 不被吞掉，走 `unavailable` | 假子进程记 argv + 失败传播一例 |
-| **V8** | **落盘**：`--json` 全文写到导出件**同目录**（目录推导复用 `export.ts`）；落盘失败不阻断导出 | 正反两例 + 读到行号证明复用 |
-| **V9** | ⛔ **仓内没有自写校验器**：`git ls-files` 无新增的 `anchor-check*.py` 或等价实现 | grep + 读 diff |
-| **V10** | §4.2 的 `createdAt` 判别性用例存在且有牙；零功率的源码匹配用例已删除/改写 | 判别性用例 + dev-note 说明 |
-| **V11** | ⛔ **核验率单位无歧义**（§0.2-3），与既有同字段用例形式一致 | 读到行号 + 用例 |
-| **V12** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` 均未设置）。基线：main `f286f0e` 实测 **22 files / 411 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
-| **V13** | 变异矩阵（§6）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **V14** | 每处删除给出必要性说明 | — |
+| **X1** | ⭐ **从生产入口出发**，给定 N 条线索 ⇒ **真的发出 N 条 `research.clue.v2`**，且每条 payload 的文本**逐字**等于输入、`status === "open"`、`depth === 0` | 假 bus 记录 publish 调用；⛔ 只断言「函数被调用」不算数 |
+| **X2** | ⛔ **幂等**：同一组线索**连播两次** ⇒ 板上仍是 N 张（idempotency key 由输入确定性派生，两次相同） | 断言两次的 key 序列逐字相同 |
+| **X3** | ⛔ **channel 不存在 ⇒ 响亮失败并点名**，⛔ **不得自动创建**（断言「创建 channel 的调用次数 = 0」） | 判别性用例 |
+| **X4** | ⛔ **零线索 ⇒ 非零退出并点名**，不得「播 0 条并成功」 | 正反两例 |
+| **X5** | 入口在 `--help` / usage 里可见；npm script 或 `bin/` 有对应入口（部署方按文档能找到它） | 读文档到行号 |
+| **X6** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4d 合入后的 main 实测为准，自己先跑一次记下来）** | 贴输出 |
+| **X7** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **X8** | `src/`、`test/` 的每处删除给出必要性说明 | — |
+
+> ⚠️ **本包不要求向真实 bus 播种**：真播是不可回退写入，归 Phase 6 由派发方在已核验的 channel 上做。
+> ⛔ **不得为了「验证一下」往任何真实 channel 播种。**
 
 ---
 
-## 6　变异矩阵（逐断言归因）
+## 3　变异矩阵（逐断言归因）
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **W1** | 核验率分母从 `total` 改成 `current_parsed` | **V2 必须挂**；⛔ 杀不掉即判 V2 零功率 |
-| **W2** | `total===0` 返回 `verificationRate: 1` | **V3 必须挂** |
-| **W3** | 忽略 `sums_ok`，照常折算核验率 | **V4 必须挂** |
-| **W4** | `ANCHOR_CHECK_BIN` 未配置时返回 `{defects:0, verificationRate:0}` 而非 unavailable | **V5 必须挂** |
-| **W5** | 不传 `--repo-root` | **V7 必须挂** |
-| **W6** | 落盘目录改成自己拼的字符串（不复用 `export.ts`） | **V8 必须挂** |
+| **Y1** | 让 idempotency key 含随机/时间成分（每次不同） | **X2 必须挂** |
+| **Y2** | channel 不存在时自动创建再播 | **X3 必须挂** |
+| **Y3** | 零线索时返回成功（播 0 条） | **X4 的失败侧必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 7　显式不做
+## 4　显式不做
 
 | 不做 | 理由 |
 |---|---|
-| ⛔ **自己实现/改写任何锚点校验逻辑** | 见 §2.1。上一包正是死在这里 |
-| 把校验器搬进本仓 | **实现方读不到源仓**（§0.1）。居所问题归 **R4**（同仓可访问） |
-| 改 `anchor-check.py` 的校验算法 | 不同仓；发现缺陷停下在 review 说明 |
-| 播种入口 | 归 **G4e** |
-| 改 `profiles/deploy/*.env` 的取值（含 `ANCHOR_CHECK_BIN` 填什么） | 归 **D2**。本包只保证**未配置时如实 `unavailable`** |
+| 向真实 bus 播种 | 不可回退；归 Phase 6，由派发方在已核验 channel 上做 |
+| 创建 channel | **不可回退的部署动作**，必须是显式决定，不是播种副作用 |
+| 改 `profiles/deploy/*.env` 的题目与 channel 取值 | 归 **D2** |
+| 改收集段/生成段任何编排逻辑 | 已合入，本包只加入口 |
 | 注册任何 bus 协议 | 不可逆，走公示流程 |
-| 端到端真跑真 bus | 归 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 8　交付物落点
+## 5　交付物落点
 
-- 实现：`src/generate.ts`（dep 形状 + 核验率换算 + `sums_ok` 点名）、`src/tick-run.ts`（生产 dep 组装）、
-  `src/export.ts`（若需暴露 slug/路径推导供复用）
-- 测试：`test/g4d-anchor-check.test.ts`（V1–V11）
-- 证据：`docs/dev-notes/dev_ledr_g4dv2_anchor_check_01.md`（V1–V14 逐条 + §6 变异六行 + 还原证据 +
-  **你采用的 `defects` 表达式** + **核验率的单位**）
+- 实现：`src/tick-entry.ts`（子命令）、`src/`（播种逻辑，复用 `bus.ts` 的 `publishClue`）、
+  必要时 `bin/` 与 `package.json` 的 script
+- 测试：`test/g4e-seed.test.ts`（X1–X5）
+- 证据：`docs/dev-notes/dev_ledr_g4e_seed_01.md`（X1–X8 逐条 + §3 变异三行 + 还原证据）
 
 > **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（该字段本来的语义）。
-> 真正的要求是**正文描述交付物本身**：测试文件数/用例数、变异矩阵各行**实测**结果、最终代码行为必须与交付一致；
-> 若中途 rework 改了实现，正文数字与结论同步更新。
+> 真正的要求是**正文描述交付物本身**；若中途 rework 改了实现，正文数字与结论同步更新。
 > ⛔ **不要为对齐 commit hash 做额外提交。**
-> ⛔ **不得用「基线计数方式差异」解释测试数缺口** —— 基线与终值是同一条 `npx vitest run`，口径可比。

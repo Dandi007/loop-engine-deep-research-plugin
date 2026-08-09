@@ -111,9 +111,9 @@ export function parseReportMarker(body: string): ReportMarker | null {
  * 保留 renderReportBody 的终态标记行格式（parseReportMarker / export 依赖它），
  * 核验率作为**紧随其后的独立行**标注（软闸门：<90% 不阻断导出，但必须标在头部）。
  */
-export function renderReportHead(marker: ReportMarker, anchorRate: number | null, anchorSumsOkFalse?: boolean): string {
+export function renderReportHead(marker: ReportMarker, anchorRate: number | null, anchorTail?: string): string {
   const rate = anchorRate === null
-    ? (anchorSumsOkFalse ? "unavailable sums_ok=false" : "unavailable")
+    ? (anchorTail ? `unavailable ${anchorTail}` : "unavailable")
     : String(anchorRate);
   return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
 }
@@ -303,6 +303,16 @@ export async function spawnGenerateRole(
   }
 }
 
+/** G4d —— ALLOWED_ROOT 未配置时 anchor-check 无法传 --repo-root ⇒ 部署故障，须与 checker 崩溃可区分。 */
+export class MissingAnchorCheckRepoRootError extends Error {
+  constructor() {
+    super(
+      "G4d: ALLOWED_ROOT is not configured — anchor-check requires --repo-root to validate current-format anchors",
+    );
+    this.name = "MissingAnchorCheckRepoRootError";
+  }
+}
+
 /** anchor-check --json 输出的完整形状（spec §2）。 */
 export interface AnchorCheckResult {
   total: number;
@@ -432,8 +442,10 @@ export async function runGenerate(
   // ⛔ 核验率 = current_verified_hit / total（分母必须是 total，不得用 current_parsed）。
   // ⛔ total === 0 ⇒ unavailable（非「全部核验通过」）。
   // ⛔ sums_ok === false ⇒ unavailable 且点名 sums_ok=false（须与崩溃可区分）。
+  // ⛔ ALLOWED_ROOT 未配置 ⇒ unavailable 且点名 no-repo-root（须与崩溃可区分）。
   let anchorRate: number | null = null;
-  let anchorSumsOkFalse = false;
+  let anchorTail: string | undefined;
+  let anchorJsonWritten = true;
   let anchorCheckJson: string | null = null;
   try {
     const ac = await deps.spawnAnchorCheck();
@@ -442,11 +454,14 @@ export async function runGenerate(
       // total === 0 ⇒ unavailable (V3)
     } else if (!ac.sums_ok) {
       // sums_ok === false ⇒ unavailable + name it (V4)
-      anchorSumsOkFalse = true;
+      anchorTail = "sums_ok=false";
     } else {
       anchorRate = (ac.current_verified_hit / ac.total) * 100;
     }
-  } catch {
+  } catch (e) {
+    if (e instanceof MissingAnchorCheckRepoRootError) {
+      anchorTail = "no-repo-root";
+    }
     // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
   }
 
@@ -455,12 +470,13 @@ export async function runGenerate(
     try {
       await deps.writeAnchorCheckJson(anchorCheckJson);
     } catch {
-      // 落盘失败不阻断导出
+      anchorJsonWritten = false;
     }
   }
 
   // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
-  const reportBody = renderReportHead(marker, anchorRate, anchorSumsOkFalse) + synthBody;
+  const reportHead = renderReportHead(marker, anchorRate, anchorTail);
+  const reportBody = reportHead + synthBody;
 
   // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
   const synthDocMessageId = await deps.writeDoc(

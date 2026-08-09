@@ -55,6 +55,7 @@ import {
   type GenerateDeps,
   type GenerateSpawnRuntime,
   type AnchorCheckResult,
+  MissingAnchorCheckRepoRootError,
 } from "./generate";
 import { runExport, slugify, type ExportInput } from "./export";
 
@@ -1319,9 +1320,7 @@ export function assembleGenerateDeps(
       }
       const allowedRoot = opts.allowedRoot;
       if (!allowedRoot) {
-        throw new Error(
-          "G4d: ALLOWED_ROOT is not configured — anchor-check requires --repo-root",
-        );
+        throw new MissingAnchorCheckRepoRootError();
       }
       const corpusFile = join(tmpdir(), `anchor-check-corpus-${randomUUID()}.json`);
       try {
@@ -1357,7 +1356,9 @@ export function assembleGenerateDeps(
     },
     writeAnchorCheckJson: async (json: string) => {
       const exportRoot = process.env.EXPORT_ROOT;
-      if (!exportRoot) return;
+      if (!exportRoot) {
+        throw new MissingExportRootError();
+      }
       const topic = opts.question ?? "untitled";
       const slug = slugify(topic);
       const dir = join(exportRoot, "DeepThought", slug);

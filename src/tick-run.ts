@@ -32,6 +32,7 @@ import {
   buildRunsFromMessages,
   findWorkerResult,
   readChannelMessages,
+  type InspectMessage,
 } from "./tick-inspect";
 import {
   harvestCard,
@@ -61,6 +62,188 @@ export function isFrozenChannel(channelId: string): boolean {
 
 /** A8f——`code-local` role：唯一需要 `allowed_root` 的 worker（spec §1.2）。 */
 export const CODE_LOCAL_ROLE = "dr-worker-code-local";
+
+/** G2b —— triage role（agent-runtime 已交付 `dr-triage`）。 */
+export const TRIAGE_ROLE = "dr-triage";
+
+/** G2b —— `dr-triage.result.v1` 的 action 值域（§2.3(a)）。 */
+export const TRIAGE_ACTIONS = ["keep", "drop"] as const;
+
+/**
+ * G2b —— 板面快照语料（形状对齐 agent-runtime `profiles/roles/schemas/triage-input.v1.json`）。
+ * `question` / `proposed_clues` 必填；`explored_summaries` 可选。
+ */
+export interface TriageCorpus {
+  question: string;
+  proposed_clues: Array<{
+    clue_id: string;
+    clue_text: string;
+    depth?: number;
+    sources?: string[];
+  }>;
+  explored_summaries?: string[];
+}
+
+/** G2b —— `dr-triage.result.v1` 的一条决策（`{clue_id, action, rationale}`）。 */
+export interface TriageResultDecision {
+  clue_id: string;
+  action: "keep" | "drop";
+  rationale: string;
+}
+
+/** G2b —— 一次 triage 的收割报告（整批预算跳过的判别点 / 校验拒绝计数）。 */
+export interface TriageReport {
+  runId: string;
+  /** 是否因 `--max-writes` 预算不足而整批跳过（§2.4：不做半批）。 */
+  budgetSkipped: boolean;
+  /** 被响亮拒绝的非法 action 条数（§2.3(a)：不当 keep 也不当 drop）。 */
+  invalidActions: number;
+  /** 被丢弃并响亮记录的越界 clue_id 条数（§2.3(b)：不改任何卡）。 */
+  outOfScopeDropped: number;
+  /** 实际执行的 CAS 数。 */
+  casCount: number;
+  /** 实际发出的 CAS 结果（budget 跳过时为空）。 */
+  casResults: { clueId: string; to: ClueV2["status"]; success: boolean; error?: CasDecision["error"] }[];
+}
+
+/**
+ * G2b §1.1 —— 把 triage 语料序列化为位置参数字符串。
+ * agent-run 的 prompt 只由 persona + 位置参数构成，`--input` 只作 schema 守卫、从不注入 prompt。
+ * ⇒ 板面快照必须放进位置参数，否则 role 交回空结果（照 G2a `serializeCorpusToPositional` 形状）。
+ */
+export function serializeTriageCorpusToPositional(corpus: TriageCorpus): string {
+  return JSON.stringify(corpus);
+}
+
+/**
+ * G2b §1.1 —— 构造真实 triage agent-run 的完整 argv：
+ * `agent-run --role dr-triage --run-id <id> --input <file> -- "<serialized board snapshot>"`
+ * 快照序列化后放在 `--` 之后的位置参数（T1 判别点：⛔ 只断言 `--input` 存在不算数）。
+ */
+export function buildTriageArgv(opts: {
+  agentRunBin: string;
+  runId: string;
+  inputPath: string;
+  corpus: TriageCorpus;
+}): string[] {
+  return [
+    opts.agentRunBin,
+    "--role",
+    TRIAGE_ROLE,
+    "--run-id",
+    opts.runId,
+    "--input",
+    opts.inputPath,
+    "--",
+    serializeTriageCorpusToPositional(opts.corpus),
+  ];
+}
+
+/**
+ * G2b §1.1 —— 把 triage 语料写成 `--input` 载荷文件。
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须走位置参数。
+ */
+export function writeTriageInputFile(corpus: TriageCorpus): string {
+  const file = join(tmpdir(), `g2b-triage-input-${randomUUID()}.json`);
+  writeFileSync(file, JSON.stringify(corpus));
+  return file;
+}
+
+/** G2b §1.3 / T7 —— triage 派发所需的运行时（agent-run 定位 / spawn / 结果回读）。 */
+export interface TriageSpawnRuntime {
+  agentRunBin: string;
+  runId: string;
+  /** 写 `--input` 载荷文件；缺省 `writeTriageInputFile`。 */
+  writeInputFile?: (corpus: TriageCorpus) => string;
+  /**
+   * 真实 spawn；测试注入假 agent-run 记录 argv。
+   * ⛔ **必填**：任何 triage 派发都必须真正启动子进程（评审 major）。
+   *    缺省/缺失即响亮失败，绝不静默构建 argv 后丢弃、返回一个从未启动的假成功。
+   */
+  spawnProcess: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
+  /** 从 worker 结果读回 `dr-triage.result.v1` 的决策列表。 */
+  readResult: (runId: string) => Promise<TriageResultDecision[]>;
+}
+
+/**
+ * G2b §1.1 —— 生产默认 triage 派发（照 G2a `spawnGenerateRole` 形状）：
+ * 语料 → `--input` 载荷文件 → `buildTriageArgv` 把序列化快照放进位置参数 → spawn agent-run。
+ * 这是 `buildTriageArgv` 的**唯一生产调用点**，杜绝「快照→argv」成为死代码（T7 判别点）。
+ * ⛔ `spawnProcess` 必填且**无条件调用**（§1.3）：缺失即编译/调用期失败，绝不静默丢弃 argv
+ *    返回「从未启动」的假成功。载荷文件的寿命绑定到本次派发：读回结果后**随即移除**（§1.3）。
+ */
+export async function spawnTriageRole(
+  corpus: TriageCorpus,
+  runtime: TriageSpawnRuntime,
+): Promise<TriageResultDecision[]> {
+  const inputPath = runtime.writeInputFile
+    ? runtime.writeInputFile(corpus)
+    : writeTriageInputFile(corpus);
+  try {
+    const argv = buildTriageArgv({
+      agentRunBin: runtime.agentRunBin,
+      runId: runtime.runId,
+      inputPath,
+      corpus,
+    });
+    // ⛔ 无条件 spawn：runtime 缺 spawnProcess 在类型层即不可通过（必填），杜绝零-spawn 假成功。
+    await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+    return await runtime.readResult(runtime.runId);
+  } finally {
+    // 载荷文件用后即删，不泄漏 tmp（§1.3）。
+    rmSync(inputPath, { force: true });
+  }
+}
+
+/**
+ * G2b §2.3(b) —— 从已读的 `board:agent-runs` 消息数组里，按 run_id 找该 run 的
+ * `dr-triage.result.v1` 决策列表。找不到 ⇒ 返回 null。
+ */
+export function findTriageResult(
+  runId: string,
+  messages: InspectMessage[],
+): TriageResultDecision[] | null {
+  let found: unknown = null;
+  for (const msg of messages) {
+    if (msg.kind !== "dr-triage.result.v1") continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id !== runId) continue;
+    found = payload;
+  }
+  if (found === null) return null;
+  const decisions = (found as { decisions?: unknown }).decisions;
+  return Array.isArray(decisions) ? (decisions as TriageResultDecision[]) : [];
+}
+
+/** G2b §2.3(a) —— 非法 action 被响亮拒绝（bus `openSchema()` 会剥掉 enum，bus 拦不住）。 */
+export class InvalidTriageActionError extends Error {
+  constructor(clueId: string, action: unknown) {
+    super(
+      `G2b: triage returned invalid action "${String(action)}" for clue "${clueId}" — must be "keep" or "drop". Rejecting this decision loudly (not treating it as keep or drop).`,
+    );
+    this.name = "InvalidTriageActionError";
+  }
+}
+
+/** G2b §2.3(b) —— clue_id 越界（不在本轮 proposed 集合）被丢弃并响亮记录（查得到 ≠ 有权改）。 */
+export class OutOfScopeTriageClueError extends Error {
+  constructor(clueId: string) {
+    super(
+      `G2b: triage returned clue_id "${clueId}" which is not in this round's proposed set — dropping the decision loudly and refusing to CAS an unowned card.`,
+    );
+    this.name = "OutOfScopeTriageClueError";
+  }
+}
+
+/** G2b —— triage 决策存在但 `readQuestion` 未接线 ⇒ 响亮失败（不得用空 question 静默派发）。 */
+export class MissingTriageQuestionError extends Error {
+  constructor() {
+    super(
+      "G2b: triage decision present but no question source wired (provide readQuestion / --question). Refusing to dispatch a triage with an empty question.",
+    );
+    this.name = "MissingTriageQuestionError";
+  }
+}
 
 /**
  * A8f——一个 dispatch 决策映射到 `dr-worker-code-local` 而 `allowed_root` 未配置 ⇒
@@ -160,6 +343,20 @@ export interface WriteDeps {
    * 缺省（未接线）⇒ 遇到 harvest 决策时抛 `MissingEvidenceChannelError`（§1.4 / H14）。
    */
   harvest?: HarvestDeps;
+  /**
+   * G2b —— triage 派发（可选，缺省走生产 `spawnTriageRole`）。
+   * 喂入引擎组装的板面快照语料，回收 `dr-triage.result.v1` 决策列表。
+   * ⛔ 遇 triage 决策必须**无条件调用**（§1.3 / T7）；缺省经 `triageSpawnRuntime`
+   *   （其 `spawnProcess` 必填）。两者都不提供时遇 triage 决策 ⇒ 响亮失败，绝不静默跳过。
+   */
+  spawnTriage?: (corpus: TriageCorpus) => Promise<TriageResultDecision[]>;
+  /** G2b —— 缺省 spawnTriage 的生产运行时（不注入 spawnTriage 时使用）。 */
+  triageSpawnRuntime?: TriageSpawnRuntime;
+  /**
+   * G2b —— 研究主问题（进入 triage 语料 `question`）。
+   * 生产经 `runChannelWrite` 的 `--question` 提供；缺省时遇 triage 决策 ⇒ 响亮失败。
+   */
+  readQuestion?: () => Promise<string>;
 }
 
 /** 一次 spawn 的观察记录：role/runId 由决策注入，spawned 表示 spawnWorker 是否成功返回。 */
@@ -188,6 +385,8 @@ export interface WriteResult {
   spawnCalls: number;
   /** A8e——收割报告（每张 exited(0) 卡一条；H12/H13 显式报告跳过数）。 */
   harvestReports: HarvestReport[];
+  /** G2b——triage 收割报告（一次 triage 一条；含整批预算跳过/校验拒绝计数）。 */
+  triageReports: TriageReport[];
 }
 
 function generateRunId(): string {
@@ -281,6 +480,7 @@ export async function runWrite(
   const casResults: WriteResult["casResults"] = [];
   const spawns: WriteResult["spawns"] = [];
   const harvestReports: WriteResult["harvestReports"] = [];
+  const triageReports: WriteResult["triageReports"] = [];
   // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增。
   let spawnCalls = 0;
   const spawnWorker = async (
@@ -468,10 +668,49 @@ export async function runWrite(
         });
         break;
       }
-      case "triage":
-        // 本包不处理 triage 的 spawn 副作用；triage 决策不写卡，跳过。
-        skipped += 1;
+      case "triage": {
+        // G2b —— triage 生产派发：组装板面快照 → spawn dr-triage → 收割逐条 CAS。
+        // ⛔ 快照语料必须进位置参数（§1.1）；spawn 必填且无条件调用（§1.3 / T7）。
+        const question = deps.readQuestion
+          ? await deps.readQuestion()
+          : (() => {
+              throw new MissingTriageQuestionError();
+            })();
+        const corpus: TriageCorpus = {
+          question,
+          proposed_clues: decision.proposedClues.map((c) => ({
+            clue_id: c.clueId,
+            clue_text: c.clueText,
+            ...(c.depth !== undefined && c.depth !== 0 ? { depth: c.depth } : {}),
+            ...(c.sources !== undefined && c.sources.length > 0 ? { sources: [...c.sources] } : {}),
+          })),
+          ...(decision.exploredSummaries.length > 0
+            ? { explored_summaries: [...decision.exploredSummaries] }
+            : {}),
+        };
+        // 缺省 spawnTriage = 生产 agent-run 派发（语料→argv→spawn，经 spawnTriageRole）。
+        const spawnTriage: NonNullable<WriteDeps["spawnTriage"]> =
+          deps.spawnTriage ??
+          ((corp) => {
+            if (!deps.triageSpawnRuntime) {
+              throw new Error(
+                "WriteDeps.spawnTriage has no default: provide spawnTriage or a triageSpawnRuntime",
+              );
+            }
+            return spawnTriageRole(corp, deps.triageSpawnRuntime);
+          });
+        const result = await spawnTriage(corpus);
+        const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
+        const applied = await applyTriageBatch(
+          deps,
+          { writes, maxWrites },
+          proposedIds,
+          result,
+        );
+        writes = applied.writes;
+        triageReports.push(applied.report);
         break;
+      }
     }
   }
 
@@ -482,6 +721,88 @@ export async function runWrite(
     spawns,
     spawnCalls,
     harvestReports,
+    triageReports,
+  };
+}
+
+/**
+ * G2b —— 收割一次 triage 返回的决策列表：逐条校验值域/越界，然后整批 CAS。
+ *
+ * 校验（先于任何 CAS，保证「不做半批」）：
+ *   (a) action 值域（§2.3(a)）：非 keep/drop ⇒ 响亮拒绝（不当 keep 也不当 drop）。
+ *   (b) clue_id 越界（§2.3(b)）：不在本轮 proposed 集合 ⇒ 丢弃并响亮记录，不改任何卡。
+ * 上述任一校验失败 ⇒ 响亮抛错，整个批次零 CAS（⛔ 不得据此去改一张不该动的卡）。
+ *
+ * 写入预算（§2.4）：CAS 写入计入 `--max-writes`；不足 ⇒ **整批跳过**并响亮报告（`budgetSkipped`），
+ * 不做半批。budget 充足时对每条 `keep → proposed→open`、`drop → proposed→dropped` 执行 CAS，
+ * 并把 `rationale` 写进该卡（版本链留痕，spec §2.2）。⛔ clue 的唯一写者仍是调度器（引擎按 decision CAS）。
+ */
+async function applyTriageBatch(
+  deps: WriteDeps,
+  ctx: { writes: number; maxWrites: number },
+  proposedIds: Set<string>,
+  decisions: TriageResultDecision[],
+): Promise<{ writes: number; report: TriageReport }> {
+  // (a) action 值域：bus `openSchema()` 会剥掉 enum ⇒ bus 拦不住，引擎消费侧必须自校验。
+  let invalidActions = 0;
+  const inDomain: TriageResultDecision[] = [];
+  for (const d of decisions) {
+    if (d.action !== "keep" && d.action !== "drop") {
+      invalidActions += 1;
+      throw new InvalidTriageActionError(d.clue_id, d.action);
+    }
+    inDomain.push(d);
+  }
+
+  // (b) clue_id 越界：不在本轮 proposed 集合 ⇒ 丢弃并响亮记录（查得到 ≠ 有权改）。
+  let outOfScopeDropped = 0;
+  const inScope: TriageResultDecision[] = [];
+  for (const d of inDomain) {
+    if (!proposedIds.has(d.clue_id)) {
+      outOfScopeDropped += 1;
+      throw new OutOfScopeTriageClueError(d.clue_id);
+    }
+    inScope.push(d);
+  }
+
+  // 写入预算：不足 ⇒ 整批跳过并响亮报告（不做半批）。
+  if (inScope.length > ctx.maxWrites - ctx.writes) {
+    return {
+      writes: ctx.writes,
+      report: {
+        runId: "",
+        budgetSkipped: true,
+        invalidActions,
+        outOfScopeDropped,
+        casCount: 0,
+        casResults: [],
+      },
+    };
+  }
+
+  let writes = ctx.writes;
+  const casResults: TriageReport["casResults"] = [];
+  for (const d of inScope) {
+    const to: ClueV2["status"] = d.action === "keep" ? "open" : "dropped";
+    const result = await deps.cas({
+      clueId: d.clue_id,
+      to,
+      from: "proposed",
+      rationale: d.rationale,
+    });
+    writes += 1;
+    casResults.push({ clueId: d.clue_id, to, success: result.success, error: result.error });
+  }
+  return {
+    writes,
+    report: {
+      runId: "",
+      budgetSkipped: false,
+      invalidActions,
+      outOfScopeDropped,
+      casCount: inScope.length,
+      casResults,
+    },
   };
 }
 
@@ -505,6 +826,12 @@ export interface RunWriteOptions {
   workerCmd?: string;
   /** A8f——worker 可读的 repo 根（`code-local` 必需；经 `--add-dir` 授予目录读）。 */
   allowedRoot?: string;
+  /** G2b——研究主问题（进入 triage 语料 question）。缺省时遇 triage 决策 ⇒ 响亮失败。 */
+  question?: string;
+  /** G2b——注入的 triage spawn dep（测试用）；缺省走真实 `agent-run` 子进程派发。 */
+  spawnTriage?: WriteDeps["spawnTriage"];
+  /** G2b——注入的 triage spawn 运行时（缺省 spawnTriage 用）。 */
+  triageSpawnRuntime?: TriageSpawnRuntime;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -517,6 +844,8 @@ export interface RunWriteOutcome {
   spawns: SpawnRecord[];
   /** A8e——收割报告（exited(0) 卡的 evidence/clue 发布与跳过情况）。 */
   harvestReports: HarvestReport[];
+  /** G2b——triage 收割报告（一次 triage 一条；含整批预算跳过/校验拒绝计数）。 */
+  triageReports: TriageReport[];
   /**
    * A9 —— 板面是否仍有非终态 clue（proposed / open / in_flight），由板面状态确定性推出。
    * tick 依它决定是否 `loop-store put` 下一条触发（spec §1.3 / F7/F8）。
@@ -812,6 +1141,33 @@ export async function runChannelWrite(
       publishClue: (channelId, clue, key) =>
         publishClue(channelId, clue, key).then(() => undefined),
     },
+    // G2b —— triage：研究主问题（--question）；缺省走生产 spawnTriageRole（真实 agent-run）。
+    readQuestion: async () => {
+      if (opts.question !== undefined) return opts.question;
+      throw new MissingTriageQuestionError();
+    },
+    spawnTriage:
+      opts.spawnTriage ??
+      ((corpus) => {
+        const runtime: TriageSpawnRuntime =
+          opts.triageSpawnRuntime ?? {
+            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+            runId: randomUUID(),
+            // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
+            //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
+            spawnProcess: async (argv, env) => {
+              await spawnWorkerProcess({
+                cmd: argv[0],
+                args: argv.slice(1),
+                env,
+                onExit: () => {},
+              });
+              return {};
+            },
+            readResult: async (runId) => findTriageResult(runId, runsMessages) ?? [],
+          };
+        return spawnTriageRole(corpus, runtime);
+      }),
   };
   const result = await runWrite(
     deps,
@@ -821,7 +1177,10 @@ export async function runChannelWrite(
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
-  const postWriteState = applyCasOutcomes(state, result.casResults);
+  //   G2b —— triage 的 CAS（proposed→open/dropped）一并计入写后重建，否则 triage 收割的
+  //   proposed→dropped 不会被反映，hasPendingWork 仍把已裁走的卡算作待处理（spec §3.2）。
+  const triageCasResults = result.triageReports.flatMap((r) => r.casResults);
+  const postWriteState = applyCasOutcomes(state, [...result.casResults, ...triageCasResults]);
   // ⛔（attempt 2 blocker）写后板面重建（applyCasOutcomes）只重写**已存在于写前快照**的卡，
   //   本 tick 经 harvest 新发布的 clue（status=proposed，非终态）不在其中。若被收割的卡恰好是
   //   最后一张非终态卡，postWriteState 会全为终态而 hasPendingWork=false，导致新发布的 proposed
@@ -840,6 +1199,7 @@ export async function runChannelWrite(
     skipped: result.skipped,
     spawns: result.spawns,
     harvestReports: result.harvestReports,
+    triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
   };
 }
@@ -873,11 +1233,13 @@ export interface RunCliOptions {
   evidenceChannelId?: string;
   /** A8f——worker 可读 repo 根（--allowed-root）；`code-local` 必需（§1.2 / F5）。 */
   allowedRoot?: string;
+  /** G2b——研究主问题（--question）；进入 triage 语料 question（缺省遇 triage 决策即响亮失败）。 */
+  question?: string;
 }
 
 /**
  * 解析 `--run` 之后的参数：
- * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>]`。
+ * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>]`。
  * ⛔ 不传 channel → 抛 MissingChannelError（exit ≠ 0，M11）。
  * ⛔ 冻结 channel → 抛 FrozenChannelError（M12）。
  */
@@ -889,6 +1251,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let maxWrites = DEFAULT_MAX_WRITES;
   let evidenceChannelId: string | undefined;
   let allowedRoot: string | undefined;
+  let question: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -913,10 +1276,18 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
         );
       }
       i += 1;
+    } else if (args[i] === "--question") {
+      question = args[i + 1];
+      if (!question) {
+        throw new Error(
+          "G2b: invalid --question (must specify the research question).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
     throw new FrozenChannelError(channelId);
   }
-  return { channelId, maxWrites, evidenceChannelId, allowedRoot };
+  return { channelId, maxWrites, evidenceChannelId, allowedRoot, question };
 }

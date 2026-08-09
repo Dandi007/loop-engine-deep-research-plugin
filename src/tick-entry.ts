@@ -38,8 +38,8 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
-  ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>]
-                    写侧：CAS + spawn + 收割（reclaim/dispatch/block/harvest），exit 0
+  ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>]
+                    写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
@@ -47,7 +47,8 @@ usage:
      spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；
       --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 DEFAULT_MAX_WRITES（--max-writes，A10c 起足以收割一张真实卡）；
       --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
-      拒绝写 v1 冻结 channel。
+      --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；
+       拒绝写 v1 冻结 channel。
   JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。
 `;
 

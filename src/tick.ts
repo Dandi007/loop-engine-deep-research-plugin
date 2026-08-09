@@ -114,6 +114,14 @@ export interface BoardState {
   triageInFlight: boolean;
 }
 
+/** G2b —— 板面快照里一条 proposed clue 的最小视图（对齐 `triage-input.v1.json`）。 */
+export interface TriageProposedClue {
+  clueId: string;
+  clueText: string;
+  depth?: number;
+  sources?: string[];
+}
+
 /** 决策——纯函数输出，副作用执行权归 runTick。 */
 export type Decision =
   | { kind: "reclaim"; clueId: string; to: ClueV2["status"]; retries: number }
@@ -143,7 +151,16 @@ export type Decision =
       /** 该卡 blocked 的明确 rationale（N7：blocked 且 rationale 非空，写进卡）。 */
       rationale: string;
     }
-  | { kind: "triage" };
+  | {
+      kind: "triage";
+      /**
+       * G2b —— 本轮 proposed 集合（板面快照的 `proposed_clues` 原料）。
+       * ⛔ clue 的唯一写者仍是调度器：role 只返回决策，引擎按 decision 去 CAS。
+       */
+      proposedClues: TriageProposedClue[];
+      /** G2b —— 已探索卡的一句话摘要（`explored_summaries`，可选）。 */
+      exploredSummaries: string[];
+    };
 
 /**
  * A9 —— 非终态 clue 状态集合：板面仍有待处理工作的判据（spec §1.3）。
@@ -279,9 +296,19 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
   }
 
   // §5 派 triage：count(proposed) >= K 且 triage 无在途。
-  const proposed = state.cards.filter((c) => c.status === "proposed").length;
-  if (proposed >= cfg.triageThreshold && !state.triageInFlight) {
-    decisions.push({ kind: "triage" });
+  const proposedClues: TriageProposedClue[] = state.cards
+    .filter((c) => c.status === "proposed")
+    .map((c) => ({
+      clueId: c.clueId,
+      clueText: c.text,
+      ...(c.depth !== 0 ? { depth: c.depth } : {}),
+      ...(c.sources.length > 0 ? { sources: [...c.sources] } : {}),
+    }));
+  const exploredSummaries = state.cards
+    .filter((c) => c.status === "explored")
+    .map((c) => c.text);
+  if (proposedClues.length >= cfg.triageThreshold && !state.triageInFlight) {
+    decisions.push({ kind: "triage", proposedClues, exploredSummaries });
   }
 
   return decisions;

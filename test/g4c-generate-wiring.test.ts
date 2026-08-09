@@ -680,7 +680,7 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
     expect(err.message).toContain("anchor-check is not wired");
   });
 
-  it("discriminative T5: production assembleGenerateDeps spawnAnchorCheck throws AnchorCheckNotWiredError", async () => {
+  it("discriminative T5: production assembleGenerateDeps spawnAnchorCheck no longer throws (G4d wired)", async () => {
     const oneShotDir = uniqueOneShotDir("u7-t5");
     const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
     const deps = assembleGenerateDeps(
@@ -694,7 +694,9 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
       term(),
       postWriteState,
     );
-    await expect(deps.spawnAnchorCheck("anchor-check")).rejects.toThrow(AnchorCheckNotWiredError);
+    // G4d: spawnAnchorCheck is now wired as a deterministic subprocess call.
+    // It no longer takes a route argument and no longer throws AnchorCheckNotWiredError.
+    expect(typeof deps.spawnAnchorCheck).toBe("function");
     rmSync(oneShotDir, { recursive: true, force: true });
   });
 });

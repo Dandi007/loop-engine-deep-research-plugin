@@ -1,64 +1,79 @@
-# G4a(v2) —— `--question` 生产贯通：第五次「组件支持、生产不传」
+# G4b(v2) —— 终态贯通：生产 `--run` 从不计算终止判定，「正常收敛」当前**不可达**
 
-> 派发方：`line-deep-research`（deep-research V2 收尾线）。**这是一个已核实的生产接线缺陷，不是加功能。**
-> 前置已合入 main `501db99`。
+> 派发方：`line-deep-research`（deep-research V2 收尾线）。**这是已核实的生产缺陷，不是加功能。**
+> 前置已合入 main `70898c4`（G4a(v2) `--question` 贯通已完成）。
 >
-> ⚠️ **这是重开包。上一个 development（`dev_ledr_g4a_question_wiring_01`，PR #33）被派发方主动取消，
-> 原因是我在 spec 里写了一条自指、逻辑上不可满足的要求，导致无限 rework。功能实现当时已被评审判定正确。
-> 详见 §6 —— 那一节写明了「上一轮已被验证正确的做法」，请照它做，别重新发明。**
+> ⚠️ **这是重开包。** 上一个 development（`dev_ledr_g4b_termination_wiring_01`，PR #35）被派发方取消，
+> 原因**与 spec 和实现都无关**：implementer 首选档持续 60s 首包超时（100 分钟内 55 次，约 5.4 分钟/step，
+> 只推进到 step=71 远未收敛）。attempt-context v1 的 `reconfigure` 与 `steer` 在 IMPLEMENTING 均 409（已实测），
+> 无法在飞换档，故取消重开并把 implementer 钉到实测健康的备用档。**spec 内容与上一轮逐字相同。**
 
 ---
 
-## 0　已核实的现状（全部 grep 到行号，不是推断）
+## 0　两条已核实的事实（grep 到行号，非推断）
 
-| 位置 | 事实 |
-|---|---|
-| `src/tick-run.ts:1279` | `parseRunCliArgs` **确实解析** `--question` |
-| `src/tick-entry.ts:41,50` | usage 里**确实写了** `--question <研究主问题>` |
-| `src/tick-run.ts:674-678` | triage 分支：`deps.readQuestion` 不存在 ⇒ **抛 `MissingTriageQuestionError`** |
-| `workflows/deep-research/tick/templates/tick.md:26,28,30,32` | **四个分支一个都没带 `--question`** |
-| `bin/deep-research-loop.sh` | `grep -n question` **零命中** |
-| `workflows/deep-research/fleet.yaml.tpl` | `grep -n question` **零命中** |
+### 0.1 生产 `--run` 路径**从不调用** `decideTermination`
 
-⇒ **CLI 支持它、引擎依赖它、生产从不传它。**
+```
+grep -n "termination" src/tick-run.ts   →   零命中
+```
 
-### 后果：收集段会在第一个 triage 决策上响亮失败
+`decideTermination`（`src/tick.ts:359`）的调用者只有两处，**都不是生产写路径**：
+- `src/tick-entry.ts:73` —— `--selfcheck`（空板面自检）
+- `src/tick-inspect.ts:112` —— `--inspect`（只读观察）
 
-`tick-run.ts:242` 的错误消息原文：
-> `G2b: triage decision present but no question source wired (provide readQuestion / --question). Refusing to dispatch a triage with an empty question.`
+⇒ **生产每个 tick 只做「决策 → 执行 → 报 `hasPendingWork`」，从不判断研究是否结束。**
 
-⚠️ **G2b 把响亮失败做对了**（不静默用空 question 派发），但它意味着
-**V2 端到端一旦跑到 triage 就停**。本包是 Phase 6 的必要前置。
+### 0.2 ⛔ 更硬的一条：`zeroGrowthRounds` **没有任何跨 tick 持久化**，导致「正常收敛」永不可达
+
+三个调用点**全部硬编码 `prevCoverage: 0, prevZeroGrowthRounds: 0`**
+（`tick-entry.ts:74-75`、`tick-inspect.ts:113-114`）。
+
+代入 `tick.ts:362-363`：
+
+```ts
+const zeroGrowthRounds = coverage > input.prevCoverage ? 0 : input.prevZeroGrowthRounds + 1;
+//                                    ^^^ 恒为 0                        ^^^ 恒为 0
+```
+
+⇒ `zeroGrowthRounds` **恒为 0 或 1**，而阈值 `zeroGrowthThreshold = 2`（`tick.ts:88`）
+⇒ **条件 1（正常收敛）永远不成立**，唯一可达终态是 `capped`（触顶）。
+
+> ⛔ 这正是 `spec` §3.4 明令要区分的两件事：**因触顶而停 ≠ 收敛**。
+> 现状下**每一次研究的终态都只能是触顶**，报告的完备性主张随之失真。
+> G2b 修掉了「proposed 永不被裁走」那一半；**这一半（计数器无记忆）还在。**
 
 ---
 
 ## 1　要做什么
 
-**把「研究主问题」从部署配置一路贯通到 `tick-entry --run --question`。**
+### 1.1 生产 `--run` 必须计算并返回终止判定
 
-```
-bin/deep-research-loop.sh  (export)
-  → workflows/deep-research/fleet.yaml.tpl  (pipeline input 占位符)
-    → workflows/deep-research/tick/workflow.yaml  (payload)
-      → workflows/deep-research/tick/templates/tick.md  ({{…}} 变量)
-        → "$tick_entry" --run <channel> … --question "<研究主问题>"
-```
+`runChannelWrite` 在执行完本轮决策后，**用本轮真实板面**调用 `decideTermination`，
+并把 `TerminationState` 放进 `--run` 的 JSON 输出（与既有 `hasPendingWork` 并列）。
 
-`MAX_WRITES` 已经走通同一条链（`bin:101`、`fleet.yaml.tpl:12`、`tick.md:19`、`tick.md:26/28/30/32`）——**读它们，照它们的形状接。**
+⛔ **不得新造一套判定逻辑**：`decideTermination` / `computeCoverage` 是已交付的纯函数，**调用它们**。
 
-### 1.1 ⛔ 无内置缺省，未配置即响亮失败
+### 1.2 ⛔ `prevCoverage` / `prevZeroGrowthRounds` 必须跨 tick 传递
 
-与 `TICK_CHANNEL`（D1 已确立）、`EVIDENCE_CHANNEL`（设计如此）对齐：
-**研究主问题不得有内置缺省值**，未由 profile 或显式 env 提供 ⇒ **响亮失败拒绝启动**，理由写进错误消息。
+**走已经铺好的 trigger body 通道，不要新造存储：**
 
-> **判据**：一个编出来的缺省问题会让整场研究跑偏，而 bus 写入 append-only 不可回退。
-> ⛔ **尤其不得**从 channel 名、topic slug 或任何其它字段**推导**出问题字符串。
+| 位置 | 现状 |
+|---|---|
+| `workflows/deep-research/fleet.yaml.tpl:27-28` | `claim.bind` 已把 `trigger_id: id` / **`trigger_body: body`** 绑进 pipeline input |
+| `tick.md:46` | 续投时写死 `"body":{"tick":true}` —— **body 是可用载体，但当前只放了一个常量** |
+| `tick.md` | **从不读 `{{trigger_body}}`** —— 载体已通，两端都没接 |
 
-### 1.2 ⛔ 不得把 `tick.md` 的分支数再翻一倍
+⇒ 续投时把本轮的 `{coverage, zeroGrowthRounds}` 写进下一条 trigger 的 body；
+下一轮 tick 读回来，作为 `prevCoverage` / `prevZeroGrowthRounds` 传给 `decideTermination`。
 
-`tick.md:25-33` 现在是 `evidence_channel × allowed_root` 的 **4 分支组合树**，再加一个可选参数会变 8，下一个变 16。
-⇒ **改成增量拼 argv**（数组累加后一次调用）。
-⚠️ `set -euo pipefail` 下注意数组展开与空值；**`run_output` 的捕获与后续 `hasPendingWork` 判定逐字不变**（A9 续投逻辑，本包不碰）。
+⛔ **首轮无前值** ⇒ 用 `0 / 0`（与现状一致，且首轮本来就不该收敛）。
+⛔ **body 解析失败 / 字段缺失** ⇒ **响亮失败**，不得静默回落到 `0 / 0`
+（静默回落 = 计数器被无声重置 = 本缺陷原样复发，而且更难查）。
+
+### 1.3 显式不做：不要在这里触发生成段
+
+`decideGenerate` 的接线归 **G4c**。本包只让**终态本身可算、可达、可观察**。
 
 ---
 
@@ -66,17 +81,15 @@ bin/deep-research-loop.sh  (export)
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **Q1** | 从生产入口渲染：只设 profile/env、跑 `--dry-run`，fleet 的 tick pipeline input 里**有 question 字段且等于配置值** | 解析渲染出的 YAML |
-| **Q2** | ⛔ **真正的贯通断言**：渲染出的 `tick.md` + **假 `tick-entry` 记录 argv**，断言 `--question` **及其值**真的出现在 argv 里 | 照 `test/a10c-writebudget.test.ts` 里 `--max-writes` 那条的做法。⛔ 只断言「fleet input 里有 question」**不算数**——那是 Q1，两者必须都有 |
-| **Q3** | ⛔ **无内置缺省**：不设任何相关 env 且无 profile ⇒ **非零退出且错误消息点名该变量**；且**不得**出现被推导/编造的问题字符串 | 正反两例 |
-| **Q4** | ⛔ **组合矩阵**：`evidence_channel` / `allowed_root` / `question` 三者「有/无」的**全部 8 种组合**下，argv 都只含该有的参数、不含不该有的 | 参数化用例；同时证明 §1.2 的重构没漏分支 |
-| **Q5** | ⭐ **可达性判据说明**（不是额外用例）：证据必须是「从生产入口到达 `tick-entry`」，**「模块支持」「渲染里有值」都不构成可达性证据** | 见 Q2 |
-| **Q6** | 全量 `npx vitest run` 全绿，文件数/用例数**不少于基线 19 / 348** | 贴输出 |
-| **Q7** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **Q8** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明（本包要重写 `tick.md` 的分支树，属必要） | — |
-
-> ⭐ **本包的存在理由是 Q2**：`--question` 已被 CLI 解析、被 usage 记录、被引擎依赖，**唯独没有人传它**。
-> ⛔ 任何只验「CLI 支持」「input 里有值」的检查都复现不了这个缺陷。
+| **R1** | ⛔ **可达性**：存在一条从**生产入口**（`tick-entry --run`）出发的用例，其 JSON 输出里含 `termination`；⛔ 只验 `--selfcheck`/`--inspect` **不算数**（那两条本来就有） | 读用例到行号 |
+| **R2** | ⭐ **「正常收敛」可达**：构造连续多轮零增长，断言 `zeroGrowthRounds` **能长到 ≥ 2** 且 `state === "converged"`。⛔ 这条在改动前**必然挂**——它是本包的存在理由 | 多轮驱动用例 |
+| **R3** | ⛔ **判别性**：同样多轮但**覆盖度有增长** ⇒ `zeroGrowthRounds` 被重置、**不得**收敛 | 反例（一个永远收敛的检查等于没有检查） |
+| **R4** | **跨 tick 传递真的经过 trigger body**：断言续投写出的 trigger body 里含本轮的 `coverage` / `zeroGrowthRounds`，且下一轮从 `{{trigger_body}}` 读回 | 两端各一条；⛔ 只断言「函数收了参数」不算数 |
+| **R5** | ⛔ **body 缺失/损坏 ⇒ 响亮失败**，不得静默回落 `0/0` | 正反两例 |
+| **R6** | `capped` 与 `converged` **仍然可区分**：触顶路径产出 `capped`，零增长路径产出 `converged` | 各一条 |
+| **R7** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4a 合入后的 main 实测为准，请自己先跑一次记下来）** | 贴基线与终值两次输出 |
+| **R8** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **R9** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明 | — |
 
 ---
 
@@ -84,9 +97,9 @@ bin/deep-research-loop.sh  (export)
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **P1** | 生产 `tick.md` 里去掉 `--question` 传参（其余不动） | **Q2 必须挂**；⛔ **Q1 应当仍绿** —— 这正是本包要证明的：Q1 单独存在时是零功率的 |
-| **P2** | 给研究主问题编一个内置缺省值 | **Q3 的失败侧必须挂** |
-| **P3** | 只在 `evidence_channel` 与 `allowed_root` 都有的那一支传 `--question`，其余支不传 | **Q4 必须挂**（「组合分支漏一支」的真实形态） |
+| **S1** | 把跨 tick 传递去掉，`prevZeroGrowthRounds` 恒传 `0`（= 回到改动前） | **R2 必须挂**；⛔ 杀不掉即判 R2 零功率、必须重写 |
+| **S2** | 让 body 缺失时静默回落 `0/0`（去掉响亮失败） | **R5 的失败侧必须挂** |
+| **S3** | 让 `coverage` 增长时**不**重置 `zeroGrowthRounds`（照单 +1） | **R3 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
@@ -97,71 +110,24 @@ bin/deep-research-loop.sh  (export)
 
 | 不做 | 理由 |
 |---|---|
-| 终态贯通（生产 `--run` 计算 `decideTermination`、跨 tick 计数器） | 归 **G4b** |
-| 接生成段（`decideGenerate` → `runGenerate`） | 归 **G4c** |
+| 触发生成段（`decideGenerate` → `runGenerate`） | 归 **G4c** |
 | 接导出 / anchor-check | 归 **G4d** |
 | 播种入口 | 归 **G4e** |
-| 改 `profiles/deploy/*.env` 的 channel 取值 | 归 **D2**（那两个 channel 当前在 bus 上不存在，由派发方处置）。本包**只加该变量的键** |
+| 改 `profiles/deploy/*.env` 的 channel 取值 | 归 **D2** |
+| 改 `decideTermination` / `computeCoverage` 的判定语义 | 它们是已交付的纯函数，本包只**接线与持久化**，不改判定 |
 | 注册任何 bus 协议 | 不可逆，走公示流程 |
 | 改 `agent-runtime` | 不同仓 |
-| 动 A9 续投逻辑 / `hasPendingWork` 判定 | 本包只加一个参数的贯通，不碰控制流 |
-| 端到端真跑真 bus | 归 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 5　⛔ 关于 dev-note 的要求（**上一轮我把这条写错了，以本节为准**）
+## 5　交付物落点
 
-**上一轮 spec 的原话**是「dev-note 的 `input_commit` 必须等于最终交付 commit」。
-**这条要求是自指的、逻辑上不可满足**：note 本身就是交付 commit 的一部分，
-note 里不可能记录包含它自己的那个 commit 的 hash。每更新一次 note 就产生一个新 commit，note 又「过期」。
-上一轮 continuous review 据此连续 REJECT，而它自己的评语写着
-「The functional wiring is correct and complete against §1/§2」。**这是我的 spec 缺陷，不是实现方的问题。**
+- 实现：`src/tick-run.ts`（`--run` 计算终态 + 读写跨 tick 计数）、
+  `workflows/deep-research/tick/templates/tick.md`（读 `{{trigger_body}}` + 续投写计数）、
+  必要时 `workflows/deep-research/fleet.yaml.tpl`
+- 测试：`test/g4b-termination-wiring.test.ts`（R1–R6）
+- 证据：`docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`（R1–R9 逐条 + §3 变异三行 + 还原证据）
 
-**更正后的唯一判据**：
-
-1. dev-note 的 `input_commit` 字段记录**本次 implement attempt 的 input_commit**（dd 交给你的那个）——
-   这本来就是该字段的语义，**不要去追交付 commit**。
-2. 真正要保证的是：**note 的正文描述交付物本身** —— 测试文件数/用例数、变异矩阵各行的实测结果、
-   最终代码的行为，必须与最终交付一致。**若中途 rework 改了实现，note 正文的数字与结论必须同步更新。**
-3. ⛔ **不要为对齐 commit hash 做任何额外提交。**
-
-> 这条的来历：派发方在 D1 上实测到「note 停在 attempt 1，写 347 tests 而实际 348、变异按 14 用例测而实际 15、
-> rework 修的四件事一个字没记」。**真正的病是「证据文档描述的不是交付物」，不是 hash 对不上。**
-
----
-
-## 6　上一轮已被评审判定正确的做法（照做，别重新发明）
-
-上一个 development 的实现被 continuous review 逐条确认「correct and complete against §1/§2」。
-以下是它的形状，**请照此实现**（代码不在本 H0 里，需要你自己写）：
-
-- **`bin/deep-research-loop.sh`**：在 `TICK_CHANNEL` 响亮失败块之后，加
-  `export RESEARCH_QUESTION="${RESEARCH_QUESTION:-}"` + 空值响亮失败（exit 3，错误消息点名 `RESEARCH_QUESTION`
-  并说明「编造或推导的缺省会让整场研究跑偏，且 bus 写入不可回退」）。
-- **`fleet.yaml.tpl`**：pipeline input 加 `research_question: ${RESEARCH_QUESTION}`（与 `max_writes` 同级）。
-- **`tick/workflow.yaml`**：把该字段接进 payload。
-- **`tick.md`**：加 `research_question="{{research_question}}"`；把 4 分支组合树换成
-  ```bash
-  tick_args=("$tick_entry" --run "$tick_channel")
-  [ -n "$evidence_channel" ] && tick_args+=(--evidence-channel "$evidence_channel")
-  [ -n "$allowed_root" ]     && tick_args+=(--allowed-root "$allowed_root")
-  tick_args+=(--max-writes "$max_writes")
-  [ -n "$research_question" ] && tick_args+=(--question "$research_question")
-  run_output="$("${tick_args[@]}")"
-  ```
-  ⚠️ 注意 `set -e` 下 `[ … ] && …` 作为**语句**在条件为假时返回非零会终止脚本 —— 上一轮用的是 `if` 块，**照 `if` 块写**。
-- **`profiles/deploy/{production,local}.env`**：**只加该变量的键**，channel 取值一字不改。
-- **`test/g4a-question-wiring.test.ts`**：Q1–Q4，其中 **Q2 用假 `tick-entry` 记 argv** 做可达性断言，
-  并含 8 种组合的参数化矩阵。
-
----
-
-## 7　交付物落点
-
-- 实现：`bin/deep-research-loop.sh`、`workflows/deep-research/fleet.yaml.tpl`、
-  `workflows/deep-research/tick/workflow.yaml`、`workflows/deep-research/tick/templates/tick.md`
-- 配置：`profiles/deploy/*.env`（只加键）
-- 测试：`test/g4a-question-wiring.test.ts`（Q1–Q4）
-- 证据：`docs/dev-notes/dev_ledr_g4a2_question_wiring_01.md`（Q1–Q8 逐条 + §3 变异矩阵三行 + 还原证据），
-  **按 §5 的更正后要求写**。
+> ⚠️ **dev-note 的 `input_commit` 必须等于最终交付 commit**；中途 rework 则 note 必须同步更新。
+> 派发方在 D1 上实测到「note 停在 attempt 1、数字与交付物对不上」，gate 会核对这一项。

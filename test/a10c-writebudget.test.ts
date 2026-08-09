@@ -96,9 +96,10 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     const argvLog = join(dir, "tick-entry.argv.log");
     const tickEntry = join(dir, "tick-entry");
     // 假 tick-entry：把 argv 逐行写进日志，并回显 hasPendingWork=false（无需续投/runner）。
+    // G4b —— 输出含 termination（tick.md 续投时提取；此处 hasPendingWork=false 不触发，但保持形状一致）。
     writeFileSync(
       tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": []}'\n`,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
     );
     chmodSync(tickEntry, 0o755);
 
@@ -107,6 +108,7 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
       tick_entry: tickEntry,
       tick_channel: "research:v1-tick-reclaim.index",
       max_writes: "64",
+      trigger_body: '{"coverage":0,"zeroGrowthRounds":0}',
     };
     const script = tpl.replace(/\{\{([a-z_]+)\}\}/g, (_m, key) => values[key] ?? "");
     const outShell = join(dir, "tick.sh");

@@ -277,6 +277,41 @@ export async function readWorkerResult(
 }
 
 /**
+ * G4c —— 从已读的消息数组里，按 run_id 找该 run 的 `dr-doc.result.v1`。
+ * 与 `findWorkerResult` 同构，但过滤 `kind === "dr-doc.result.v1"`。
+ * 取 payload.run_id 匹配的**最后一条**（同 run 后发覆盖先发）。找不到 ⇒ 返回 null。
+ */
+export function findGenerateResult(
+  runId: string,
+  messages: InspectMessage[],
+): { body: string } | null {
+  let found: { body: string } | null = null;
+  for (const msg of messages) {
+    if (msg.kind !== "dr-doc.result.v1") continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id !== runId) continue;
+    if (typeof payload.body === "string") {
+      found = { body: payload.body };
+    }
+  }
+  return found;
+}
+
+/**
+ * G4c —— 按 run_id 读该 run 的 `dr-doc.result.v1`（生成角色结果回读）。
+ * ⛔ 每次重新分页读 channel（不复用 spawn 前的快照）——spawn 是异步的，
+ *    结果不会立刻在 channel 上，且 `runId` 是 spawn 时才生成的，
+ *    用 spawn 前读的快照确定性落空。
+ */
+export async function readGenerateResult(
+  runId: string,
+  channelId = "board:agent-runs",
+): Promise<{ body: string } | null> {
+  const messages = await readChannelMessages(channelId);
+  return findGenerateResult(runId, messages);
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

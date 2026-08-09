@@ -327,9 +327,10 @@ export interface GenerateDeps {
   spawnRuntime?: GenerateSpawnRuntime;
   /** anchor-check：返回缺陷数与核验率（核验率用于报告头部标注，软闸门 <90% 不阻断导出）。 */
   spawnAnchorCheck(route: string): Promise<{ defects: number; verificationRate: number }>;
-  spawnExport(body: string): Promise<void>;
-  /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。 */
-  writeDoc(doc: DocV2, idempotencyKey: string): Promise<void>;
+  spawnExport(body: string, sourceMessageId: string): Promise<void>;
+  /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。
+   *  返回发布出的 message_id。 */
+  writeDoc(doc: DocV2, idempotencyKey: string): Promise<string>;
   /**
    * 单例 lock：串行化（wait-then-run），而不是拿不到就跳过。
    * 返回一个 release 函数；调用方拿到锁后必须跑 synthesizer，再释放。
@@ -425,11 +426,11 @@ export async function runGenerate(
   const reportBody = renderReportHead(marker, anchorRate) + synthBody;
 
   // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
-  await deps.writeDoc(
+  const synthDocMessageId = await deps.writeDoc(
     buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
     `dr-doc:${cfg.synthesizer.role}:${origin}`,
   );
 
-  // 导出：最后（D8）。
-  await deps.spawnExport(reportBody);
+  // 导出：最后（D8），带 source_message_id。
+  await deps.spawnExport(reportBody, synthDocMessageId);
 }

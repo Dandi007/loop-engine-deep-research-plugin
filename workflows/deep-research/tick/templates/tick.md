@@ -24,6 +24,8 @@ evidence_channel="{{evidence_channel}}"
 allowed_root="{{allowed_root}}"
 max_writes="{{max_writes}}"
 research_question="{{research_question}}"
+research_origin="{{research_origin}}"
+doc_channel="{{doc_channel}}"
 trigger_store_dir="{{trigger_store_dir}}"
 loop_store_cli="{{loop_store_cli}}"
 loop_engine_runner="{{loop_engine_runner}}"
@@ -47,6 +49,9 @@ if [ -n "$tick_channel" ]; then
   if [ -n "$allowed_root" ]; then tick_args+=(--allowed-root "$allowed_root"); fi
   tick_args+=(--max-writes "$max_writes")
   if [ -n "$research_question" ]; then tick_args+=(--question "$research_question"); fi
+  # G4c —— research origin 与 doc channel 可选注入 tick-entry --run。
+  if [ -n "$research_origin" ]; then tick_args+=(--origin "$research_origin"); fi
+  if [ -n "$doc_channel" ]; then tick_args+=(--doc-channel "$doc_channel"); fi
   # G4b —— 从 trigger_body 解析上一轮的 coverage / zeroGrowthRounds 并传给 tick-entry。
   #   ⛔ body 一旦非空就必须是合法 JSON。首轮判定基于 **seed 标记**（{"seed":true}）：
   #      seed body ⇒ 不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。

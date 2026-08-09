@@ -113,6 +113,14 @@ export MAX_WRITES="${MAX_WRITES:-64}"
 # D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
 # 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
 export EXPORT_ROOT="${EXPORT_ROOT:-}"
+# G4c —— 研究 origin（report 的 origin 字段）：从 pipeline input namespace 注入 tick.md 供 `--run --origin` 使用。
+# 可用 RESEARCH_ORIGIN 覆盖。⛔ 无内置缺省：编造的 origin 会让整场研究报告的溯源信息出错，
+# 且 bus 写入 append-only 不可回退。未配置时留空，tick.md 不传 --origin ⇒ 生成段不执行。
+export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
+# G4c —— doc channel（research.doc.v2 发布 channel）：从 pipeline input namespace 注入 tick.md 供 `--run --doc-channel` 使用。
+# 可用 DOC_CHANNEL 覆盖。⛔ 无内置缺省：不得静默回退到板 channel（research.doc.v2 发进 clue 板是 append-only
+# 不可回退的错误落点）。未配置时留空，tick.md 不传 --doc-channel ⇒ writeDoc 抛 MissingDocChannelError。
+export DOC_CHANNEL="${DOC_CHANNEL:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

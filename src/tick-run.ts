@@ -13,12 +13,12 @@
  * ⛔ 只对显式传入的 channel 操作（M11）；拒绝写 v1 冻结 channel（M12）。
  * ⛔ CAS 一律走 A8b 的 `realCas`，不得绕过另写 CAS（spec §4.1 纪律 8）。
  */
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync, openSync, closeSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import type { ClueV2 } from "./protocol";
+import type { ClueV2, DocV2 } from "./protocol";
 import {
   decideTick,
   decideTermination,
@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findWorkerResult,
   readChannelMessages,
+  readGenerateResult,
   type InspectMessage,
 } from "./tick-inspect";
 import {
@@ -43,7 +44,18 @@ import {
   type HarvestDeps,
   type HarvestReport,
 } from "./harvest";
-import { casUpdateClue, getEntity, publishClue, publishEvidence } from "./bus";
+import { casUpdateClue, getEntity, publishClue, publishEvidence, publishDoc } from "./bus";
+import {
+  runGenerate,
+  decideGenerate,
+  DEFAULT_GENERATE_CONFIG,
+  spawnGenerateRole,
+  buildReportMarker,
+  type EvidenceView,
+  type GenerateDeps,
+  type GenerateSpawnRuntime,
+} from "./generate";
+import { runExport, type ExportInput } from "./export";
 
 /**
  * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
@@ -321,6 +333,46 @@ export class TriggerBodyTerminationError extends Error {
       `G4b: trigger_body is missing or malformed termination counters (${reason}). Refusing to silently fall back to 0/0 — that would silently reset zeroGrowthRounds and re-introduce the very defect this package fixes. Pass valid {coverage, zeroGrowthRounds} (first tick legitimately uses 0/0, via a {"seed":true} body).`,
     );
     this.name = "TriggerBodyTerminationError";
+  }
+}
+
+/** G4c —— anchor-check 未接线 ⇒ 响亮失败（不得编造核验率、不得静默返回 0）。 */
+export class AnchorCheckNotWiredError extends Error {
+  constructor() {
+    super(
+      "G4c: anchor-check is not wired (reserved for G4d). Refusing to fabricate a verification rate or silently return 0 — 0% and 'unavailable' are distinct.",
+    );
+    this.name = "AnchorCheckNotWiredError";
+  }
+}
+
+/** G4c —— --origin 未配置 ⇒ 响亮失败。 */
+export class MissingOriginError extends Error {
+  constructor() {
+    super(
+      "G4c: --origin is not configured. Refusing to silently skip the generation phase.",
+    );
+    this.name = "MissingOriginError";
+  }
+}
+
+/** G4c —— --doc-channel 未配置 ⇒ 响亮失败。 */
+export class MissingDocChannelError extends Error {
+  constructor() {
+    super(
+      "G4c: --doc-channel is not configured. Refusing to silently default to a board channel.",
+    );
+    this.name = "MissingDocChannelError";
+  }
+}
+
+/** G4c —— EXPORT_ROOT 未配置 ⇒ 响亮失败。 */
+export class MissingExportRootError extends Error {
+  constructor() {
+    super(
+      "G4c: EXPORT_ROOT is not configured. Refusing to silently skip the export.",
+    );
+    this.name = "MissingExportRootError";
   }
 }
 
@@ -939,6 +991,28 @@ export interface RunWriteOptions {
    * 生产由 tick.md 从 `{{trigger_body}}` 解析后以 `--prev-zero-growth` 传入；首轮无前值传 0。
    */
   prevZeroGrowthRounds?: number;
+  /**
+   * G4c —— 研究 origin（report 的 origin 字段；进入 runGenerate 的 readOrigin）。
+   * 生产由 tick.md 从 `{{research_origin}}` 以 `--origin` 传入。
+   * ⛔ 缺失时生成段不执行。
+   */
+  origin?: string;
+  /**
+   * G4c —— doc channel（research.doc.v2 的发布 channel）。
+   * 生产由 tick.md 从 `{{doc_channel}}` 以 `--doc-channel` 传入。
+   * ⛔ 不得静默回退到板 channel（append-only 不可回退）。
+   */
+  docChannelId?: string;
+  /**
+   * G4c —— 一次性标记文件目录（跨进程持久）。
+   * 缺省 `join(tmpdir(), "deep-research-generated")`。
+   */
+  oneShotDir?: string;
+  /**
+   * G4c —— 注入的 generate deps（测试用）；缺省走生产 `assembleGenerateDeps`。
+   * 注入后 `assembleGenerateDeps` 不执行。
+   */
+  generateDeps?: GenerateDeps;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -1184,6 +1258,127 @@ export async function spawnAgentRunWorker(opts: {
 }
 
 /**
+ * G4c —— 组装生成段的生产依赖注入。
+ * 提供 runGenerate 所需的全部副作用（读终态/blocked 计数/question/origin/evidences、
+ * spawnRole/spawnRuntime、anchorCheck/export/writeDoc/lockSynthesizer）。
+ */
+function assembleGenerateDeps(
+  opts: RunWriteOptions,
+  termination: TerminationState,
+  postWriteState: BoardState,
+): GenerateDeps {
+  const synthLockDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
+  return {
+    readTermination: async () => termination,
+    countBlocked: async () =>
+      postWriteState.cards.filter((c) => c.status === "blocked").length,
+    readQuestion: async () => {
+      if (opts.question) return opts.question;
+      throw new Error("G4c: no question configured for the generation phase");
+    },
+    readOrigin: async () => {
+      if (!opts.origin) throw new MissingOriginError();
+      return opts.origin;
+    },
+    readEvidences: async (): Promise<EvidenceView[]> => {
+      if (!opts.evidenceChannelId) return [];
+      const msgs = await readChannelMessages(opts.evidenceChannelId);
+      return msgs
+        .filter((m) => m.kind === "research.evidence.v2")
+        .map((m) => {
+          const p = (m.payload ?? {}) as Record<string, unknown>;
+          return {
+            clue_id: String(p.clue_id ?? ""),
+            anchor: String(p.anchor ?? ""),
+            quote: String(p.quote ?? ""),
+            claim: String(p.claim ?? ""),
+          };
+        });
+    },
+    spawnRole: undefined,
+    spawnRuntime: {
+      agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+      runId: randomUUID(),
+      spawnProcess: async (argv, env) => {
+        await spawnWorkerProcess({
+          cmd: argv[0],
+          args: argv.slice(1),
+          env,
+          onExit: () => {},
+        });
+        return {};
+      },
+      readBody: async (runId: string) => {
+        for (let i = 0; i < 30; i++) {
+          const result = await readGenerateResult(runId);
+          if (result) return result.body;
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        throw new Error(
+          `G4c: timed out waiting for generate result for run ${runId}`,
+        );
+      },
+    },
+    spawnAnchorCheck: async () => {
+      throw new AnchorCheckNotWiredError();
+    },
+    spawnExport: async (reportBody: string, sourceMessageId: string) => {
+      const exportRoot = process.env.EXPORT_ROOT;
+      if (!exportRoot) throw new MissingExportRootError();
+      if (!opts.docChannelId) throw new MissingDocChannelError();
+      const docMessages = await readChannelMessages(opts.docChannelId);
+      const docMsg = docMessages.find((m) => m.message_id === sourceMessageId);
+      if (!docMsg) {
+        throw new Error(
+          `G4c: cannot find doc message ${sourceMessageId} in channel ${opts.docChannelId} for export createdAt`,
+        );
+      }
+      const report: DocV2 = {
+        doc_kind: "report",
+        body: reportBody,
+        digest: createHash("sha256").update(reportBody).digest("hex"),
+        origin: opts.origin!,
+      };
+      const input: ExportInput = {
+        report,
+        sourceMessageId,
+        createdAt: docMsg.created_at,
+        topic: opts.question ?? "untitled",
+      };
+      await runExport(
+        {
+          writeFile: async (path: string, content: string) => {
+            writeFileSync(path, content, "utf8");
+          },
+        },
+        input,
+        exportRoot,
+      );
+    },
+    writeDoc: async (doc, idempotencyKey) => {
+      if (!opts.docChannelId) throw new MissingDocChannelError();
+      const result = await publishDoc(opts.docChannelId, doc, idempotencyKey);
+      return result.message_id;
+    },
+    lockSynthesizer: async () => {
+      mkdirSync(synthLockDir, { recursive: true });
+      const lockPath = join(synthLockDir, "synthesizer.lock");
+      while (true) {
+        try {
+          closeSync(openSync(lockPath, "wx"));
+          break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      return async () => {
+        rmSync(lockPath, { force: true });
+      };
+    },
+  };
+}
+
+/**
  * 完整写侧跑一次：校验 channel（冻结即拒，M12）→ 读板 + 真实 runs → 决策 → 执行写 + spawn。
  * ⛔ CAS 一律走 A8b 的 `realCas`（不得绕过另写 CAS，spec §4.1 纪律 8）。
  * spawn 为真实路径实现：CAS 成功后**缺省走真实 `agent-run`**（spec §1.1，A8d）；
@@ -1354,6 +1549,23 @@ export async function runChannelWrite(
     },
     DEFAULT_TICK_CONFIG,
   );
+
+  // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  if (opts.origin) {
+    if (decideGenerate(termination)) {
+      const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
+      const markerKey = `${opts.origin}:${opts.channelId}`;
+      const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
+      const markerPath = join(oneShotDir, `generated-${markerHash}`);
+      if (!existsSync(markerPath)) {
+        const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
+        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        mkdirSync(oneShotDir, { recursive: true });
+        writeFileSync(markerPath, "");
+      }
+    }
+  }
+
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -1449,6 +1661,12 @@ export interface RunCliOptions {
    * 首轮无前值时不传，runChannelWrite 缺省 0。
    */
   prevZeroGrowthRounds?: number;
+  /** G4c —— 研究 origin（--origin）；进入 runGenerate 的 readOrigin。 */
+  origin?: string;
+  /** G4c —— doc channel（--doc-channel）；research.doc.v2 的发布 channel。 */
+  docChannelId?: string;
+  /** G4c —— 一次性标记文件目录（--one-shot-dir）；跨进程持久。 */
+  oneShotDir?: string;
 }
 
 /**
@@ -1468,6 +1686,9 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let question: string | undefined;
   let prevCoverage: number | undefined;
   let prevZeroGrowthRounds: number | undefined;
+  let origin: string | undefined;
+  let docChannelId: string | undefined;
+  let oneShotDir: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1518,6 +1739,30 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       prevZeroGrowthRounds = value;
       i += 1;
+    } else if (args[i] === "--origin") {
+      origin = args[i + 1];
+      if (!origin) {
+        throw new Error(
+          "G4c: invalid --origin (must specify the research origin).",
+        );
+      }
+      i += 1;
+    } else if (args[i] === "--doc-channel") {
+      docChannelId = args[i + 1];
+      if (!docChannelId) {
+        throw new Error(
+          "G4c: invalid --doc-channel (must specify a doc channel id).",
+        );
+      }
+      i += 1;
+    } else if (args[i] === "--one-shot-dir") {
+      oneShotDir = args[i + 1];
+      if (!oneShotDir) {
+        throw new Error(
+          "G4c: invalid --one-shot-dir (must specify a directory path).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1529,6 +1774,9 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     evidenceChannelId,
     allowedRoot,
     question,
+    origin,
+    docChannelId,
+    oneShotDir,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

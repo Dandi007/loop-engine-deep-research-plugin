@@ -12,6 +12,8 @@
  */
 import type { DocV2 } from "./protocol";
 import { parseReportMarker, renderReportBody } from "./generate";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 /** 一次导出所需的纯数据（spec §2/§4：日期从 report 数据派生，由调用方经参数传入）。 */
 export interface ExportInput {
@@ -81,13 +83,21 @@ export function renderExportContent(input: ExportInput): string {
 /**
  * 执行壳：纯路径 + 纯内容 → 写文件（spec §5.5）。
  * 写入失败 ⇒ 响亮抛错，不得静默吞掉（F13）。
+ * ⛔ 父目录自动创建（mkdirSync recursive），首次真导出必满足。
+ * ⛔ EXPORT_ROOT 未配置 ⇒ 响亮失败。
  */
 export async function runExport(
   deps: ExportDeps,
   input: ExportInput,
   vaultRoot: string,
 ): Promise<string> {
+  if (!vaultRoot) {
+    throw new Error(
+      "EXPORT_ROOT is not configured. Refusing to silently skip the export — the export is a mandatory deliverable.",
+    );
+  }
   const path = deriveExportPath(input, vaultRoot);
+  mkdirSync(dirname(path), { recursive: true });
   const content = renderExportContent(input);
   await deps.writeFile(path, content);
   return path;

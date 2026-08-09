@@ -39,11 +39,14 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
-  ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>]
+... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>]
                      写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
                      G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经
-                            本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；
-                            JSON 输出含 termination（与 hasPendingWork 并列）。
+                             本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；
+                             JSON 输出含 termination（与 hasPendingWork 并列）。
+                     G4c——--origin 与 --doc-channel 由 tick.md 从 {{research_origin}}/{{doc_channel}} 传入；
+                             --origin 已配置且 termination.state !== null ⇒ runGenerate 被调用；
+                             --one-shot-dir 跨进程一次性标记目录（缺省 tmpdir/deep-research-generated）。
   ... --parse-trigger-body <body_json>
                      G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：
                      tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为

@@ -289,7 +289,7 @@ describe("R1: both triage readResult and generate readBody use AGENT_RESULT_TIME
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
         agentRunsReads += 1;
-        return agentRunsReads >= 3
+        return agentRunsReads >= 31
           ? messagesResponse([generateResultMsg(generateRunId, generateBody)])
           : emptyMessagesResponse();
       }
@@ -304,7 +304,7 @@ describe("R1: both triage readResult and generate readBody use AGENT_RESULT_TIME
 
     const body = await deps.spawnRuntime!.readBody(generateRunId);
     expect(body).toBe(generateBody);
-    expect(agentRunsReads).toBeGreaterThanOrEqual(3);
+    expect(agentRunsReads).toBeGreaterThanOrEqual(31);
   });
 });
 
@@ -572,13 +572,20 @@ describe("R4: empty result is NOT treated as read-failure", () => {
 // ─── R5: 不得靠真实等待把用例拖慢 ────────────────────────────────────────────
 
 describe("R5: tests use small poll intervals, not real waits", () => {
-  it("R5: all G6 tests use AGENT_RESULT_POLL_MS ≤ 10ms", () => {
-    // This test verifies the polling interval used in tests is small.
-    // The actual env var is set in beforeEach/afterEach to small values.
-    // The production default is 3000ms, but tests override to 5-10ms.
-    expect(DEFAULT_AGENT_RESULT_POLL_MS).toBe(3000);
-    // The tests above set POLL_ENV to 5 or 10, which is the small value.
-    expect(DEFAULT_AGENT_RESULT_TIMEOUT_MS).toBe(900_000);
+  it("R5: env override AGENT_RESULT_POLL_MS=10 ⇒ resolveAgentResultTimeout returns pollMs ≤ 10", () => {
+    setEnv(POLL_ENV, "10");
+    setEnv(TIMEOUT_ENV, "500");
+    const { pollMs, timeoutMs } = resolveAgentResultTimeout();
+    expect(pollMs).toBeLessThanOrEqual(10);
+    expect(timeoutMs).toBeLessThanOrEqual(500);
+  });
+
+  it("R5: env override AGENT_RESULT_POLL_MS=5 ⇒ resolveAgentResultTimeout returns pollMs ≤ 5", () => {
+    setEnv(POLL_ENV, "5");
+    setEnv(TIMEOUT_ENV, "10");
+    const { pollMs, timeoutMs } = resolveAgentResultTimeout();
+    expect(pollMs).toBeLessThanOrEqual(5);
+    expect(timeoutMs).toBeLessThanOrEqual(10);
   });
 });
 

@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
   resetGeneratedOrigins,
+  clearOneShotMarker,
   MissingExportRootError,
   parseRunCliArgs,
   runChannelWrite,
@@ -117,6 +118,8 @@ describe("U1: reachability — runChannelWrite triggers runGenerate when termina
 
   beforeEach(() => {
     resetGeneratedOrigins();
+    clearOneShotMarker("research-u1-positive");
+    clearOneShotMarker("research-u1-negative");
   });
 
   it("U1 positive: converged board + --origin triggers runGenerate and calls deps", async () => {
@@ -186,6 +189,7 @@ describe("U2: one-shot — same origin triggers generate only once", () => {
 
   beforeEach(() => {
     resetGeneratedOrigins();
+    clearOneShotMarker("research-u2");
   });
 
   it("U2: two runChannelWrite calls with same origin only trigger generate once", async () => {
@@ -287,6 +291,9 @@ describe("U3: source_message_id equals the real report message_id", () => {
 //       EXPORT_ROOT 未配置 ⇒ 响亮失败
 // ════════════════════════════════════════════════════════════════════
 describe("U4: export path under EXPORT_ROOT/DeepThought/<topic-slug>", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
   it("U4: deriveExportPath places the file under DeepThought/<topic-slug>", () => {
     const input: ExportInput = {
       report: { doc_kind: "report", digest: "x", body: "body", origin: "r" },
@@ -314,8 +321,33 @@ describe("U4: export path under EXPORT_ROOT/DeepThought/<topic-slug>", () => {
     expect(b).toContain("/tmp/b");
   });
 
-  it("U4: MissingExportRootError is thrown when EXPORT_ROOT is not set", () => {
-    expect(() => { throw new MissingExportRootError(); }).toThrow(/EXPORT_ROOT/i);
+  it("U4: MissingExportRootError is thrown when EXPORT_ROOT is not set", async () => {
+    clearOneShotMarker("research-u4-negative");
+    const msgs = [clueMsg("c1", { status: "explored" })];
+    stubBoard(U1_CHANNEL, msgs);
+
+    const prevExportRoot = process.env.EXPORT_ROOT;
+    delete process.env.EXPORT_ROOT;
+
+    try {
+      await expect(
+        runChannelWrite({
+          channelId: U1_CHANNEL,
+          origin: "research-u4-negative",
+          question: "test question",
+          prevCoverage: 1,
+          prevZeroGrowthRounds: 2,
+          generateDeps: {
+            spawnRole: vi.fn(async () => ({ body: "test body" })),
+            writeDoc: vi.fn(async () => "msg-test"),
+            lockSynthesizer: async () => async () => {},
+            spawnAnchorCheck: async () => { throw new AnchorCheckNotWiredError(); },
+          },
+        }),
+      ).rejects.toThrow(MissingExportRootError);
+    } finally {
+      if (prevExportRoot) process.env.EXPORT_ROOT = prevExportRoot;
+    }
   });
 
   it("U4: export source does not hardcode vault paths", async () => {

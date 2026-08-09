@@ -91,6 +91,15 @@ if [ -z "$RESEARCH_QUESTION" ]; then
   echo "[deep-research-loop] RESEARCH_QUESTION is not set. Refusing to start: an invented or derived default question would send the whole research astray, and bus writes are append-only (irreversible). Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set RESEARCH_QUESTION explicitly." >&2
   exit 3
 fi
+# G4c —— 研究 origin：生成段产物回写的 origin。取值来源必须显式且稳定（同一次研究的多个 tick
+# 必须得到同一个 origin，否则 writeDoc 的幂等键失效）。可用 RESEARCH_ORIGIN 覆盖；缺省时由
+# RESEARCH_QUESTION 确定性派生（sha256 前 16 位），保证同一 question 多次 tick 得到同一 origin。
+# ⛔ 无内置缺省：编造的 origin 会让 writeDoc 幂等键失效（同一次研究的不同 tick 拿到不同 origin
+#   ⇒ 重复发布 doc），且 bus 写入 append-only 不可回退。
+export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
+if [ -z "$RESEARCH_ORIGIN" ]; then
+  RESEARCH_ORIGIN="dr-$(printf '%s' "$RESEARCH_QUESTION" | sha256sum | cut -c1-16)"
+fi
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
 # ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：

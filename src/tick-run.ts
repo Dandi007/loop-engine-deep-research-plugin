@@ -15,7 +15,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { ClueV2 } from "./protocol";
@@ -355,6 +355,35 @@ const generatedOrigins = new Set<string>();
 /** G4c —— 测试/重置用：清空一次性保证记录。 */
 export function resetGeneratedOrigins(): void {
   generatedOrigins.clear();
+}
+
+/** G4c —— 测试/重置用：清除指定 origin 的跨进程持久标记文件。 */
+export function clearOneShotMarker(origin: string): void {
+  const path = oneShotMarkerPath(origin);
+  if (existsSync(path)) rmSync(path, { force: true });
+}
+
+/**
+ * G4c —— 跨进程持久的一次性保证：基于文件标记。
+ * 内存 Set 覆盖同进程内的重复调用；文件标记覆盖跨 tick（跨进程）的重复调用。
+ * 标记文件路径由 origin 确定性派生（同一 origin ⇒ 同一路径，跨进程共享）。
+ */
+function oneShotMarkerPath(origin: string): string {
+  const safe = origin.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return join(tmpdir(), `g4c-generated-${safe}.marker`);
+}
+
+function hasGeneratedInAnyProcess(origin: string): boolean {
+  if (generatedOrigins.has(origin)) return true;
+  return existsSync(oneShotMarkerPath(origin));
+}
+
+function markGeneratedInAnyProcess(origin: string): void {
+  generatedOrigins.add(origin);
+  const path = oneShotMarkerPath(origin);
+  const dir = join(path, "..");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(path, "1", "utf8");
 }
 
 /**
@@ -986,6 +1015,11 @@ export interface RunWriteOptions {
    * G4c —— 注入的 generate deps（测试用）；缺省走生产接线。
    */
   generateDeps?: Partial<GenerateDeps>;
+  /**
+   * G4c —— doc 发布目标 channel（缺省与 clue board channel 相同）。
+   * 生产应配置为内容 channel（如 research:content），而非 clue board channel。
+   */
+  docChannelId?: string;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -1412,8 +1446,8 @@ export async function runChannelWrite(
   //    但导出与 spawn 的重复执行不受它保护，此处杜绝重复触发）。
   let generateTriggered = false;
   const origin = opts.origin;
-  if (origin && decideGenerate(termination) && !generatedOrigins.has(origin)) {
-    generatedOrigins.add(origin);
+  if (origin && decideGenerate(termination) && !hasGeneratedInAnyProcess(origin)) {
+    markGeneratedInAnyProcess(origin);
     generateTriggered = true;
     const cfg = opts.generateConfig ?? DEFAULT_GENERATE_CONFIG;
     const blockCount = postWriteState.cards.filter((c) => c.status === "blocked").length;
@@ -1471,14 +1505,14 @@ export async function runChannelWrite(
             topic: question,
           };
           await runExport(
-            { writeFile: async (path, content) => { const { writeFileSync } = await import("node:fs"); writeFileSync(path, content, "utf8"); } },
+            { writeFile: async (path, content) => { const { writeFileSync } = await import("node:fs"); const { mkdirSync } = await import("node:fs"); const { dirname } = await import("node:path"); mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, content, "utf8"); } },
             input,
             exportRoot,
           );
         }),
       writeDoc: opts.generateDeps?.writeDoc ??
         (async (doc, key) => {
-          const channelId = opts.channelId;
+          const channelId = opts.docChannelId ?? opts.channelId;
           const resp = await publishDoc(channelId, doc, key);
           return resp.message_id;
         }),
@@ -1614,6 +1648,8 @@ export interface RunCliOptions {
   prevZeroGrowthRounds?: number;
   /** G4c——本次研究 id（--origin）；生成段产物回写的 origin。 */
   origin?: string;
+  /** G4c——doc 发布目标 channel（--doc-channel）；缺省与 clue board channel 相同。 */
+  docChannelId?: string;
 }
 
 /**
@@ -1634,6 +1670,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let prevCoverage: number | undefined;
   let prevZeroGrowthRounds: number | undefined;
   let origin: string | undefined;
+  let docChannelId: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1692,6 +1729,14 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
         );
       }
       i += 1;
+    } else if (args[i] === "--doc-channel") {
+      docChannelId = args[i + 1];
+      if (!docChannelId) {
+        throw new Error(
+          "G4c: invalid --doc-channel (must specify a channel id).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1709,5 +1754,6 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   if (prevZeroGrowthRounds !== undefined)
     result.prevZeroGrowthRounds = prevZeroGrowthRounds;
   if (origin !== undefined) result.origin = origin;
+  if (docChannelId !== undefined) result.docChannelId = docChannelId;
   return result;
 }

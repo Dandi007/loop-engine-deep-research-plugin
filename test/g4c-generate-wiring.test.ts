@@ -610,11 +610,52 @@ describe("G4c U5: export path + EXPORT_ROOT check", () => {
   });
 });
 
-describe("G4c U6: createdAt from bus created_at, no new Date() fallback", () => {
-  it("export reads createdAt from bus message, not system clock", () => {
-    const exportCode = readFileSync(join(ROOT, "src", "export.ts"), "utf8");
-    expect(exportCode).not.toMatch(/new Date\(\)/);
-    expect(exportCode).not.toMatch(/\?\?.*new Date/);
+describe("G4c U6: spawnExport throws when sourceMessageId is absent from doc channel", () => {
+  it("production assembleGenerateDeps spawnExport throws when doc message not found (no new Date() fallback)", async () => {
+    const card = clueMsg("c1", { status: "explored" }, 1);
+    const otherDocMsg: InspectMessage = {
+      message_id: "msg-other-99",
+      channel_id: "research:doc",
+      channel_seq: 1,
+      kind: "research.doc.v2",
+      payload: { doc_kind: "report", body: "other", digest: "abc", origin: "test-origin" },
+      entity_id: "doc-other",
+      supersedes: null,
+      created_at: "2026-08-01T00:00:00Z",
+    };
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse([card, otherDocMsg]);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const exportRoot = join(tmpdir(), `g4c-u6-export-${Math.random().toString(36).slice(2)}`);
+    process.env.EXPORT_ROOT = exportRoot;
+    const oneShotDir = uniqueOneShotDir("u6-prod");
+
+    const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
+    const deps = assembleGenerateDeps(
+      {
+        channelId: CHANNEL,
+        origin: "test-origin",
+        docChannelId: "research:doc",
+        question: "test question",
+        oneShotDir,
+      },
+      term(),
+      postWriteState,
+    );
+
+    try {
+      await expect(
+        deps.spawnExport("report body", "msg-nonexistent-007"),
+      ).rejects.toThrow(/cannot find doc message/);
+    } finally {
+      delete process.env.EXPORT_ROOT;
+      if (existsSync(exportRoot)) rmSync(exportRoot, { recursive: true, force: true });
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
   });
 });
 

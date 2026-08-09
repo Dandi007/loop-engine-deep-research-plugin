@@ -684,7 +684,7 @@ describe("R8 (attempt 2 major): coverage reads the separate production evidence 
   it("evidence on a distinct evidence channel drives coverage (>0) and resets zeroGrowthRounds on growth", async () => {
     // 板 channel：1 张 explored 卡（无 evidence）。evidence channel：1 条覆盖它的 evidence。
     // 生产拓扑：板 channel ≠ evidence channel。改动前只读板 channel ⇒ coverage=0。
-    const EVIDENCE_CHANNEL = "research:v1-deep-research.evidence";
+    const EVIDENCE_CHANNEL = "research:agent-harness.evidence";
     const boardMsgs: InspectMessage[] = [
       clueMsg("c1", { status: "explored" }, 1),
     ];

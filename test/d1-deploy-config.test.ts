@@ -98,11 +98,11 @@ describe("E1: TICK_CHANNEL default is a loud failure, not the smoke channel", ()
 
   it("with a profile ⇒ renders normally (exit 0, valid YAML)", () => {
     const childEnv = cleanChildEnv();
-    childEnv.DEPLOY_PROFILE = "production";
+    childEnv.DEPLOY_PROFILE = "agent-harness";
     const res = render(childEnv);
     expect(res.code).toBe(0);
     const input = tickInput(res.out);
-    expect(input.tick_channel).toBe(readProfile("production").TICK_CHANNEL);
+    expect(input.tick_channel).toBe(readProfile("agent-harness").TICK_CHANNEL);
   });
 
   it("--profile with a missing operand fails loudly instead of degrading silently", () => {
@@ -141,10 +141,10 @@ describe("E2: research:p02-smoke-1dce60 absent from bin/ and src/", () => {
 
 // ── E3：从 profile 出发的端到端渲染断言 ───────────────────────────────
 
-describe("E3: from profile, dry-run renders all four input fields equal to profile values", () => {
-  it("only DEPLOY_PROFILE set (child env proven free of the four env) ⇒ all four equal profile", () => {
+describe("E3: from profile, dry-run renders all five input fields equal to profile values", () => {
+  it("only DEPLOY_PROFILE set (child env proven free of the five env) ⇒ all five equal profile", () => {
     const childEnv = cleanChildEnv();
-    childEnv.DEPLOY_PROFILE = "production";
+    childEnv.DEPLOY_PROFILE = "agent-harness";
     // ⛔ 照 G1 D1b：自证子环境里没有那些 env，否则会重蹈「声称删了、实际没删 ⇒ 恒绿」。
     for (const k of RELEVANT_ENV) {
       expect(childEnv).not.toHaveProperty(k);
@@ -152,11 +152,12 @@ describe("E3: from profile, dry-run renders all four input fields equal to profi
     const res = render(childEnv);
     expect(res.code).toBe(0);
     const input = tickInput(res.out);
-    const prof = readProfile("production");
+    const prof = readProfile("agent-harness");
     expect(input.tick_channel).toBe(prof.TICK_CHANNEL);
     expect(input.evidence_channel).toBe(prof.EVIDENCE_CHANNEL);
     expect(input.allowed_root).toBe(prof.ALLOWED_ROOT);
     expect(input.max_writes).toBe(Number(prof.MAX_WRITES));
+    expect(input.research_question).toBe(prof.RESEARCH_QUESTION);
   });
 });
 
@@ -165,7 +166,7 @@ describe("E3: from profile, dry-run renders all four input fields equal to profi
 describe("E4: precedence explicit env > profile > built-in default", () => {
   it("explicit env beats profile", () => {
     const childEnv = cleanChildEnv();
-    childEnv.DEPLOY_PROFILE = "production";
+    childEnv.DEPLOY_PROFILE = "agent-harness";
     childEnv.TICK_CHANNEL = "research:explicit-wins.index";
     const input = tickInput(render(childEnv).out);
     expect(input.tick_channel).toBe("research:explicit-wins.index");
@@ -173,9 +174,9 @@ describe("E4: precedence explicit env > profile > built-in default", () => {
 
   it("profile beats built-in default", () => {
     const childEnv = cleanChildEnv();
-    childEnv.DEPLOY_PROFILE = "production";
+    childEnv.DEPLOY_PROFILE = "agent-harness";
     const input = tickInput(render(childEnv).out);
-    expect(input.tick_channel).toBe(readProfile("production").TICK_CHANNEL);
+    expect(input.tick_channel).toBe(readProfile("agent-harness").TICK_CHANNEL);
   });
 
   it("built-in default used when neither profile nor explicit env supplies the value", () => {
@@ -218,7 +219,7 @@ describe("E5: EVIDENCE_CHANNEL keeps no default; downstream loud failure preserv
 
 describe("E6: export root is config-driven; content carries source_message_id + terminal marker", () => {
   it("profile carries an export root and export.ts is parameterized (no hardcoded vault path)", () => {
-    const prof = readProfile("production");
+    const prof = readProfile("agent-harness");
     expect(prof.EXPORT_ROOT).toBeTruthy();
     const src = readFileSync(join(ROOT, "src", "export.ts"), "utf8");
     // 落点根是参数（vaultRoot），不是源码里写死的绝对路径。

@@ -754,13 +754,13 @@ esac
 
     const values: Record<string, string> = {
       tick_entry: tickEntry,
-      tick_channel: "research:v1-deep-research.index",
-      evidence_channel: "research:v1-deep-research.evidence",
+      tick_channel: "research:agent-harness.index",
+      evidence_channel: "research:agent-harness.evidence",
       allowed_root: "",
       max_writes: "64",
       research_question: "",
       research_origin: "g4c-test-origin",
-      doc_channel: "research:v1-deep-research.content",
+      doc_channel: "research:agent-harness.docs",
       trigger_store_dir: dir,
       loop_store_cli: join(dir, "loop-store"),
       loop_engine_runner: "bash",
@@ -785,7 +785,7 @@ esac
 
     expect(argv).toContain("--doc-channel");
     const docChannelIdx = argv.indexOf("--doc-channel");
-    expect(argv[docChannelIdx + 1]).toBe("research:v1-deep-research.content");
+    expect(argv[docChannelIdx + 1]).toBe("research:agent-harness.docs");
 
     rmSync(dir, { recursive: true, force: true });
   });
@@ -807,7 +807,7 @@ esac
 
     const values: Record<string, string> = {
       tick_entry: tickEntry,
-      tick_channel: "research:v1-deep-research.index",
+      tick_channel: "research:agent-harness.index",
       evidence_channel: "",
       allowed_root: "",
       max_writes: "64",
@@ -852,7 +852,7 @@ esac
 
     const values: Record<string, string> = {
       tick_entry: tickEntry,
-      tick_channel: "research:v1-deep-research.index",
+      tick_channel: "research:agent-harness.index",
       evidence_channel: "",
       allowed_root: "",
       max_writes: "64",

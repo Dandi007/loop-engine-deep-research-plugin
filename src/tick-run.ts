@@ -1451,8 +1451,8 @@ export async function runChannelWrite(
   const assembled = assembleBoard(messages, runs);
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
   //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
-  //   （profiles/deploy/production.env: research:v1-deep-research.evidence，与板 channel
-  //   research:v1-deep-research.index 不同），而 --run 路径原先只读板 channel ⇒ 覆盖度
+  //   （profiles/deploy/agent-harness.env: research:agent-harness.evidence，与板 channel
+  //   research:agent-harness.index 不同），而 --run 路径原先只读板 channel ⇒ 覆盖度
   //   在生产结构性恒为 0、'coverage > prevCoverage' 永不成立、zeroGrowthRounds 无条件递增，
   //   R3 断言的「覆盖增长 ⇒ 重置」分支在生产不可达。这里显式读证据 channel 并把其
   //   research.evidence.v2 的 clue_id 并入覆盖集合；证据 channel 未配置时退化为仅板 channel

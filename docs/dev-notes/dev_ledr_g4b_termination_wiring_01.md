@@ -61,8 +61,8 @@ final review `rf-attempt_01KZJXH59QZ9DF6T2ZHTXGVJRB`（REJECT）记录 5 条 fin
 
 ### major —— 覆盖度只读板 channel；生产 evidence 发到独立 EVIDENCE_CHANNEL ⇒ 覆盖结构性 0
 - **finding**（`src/tick-run.ts:1188-1194`）：`--run` 原先只读 `opts.channelId`（板 channel），
-  生产 harvest 把 research.evidence.v2 发到 `research:v1-deep-research.evidence`（与板 channel
-  `research:v1-deep-research.index` 不同，`profiles/deploy/production.env`）⇒ 覆盖结构性 0、
+  生产 harvest 把 research.evidence.v2 发到 `research:agent-harness.evidence`（与板 channel
+  `research:agent-harness.index` 不同，`profiles/deploy/agent-harness.env`）⇒ 覆盖结构性 0、
   `coverage > prevCoverage` 永不成立、zeroGrowthRounds 无条件递增、R3 的「覆盖增长 ⇒ 重置」分支
   在生产不可达（R2/R3 只因测试把 evidence 种在板 channel 上才过）。
 - **改法**：`runChannelWrite` 显式读 `opts.evidenceChannelId` channel，并入其 research.evidence.v2

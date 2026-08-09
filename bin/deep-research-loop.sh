@@ -23,7 +23,7 @@ for ((_i=0; _i<${#_args[@]}; _i++)); do
     --profile)
       _i=$((_i+1))
       if [ -z "${_args[$_i]:-}" ] || [[ "${_args[$_i]}" == --* ]]; then
-        echo "[deep-research-loop] --profile requires an operand (usage: --profile <name>, e.g. --profile production)" >&2
+        echo "[deep-research-loop] --profile requires an operand (usage: --profile <name>, e.g. --profile agent-harness)" >&2
         exit 3
       fi
       PROFILE="${_args[$_i]}"

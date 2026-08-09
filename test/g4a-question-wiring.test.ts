@@ -102,12 +102,12 @@ describe("G4a Q1: fleet input carries research_question equal to the configured 
 
   it("from production profile only: rendered fleet input.research_question === profile value", () => {
     const childEnv = cleanChildEnv();
-    childEnv.DEPLOY_PROFILE = "production";
+    childEnv.DEPLOY_PROFILE = "agent-harness";
     for (const k of RELEVANT_ENV) expect(childEnv).not.toHaveProperty(k);
     const res = render(childEnv);
     expect(res.code).toBe(0);
     const input = tickInput(res.out);
-    expect(input.research_question).toBe(readProfile("production").RESEARCH_QUESTION);
+    expect(input.research_question).toBe(readProfile("agent-harness").RESEARCH_QUESTION);
   });
 
   it("from explicit env: rendered fleet input.research_question === the explicit value", () => {
@@ -127,8 +127,8 @@ describe("G4a Q2: --question and its value really reach tick-entry argv", () => 
     const argvLog = join(dir, "tick-entry.argv.log");
     const values: Record<string, string> = {
       tick_entry: join(dir, "tick-entry"),
-      tick_channel: "research:v1-deep-research.index",
-      evidence_channel: "research:v1-deep-research.evidence",
+      tick_channel: "research:agent-harness.index",
+      evidence_channel: "research:agent-harness.evidence",
       allowed_root: "/data/code/self/agent-runtime",
       max_writes: "96",
       research_question: TEST_RESEARCH_QUESTION,
@@ -185,7 +185,7 @@ describe("G4a Q4: argv matrix across all 8 combinations of evidence/allowed_root
     const argvLog = join(dir, "tick-entry.argv.log");
     const values: Record<string, string> = {
       tick_entry: join(dir, "tick-entry"),
-      tick_channel: "research:v1-deep-research.index",
+      tick_channel: "research:agent-harness.index",
       evidence_channel: e ? "research:v1.evidence" : "",
       allowed_root: a ? "/data/code/self/agent-runtime" : "",
       max_writes: "64",
@@ -195,7 +195,7 @@ describe("G4a Q4: argv matrix across all 8 combinations of evidence/allowed_root
 
     // --run 与 --max-writes 始终在（固定项；假 tick-entry 的 "$@" 不含脚本名 argv[0]，故自 --run 起）。
     expect(argv).toContain("--run");
-    expect(argv[argv.indexOf("--run") + 1]).toBe("research:v1-deep-research.index");
+    expect(argv[argv.indexOf("--run") + 1]).toBe("research:agent-harness.index");
     expect(argv).toContain("--max-writes");
     expect(argv[argv.indexOf("--max-writes") + 1]).toBe("64");
 

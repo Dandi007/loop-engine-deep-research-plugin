@@ -26,3 +26,7 @@ seed:
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"
+      # G4b —— 续投 trigger 的 body（claim.bind 已把 trigger body 绑进 pipeline input）。
+      # 首个 seed 触发的 body 形如 {"seed":true}（无计数字段）；tick.md 判别后对首轮不传 --prev-*。
+      # 续投 body 形如 {"tick":true,"coverage":<n>,"zeroGrowthRounds":<m>}；tick.md 解析后传 --prev-*。
+      trigger_body: "{{trigger_body}}"

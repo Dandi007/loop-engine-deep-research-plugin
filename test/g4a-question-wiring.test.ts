@@ -76,7 +76,7 @@ function runRenderedTick(values: Record<string, string>, argvLog: string): strin
   const tickEntry = join(dirname(argvLog), "tick-entry");
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": []}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const script = readFileSync(TICK_MD, "utf8").replace(/\{\{([a-z_]+)\}\}/g, (_m, key) => values[key] ?? "");

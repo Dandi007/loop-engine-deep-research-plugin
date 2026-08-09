@@ -38,18 +38,22 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
-  ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>]
-                    写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
+  ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>]
+                     写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
+                     G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 解析后传入，
+                            首轮无前值不传（runChannelWrite 缺省 0）；JSON 输出含 termination（与 hasPendingWork 并列）。
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
 --run 对显式传入的 channel 执行 CAS 认领/回收 + spawn + 收割（接线判别）：先 CAS 成功才按 role spawn，
-     spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；
-      --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 DEFAULT_MAX_WRITES（--max-writes，A10c 起足以收割一张真实卡）；
-      --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
-      --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；
-       拒绝写 v1 冻结 channel。
+      spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；
+       --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 DEFAULT_MAX_WRITES（--max-writes，A10c 起足以收割一张真实卡）；
+       --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
+       --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；
+       --prev-coverage/--prev-zero-growth 上一 tick 的覆盖度/零增长轮数（跨 tick 终止计数，由续投 trigger body 承载）；
+        拒绝写 v1 冻结 channel。
   JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。
+  JSON 输出含 termination：本轮终态判定（G4b，用本轮真实板面调用 decideTermination；coverage/zeroGrowthRounds 续投时写入下一条 trigger body）。
 `;
 
 interface SelfCheckOutput {

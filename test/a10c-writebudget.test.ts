@@ -98,7 +98,7 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     // 假 tick-entry：把 argv 逐行写进日志，并回显 hasPendingWork=false（无需续投/runner）。
     writeFileSync(
       tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": []}'\n`,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
     );
     chmodSync(tickEntry, 0o755);
 

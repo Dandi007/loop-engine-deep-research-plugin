@@ -21,11 +21,13 @@ import { delimiter, join } from "node:path";
 import type { ClueV2 } from "./protocol";
 import {
   decideTick,
+  decideTermination,
   hasPendingWork,
   DEFAULT_TICK_CONFIG,
   type BoardState,
   type CasDecision,
   type Decision,
+  type TerminationState,
 } from "./tick";
 import {
   assembleBoard,
@@ -305,6 +307,85 @@ export class MissingChannelError extends Error {
     super("A8b: --run requires an explicit <channel_id> (no default channel).");
     this.name = "MissingChannelError";
   }
+}
+
+/**
+ * G4b —— trigger body 缺失/损坏 ⇒ 响亮失败（spec §1.2）。
+ * ⛔ 静默回落到 0/0 = 计数器被无声重置 = 本缺陷（zeroGrowthRounds 无跨 tick 记忆）原样复发，
+ *    而且更难查。首轮无前值由调用方显式传 0/0；body 一旦声称承载计数就必须可解析、字段齐全。
+ */
+export class TriggerBodyTerminationError extends Error {
+  constructor(reason: string) {
+    super(
+      `G4b: trigger body is missing or malformed termination counters (${reason}). Refusing to silently fall back to 0/0 — that would silently reset zeroGrowthRounds and re-introduce the very defect this package fixes. Pass valid {coverage, zeroGrowthRounds} (first tick legitimately uses 0/0).`,
+    );
+    this.name = "TriggerBodyTerminationError";
+  }
+}
+
+/**
+ * G4b —— 从 trigger body 字符串解析 {coverage, zeroGrowthRounds}（spec §1.2）。
+ *
+ * 约定（spec §1.2 表）：
+ *   - 续投写出的 trigger body 形如 `{"tick":true,"coverage":<n>,"zeroGrowthRounds":<m>}`。
+ *   - 首个 seed 触发的 body 形如 `{"seed":true}`（无计数字段）⇒ 调用方应显式传 0/0，不经过本函数。
+ *
+ * ⛔ 本函数的契约：**body 字符串一旦传入且声称承载计数，就必须可解析且字段齐全**，否则响亮失败。
+ *    具体语义（spec §1.2 R5）：
+ *      - body 解析失败（非法 JSON） ⇒ 抛。
+ *      - 解析成功但缺 `coverage` / `zeroGrowthRounds` 任一字段 ⇒ 抛。
+ *      - 字段存在但类型错（非有限非负数）⇒ 抛。
+ *    不得静默回落到 0/0（那是本包根因的复发形态）。
+ *
+ * @param body trigger body 字符串（loop-engine `claim.bind` 把 `body` 绑进 pipeline input）。
+ * @returns 解析出的 {prevCoverage, prevZeroGrowthRounds}。
+ */
+export function parseTerminationFromBody(
+  body: string | undefined | null,
+): { prevCoverage: number; prevZeroGrowthRounds: number } {
+  if (body === undefined || body === null || body === "") {
+    throw new TriggerBodyTerminationError("body is empty/undefined");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch (e) {
+    throw new TriggerBodyTerminationError(
+      `body is not valid JSON: ${(e as Error).message}`,
+    );
+  }
+  if (parsed === null || typeof parsed !== "object") {
+    throw new TriggerBodyTerminationError("body is not a JSON object");
+  }
+  const obj = parsed as Record<string, unknown>;
+  const cov = obj.coverage;
+  const zgr = obj.zeroGrowthRounds;
+  if (cov === undefined || zgr === undefined) {
+    throw new TriggerBodyTerminationError(
+      "body is missing coverage/zeroGrowthRounds fields",
+    );
+  }
+  if (
+    typeof cov !== "number" ||
+    !Number.isFinite(cov) ||
+    cov < 0 ||
+    !Number.isInteger(cov)
+  ) {
+    throw new TriggerBodyTerminationError(
+      `coverage is not a non-negative finite integer (got ${JSON.stringify(cov)})`,
+    );
+  }
+  if (
+    typeof zgr !== "number" ||
+    !Number.isFinite(zgr) ||
+    zgr < 0 ||
+    !Number.isInteger(zgr)
+  ) {
+    throw new TriggerBodyTerminationError(
+      `zeroGrowthRounds is not a non-negative finite integer (got ${JSON.stringify(zgr)})`,
+    );
+  }
+  return { prevCoverage: cov, prevZeroGrowthRounds: zgr };
 }
 
 /** 一次 CAS 写动作的最小输入。 */
@@ -832,6 +913,18 @@ export interface RunWriteOptions {
   spawnTriage?: WriteDeps["spawnTriage"];
   /** G2b——注入的 triage spawn 运行时（缺省 spawnTriage 用）。 */
   triageSpawnRuntime?: TriageSpawnRuntime;
+  /**
+   * G4b —— 上一 tick 的覆盖度（spec §1.2：跨 tick 传递 `prevCoverage`）。
+   * 生产由 tick.md 从 `{{trigger_body}}` 解析后以 `--prev-coverage` 传入；首轮无前值传 0。
+   * ⛔ 一旦 trigger body 声称承载计数就必须可解析（见 parseTerminationFromBody），
+   *    不得静默回落 0/0（会无声重置 zeroGrowthRounds，本包根因复发）。
+   */
+  prevCoverage?: number;
+  /**
+   * G4b —— 上一 tick 结束时的零增长轮数（spec §1.2：跨 tick 传递 `prevZeroGrowthRounds`）。
+   * 生产由 tick.md 从 `{{trigger_body}}` 解析后以 `--prev-zero-growth` 传入；首轮无前值传 0。
+   */
+  prevZeroGrowthRounds?: number;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -851,6 +944,12 @@ export interface RunWriteOutcome {
    * tick 依它决定是否 `loop-store put` 下一条触发（spec §1.3 / F7/F8）。
    */
   hasPendingWork: boolean;
+  /**
+   * G4b —— 本 tick 的终止判定（spec §1.1：用本轮真实板面调用 decideTermination）。
+   * 与 `hasPendingWork` 并列出现在 `--run` 的 JSON 输出里。续投时把
+   * `termination.coverage` / `termination.zeroGrowthRounds` 写进下一条 trigger 的 body。
+   */
+  termination: TerminationState;
 }
 
 /**
@@ -1191,6 +1290,22 @@ export async function runChannelWrite(
     (n, r) => n + r.cluesPublished,
     0,
   );
+  // G4b —— 用本轮真实（写后）板面调用 decideTermination（spec §1.1）。
+  //   ⛔ 不得新造判定逻辑：decideTermination / computeCoverage 是已交付纯函数，调用它们。
+  //   ⛔ prevCoverage / prevZeroGrowthRounds 跨 tick 传递（spec §1.2）：本轮从 opts 读取
+  //      （生产由 tick.md 从 {{trigger_body}} 解析后以 --prev-coverage/--prev-zero-growth 传入；
+  //       首轮无前值传 0）。用写后板面 postWriteState + assembled.coveredClueIds 作为「本轮真实板面」。
+  //   coverage 取本轮 evidence 已覆盖的 clue_id 集合大小（assembled.coveredClueIds 经
+  //      Set 去重后的大小，与 decideTermination 内部 computeCoverage 一致）。
+  const termination = decideTermination(
+    {
+      cards: postWriteState.cards,
+      coveredClueIds: assembled.coveredClueIds,
+      prevCoverage: opts.prevCoverage ?? 0,
+      prevZeroGrowthRounds: opts.prevZeroGrowthRounds ?? 0,
+    },
+    DEFAULT_TICK_CONFIG,
+  );
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -1201,6 +1316,7 @@ export async function runChannelWrite(
     harvestReports: result.harvestReports,
     triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
+    termination,
   };
 }
 
@@ -1235,11 +1351,21 @@ export interface RunCliOptions {
   allowedRoot?: string;
   /** G2b——研究主问题（--question）；进入 triage 语料 question（缺省遇 triage 决策即响亮失败）。 */
   question?: string;
+  /**
+   * G4b —— 上一 tick 的覆盖度（--prev-coverage）；生产由 tick.md 从 `{{trigger_body}}` 解析后传入。
+   * 首轮无前值时不传（parseRunCliArgs 不给该字段），runChannelWrite 缺省 0（spec §1.2）。
+   */
+  prevCoverage?: number;
+  /**
+   * G4b —— 上一 tick 结束时的零增长轮数（--prev-zero-growth）；生产由 tick.md 从 `{{trigger_body}}` 解析后传入。
+   * 首轮无前值时不传，runChannelWrite 缺省 0。
+   */
+  prevZeroGrowthRounds?: number;
 }
 
 /**
  * 解析 `--run` 之后的参数：
- * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>]`。
+ * `[<channel_id>] [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>]`。
  * ⛔ 不传 channel → 抛 MissingChannelError（exit ≠ 0，M11）。
  * ⛔ 冻结 channel → 抛 FrozenChannelError（M12）。
  */
@@ -1252,6 +1378,8 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let evidenceChannelId: string | undefined;
   let allowedRoot: string | undefined;
   let question: string | undefined;
+  let prevCoverage: number | undefined;
+  let prevZeroGrowthRounds: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1284,10 +1412,39 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
         );
       }
       i += 1;
+    } else if (args[i] === "--prev-coverage") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value < 0) {
+        throw new Error(
+          "G4b: invalid --prev-coverage (must be a non-negative integer).",
+        );
+      }
+      prevCoverage = value;
+      i += 1;
+    } else if (args[i] === "--prev-zero-growth") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value < 0) {
+        throw new Error(
+          "G4b: invalid --prev-zero-growth (must be a non-negative integer).",
+        );
+      }
+      prevZeroGrowthRounds = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
     throw new FrozenChannelError(channelId);
   }
-  return { channelId, maxWrites, evidenceChannelId, allowedRoot, question };
+  const result: RunCliOptions = {
+    channelId,
+    maxWrites,
+    evidenceChannelId,
+    allowedRoot,
+    question,
+  };
+  // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
+  if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;
+  if (prevZeroGrowthRounds !== undefined)
+    result.prevZeroGrowthRounds = prevZeroGrowthRounds;
+  return result;
 }

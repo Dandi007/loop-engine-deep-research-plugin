@@ -33,6 +33,27 @@ import type { Decision } from "../src/tick";
 
 const CHANNEL = "research:p05-g5-triage-read";
 
+let capturedTriageRunId = "";
+let agentRunsReadCount = 0;
+
+vi.mock("node:child_process", () => {
+  const EventEmitter = require("node:events").EventEmitter;
+  return {
+    spawn: (cmd: string, args: string[]) => {
+      const runIdIdx = args.indexOf("--run-id");
+      if (runIdIdx >= 0) capturedTriageRunId = args[runIdIdx + 1];
+      const child = new EventEmitter();
+      child.pid = 12345;
+      child.unref = () => {};
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      setImmediate(() => child.emit("exit", 0));
+      return child;
+    },
+    execFileSync: () => "",
+  };
+});
+
 function jsonResponse(data: unknown) {
   return {
     ok: true,
@@ -113,6 +134,8 @@ function baseDeps(over: Partial<WriteDeps> = {}): WriteDeps {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  capturedTriageRunId = "";
+  agentRunsReadCount = 0;
 });
 
 // ─── P1: 判别性 —— spawn 之后才出现的 triage 结果仍能被读到 ───────────────
@@ -505,5 +528,72 @@ describe("P6: assertions drive production assembly (readResult uses readTriageRe
     expect(readCount).toBeGreaterThanOrEqual(2);
     expect(captured).toHaveLength(1);
     expect(result.triageReports[0].casCount).toBe(1);
+  });
+
+  // ⛔ P6 production-assembly test: no spawnTriage injection, no triageSpawnRuntime
+  // injection. The production default branch at tick-run.ts:1506-1531 builds the
+  // runtime, and readResult uses readTriageResult (re-reads channel each time) with
+  // 30×1s retries. This test verifies that the production-assembled deps actually
+  // work end-to-end: board:agent-runs is re-read post-spawn and the triage result
+  // is found, producing CAS.
+  it("P6: runChannelWrite without spawnTriage/triageSpawnRuntime uses production default readResult and re-reads board:agent-runs post-spawn", async () => {
+    capturedTriageRunId = "";
+    agentRunsReadCount = 0;
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReadCount += 1;
+        if (capturedTriageRunId && agentRunsReadCount >= 2) {
+          return messagesResponse([
+            triageResultMsg(capturedTriageRunId, [
+              { clue_id: "c1", action: "keep", rationale: "keep c1" },
+              { clue_id: "c2", action: "drop", rationale: "drop c2" },
+            ]),
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) {
+        return messagesResponse(cards);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+
+    expect(result.triageReports[0].casCount).toBe(2);
+    expect(result.triageReports[0].budgetSkipped).toBe(false);
+    expect(result.triageReports[0].runId).toBe(capturedTriageRunId);
+    expect(result.triageReports[0].runId).not.toBe("");
+    expect(agentRunsReadCount).toBeGreaterThanOrEqual(2);
   });
 });

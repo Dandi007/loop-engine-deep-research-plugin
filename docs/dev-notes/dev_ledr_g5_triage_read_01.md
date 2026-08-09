@@ -1,7 +1,7 @@
 # G5 —— triage 结果读回：readTriageResult 每次重新读 channel
 
 - `development_id`: `dev_ledr_g5_triage_read_01`
-- `input_commit`: `8a087696e3db288a583f0e02d8b4cb34614f2362`
+- `input_commit`: `f01f31ac353f0099c7fbfada9a4a3158855417ff`
 
 ## 重试策略
 
@@ -55,11 +55,21 @@
 
 ### P6：断言打在生产组装出的 deps 上
 
-**通过**。`test/g5-triage-read.test.ts` P6 测试：
-- `runChannelWrite` 带 `triageSpawnRuntime` 注入，但 `readResult` 使用生产 `readTriageResult` 路径
-- 验证 `board:agent-runs` 被实际读取（`agentRunsReads >= 1`）
-- 验证 `readResult` 每次重试都重新读 channel（`readCount >= 2`，第一次返回空，第二次返回结果）
-- 不注入 `spawnTriage`（走 `triageSpawnRuntime` → `spawnTriageRole` 的生产路径）
+**通过**。`test/g5-triage-read.test.ts` P6 测试（3 tests）：
+
+1. `runChannelWrite` 带 `triageSpawnRuntime` 注入，但 `readResult` 使用生产 `readTriageResult` 路径
+   - 验证 `board:agent-runs` 被实际读取（`agentRunsReads >= 1`）
+   - 不注入 `spawnTriage`（走 `triageSpawnRuntime` → `spawnTriageRole` 的生产路径）
+
+2. `readResult` 每次重试都重新读 channel（`readCount >= 2`，第一次返回空，第二次返回结果）
+
+3. ⛔ **生产组装测试**：`runChannelWrite` **不注入** `spawnTriage` 且 **不注入** `triageSpawnRuntime`
+   - 触发生产默认分支（`tick-run.ts:1506-1531`）自行组装 `TriageSpawnRuntime`
+   - `readResult` 使用生产默认 `readTriageResult` + 30×1s 重试（`tick-run.ts:1521-1530`）
+   - mock `child_process.spawn` 捕获 runId 并模拟子进程退出
+   - mock `fetch` 在 spawn 后返回 `dr-triage.result.v1`（`board:agent-runs` 被重新读取）
+   - 断言 `casCount === 2`、`runId` 非空且等于实际 spawn 的 runId、
+     `board:agent-runs` 被重新读取至少 2 次（初始 + post-spawn）
 
 ### P7：全量 vitest run 真绿
 
@@ -67,10 +77,10 @@
 
 ```
 Test Files  26 passed (26)
-Tests       471 passed (471)
+Tests       472 passed (472)
 ```
 
-基线（main `4312cae`）：25 files / 458 tests。终值 **26 files / 471 tests**，两项均高于基线。
+基线（main `4312cae`）：25 files / 458 tests。终值 **26 files / 472 tests**，两项均高于基线。
 环境变量 `ANCHOR_CHECK_BIN`、`DOC_CHANNEL`、`RESEARCH_ORIGIN`、`EXPORT_ROOT` 均未设置。
 
 ### P8：变异矩阵逐断言归因
@@ -129,5 +139,5 @@ Tests       471 passed (471)
 |------|------|
 | `src/tick-inspect.ts` | 新增 `TriageResultDecision` 类型、`findTriageResult` 纯函数、`readTriageResult` 异步函数 |
 | `src/tick-run.ts` | 移除移至 `tick-inspect.ts` 的类型和函数；更新 imports；`readResult` 改用 `readTriageResult` + 30 次重试 + 响亮失败；`applyTriageBatch` 接受 `runId` 参数并填入 `triageReport.runId`；`spawnTriage` 返回类型加宽为 `{ decisions, runId }` |
-| `test/g5-triage-read.test.ts` | 新增 P1–P6 测试（13 tests） |
+| `test/g5-triage-read.test.ts` | 新增 P1–P6 测试（14 tests；含一条生产默认组装测试：不注入 `spawnTriage`/`triageSpawnRuntime`，驱动 `tick-run.ts:1506-1531` 生产默认路径） |
 | `test/g2b-triage-wiring.test.ts` | `spawnTriage` 注入返回值适配新形状 `{ decisions, runId }` |

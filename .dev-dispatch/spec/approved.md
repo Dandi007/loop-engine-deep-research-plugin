@@ -1,157 +1,116 @@
-# G5 —— triage 的结果读回查的是 spawn **之前**的快照：33 次真实裁定被全部丢弃
+# G6 —— 结果等待预算 30 秒，而真实 agent 要 43–390 秒：两条生产路径都会超时失败
 
-> 派发方：`line-deep-research`。前置：D2 已合入 main `4312cae`。
-> **这是 Phase 6 真跑当场抓到的生产缺陷，不是推断。** 证据在 §0，全部取自生产 bus。
-
----
-
-## 0　生产实况（2026-08-09 19:35Z–20:35Z，真跑一小时）
-
-研究「agent harness」在生产 bus 上跑了约一小时，**板面在第一次 triage 之后就永久停滞**：
-
-| 观察 | 数值 |
-|---|---|
-| `research:agent-harness.index` | 32 条消息 / 22 个线索实体：**5 explored、17 proposed** |
-| `research:agent-harness.evidence` | 65 条真实证据（收集段工作正常） |
-| 板面停滞时长 | ≥ 25 分钟内 `head_seq` **一动不动**（32 / 65 两次采样完全相同） |
-| 驱动轮次 | 19+ 轮，每轮 `loop-events.jsonl` 均 **`errors: 0`**、`drain.json` 均 `reason: drained`、脚本 **exit 0** |
-
-**手工单跑一次 tick 的输出（逐字）**：
-
-```json
-"triageReports": [ { "runId": "", "budgetSkipped": false, "invalidActions": 0,
-                     "outOfScopeDropped": 0, "casCount": 0, "casResults": [] } ],
-"writes": 0, "spawns": [],
-"termination": { "state": null, "coverage": 5, "zeroGrowthRounds": 0, "capHit": false }
-```
-
-**而 `board:agent-runs` 上（`after_seq=7500`，⚠️ 不带 `after_seq` 只会返回最早 100 条）**：
-
-```
-kind 分布: {'dr-triage.result.v1': 33, 'worker.result.v1': 5,
-            'agent.run.started.v2': 41, 'agent.run.exited.v2': 38, …}
-dr-triage.result.v1 样本: run_id=db677302-… decisions=17
-                          run_id=f8fbcdc0-… decisions=17
-                          run_id=df6d7781-… decisions=17
-```
-
-⇒ **triage agent 一直在正确工作**：被派出、读板、对那 17 条 proposed 逐条做出 keep/drop 裁定、发布到板上。
-⇒ **引擎从不读取它们。33 次真实裁定全部被丢弃。** 17 条线索永远停在 `proposed`，永不可被 worker 认领。
-
-> ### ⛔ 这是本仓反复出现的那个形态的最完整标本：
-> **工作发生了 → 结果发布了 → 消费方读了一份陈旧快照 → 零效果 → 全链路报告成功。**
-> `errors: 0`、`drained`、`exit 0`、`casCount: 0` —— **没有任何一处是红的。**
+> 派发方：`line-deep-research`。前置：G5 已合入 main `0b619e8`。
+> **这是 Phase 6 真跑实测出的生产缺陷，数值全部取自生产 bus，非估计。**
 
 ---
 
-## 1　根因（已定位到行号，非推断）
+## 0　实测数据（生产 `board:agent-runs`，2026-08-09 19:35Z–22:05Z）
 
-`src/tick-run.ts`：
+把每条结果消息与同 `run_id` 的 `agent.run.started.*` 配对，得到**真实端到端耗时**：
 
-```ts
-:1449   const runsMessages = await readChannelMessages(runsChannelId);   // ← spawn 之前读的快照
-...
-:1529             runId: randomUUID(),                                   // ← spawn 时才生成
-:1541   readResult: async (runId) => findTriageResult(runId, runsMessages) ?? [],
+| agent 类 | 样本 | 最小 | 中位 | 最大 |
+|---|---|---|---|---|
+| **`dr-triage`**（`dr-triage.result.v1`） | **37** | **43s** | **175s** | **390s** |
+| **`dr-worker-code-local`**（`worker.result.v1`） | **5** | **160s** | **207s** | **258s** |
+
+**而现行等待预算是 30 次 × 1 秒 = 30 秒** —— **低于观测到的最小值（43s）。**
+
+生产实证（G5 合入后手工跑一次 tick，逐字）：
+
+```
+G5: timed out waiting for triage result for run 32ba1229-baa1-4614-870f-9b2f6f9da94f
+    — no dr-triage.result.v1 found on board:agent-runs after 30 retries
 ```
 
-`runsMessages` 是**普通数组**，读取后不重读、不变更。而 `runId` 是 spawn 时新生成的
-⇒ `findTriageResult(runId, runsMessages)` **在数学上不可能命中**，恒返回 `null` ⇒ `?? []` ⇒ 零 CAS。
+⇒ G5 的响亮失败**工作正常**（这是进步：此前是静默丢弃）。**但预算本身是错的，研究仍无法推进。**
 
-### ⛔ 同一条缺陷已在生成段被修过，triage 没享受到
+### ⛔ 同一预算也用在生成段，且生成段更慢
 
-G4c(v2) 的 final review 对**生成段**记过逐字相同的判定：
-「`runsMessages` 是 spawn **之前**读的快照…`runId` 是新生成的 `randomUUID()`…该 run id 不可能出现在那个 pre-spawn 数组里」。
-G4c(v2) 已用 **`readGenerateResult`** 修好（见 §2）。**triage 这条路径由更早的 G2b 交付，未随之更新。**
+`src/tick-run.ts` 的生成段 `readBody`（G4c(v2) 交付）用的是**同一形状的 30 × 1s**。
+debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
+⇒ **生成段会以完全相同的方式超时**，plan §0 的产物 1（report）与 2（导出件）仍然产不出。
+**本包必须同时修这两条路径**，只修 triage 等于把同一个坑留给下一次真跑。
 
 ---
 
-## 2　⛔ 照抄已验证正确的形状（不要重新发明）
+## 1　要做什么
 
-`src/tick-inspect.ts` 里 G4c(v2) 交付并已合入的正确形状：
+把两处结果等待改成**按时间预算**（而非写死的重试次数），并可由部署方覆盖：
 
-```ts
-export async function readGenerateResult(
-  runId: string, channelId = "board:agent-runs",
-): Promise<{ body: string } | null> {
-  const messages = await readChannelMessages(channelId);   // ⛔ 每次调用都重新读
-  return findGenerateResult(runId, messages);
-}
-```
+| 键 | 语义 | 缺省 |
+|---|---|---|
+| `AGENT_RESULT_TIMEOUT_MS` | 等待 `dr-triage.result.v1` / `dr-doc.result.v1` 出现在 `board:agent-runs` 的总预算 | **900000（15 分钟）** |
+| `AGENT_RESULT_POLL_MS` | 轮询间隔 | **3000（3 秒）** |
 
-配套的调用侧（`tick-run.ts` 的生成段 `readBody`）带**重试等待**：spawn 是异步的，
-结果不会在 spawn 返回的瞬间就在 channel 上（上一包用 30 次 × 1s）。
+**缺省取值的依据（必须在 dev-note 复述）**：观测最大值 390s；900s ≈ **2.3×** 最大值，
+且覆盖 triage 与 worker 两个分布的全部样本。轮询 1s 在 15 分钟预算下会产生 900 次无谓请求，3s 足够。
 
-**本包要做的**：
-1. 加 `readTriageResult(runId, channelId = "board:agent-runs")` —— **每次调用重新分页读 channel**，
-   过滤 `kind === "dr-triage.result.v1"` 且 `payload.run_id` 匹配（复用既有 `findTriageResult` 做纯匹配）。
-2. 生产 `triageSpawnRuntime.readResult` 改用它，并加**重试等待**（与生成段同量级；实现方可调具体次数/间隔，
-   但必须在 dev-note 写明取值与理由）。
-3. ⛔ **等待耗尽仍无结果 ⇒ 必须响亮**：不得再返回 `[]` 当成「triage 判了 0 条」。
-   **空结果与「读不到结果」是两件事**，正是本缺陷得以静默一小时的原因。
-   响亮形态由实现方定（抛错或在 `triageReport` 里显式标记并使该 tick 非零退出），但**必须在日志/输出里点名 runId**。
-4. **`triageReport.runId` 必须是真实 runId**，不得是空串（实测为 `""`，使「结果被丢弃」在输出里不可诊断）。
+⛔ **不得**把预算写死成另一个魔数就完事：**必须可由部署方覆盖**，因为不同档位的模型耗时差一个数量级
+（本线实测 pro 档 implement 墙钟 355–667s，flash 档曾因 429 风暴到 1896s）。
 
-⛔ 不要改 `applyTriageBatch` 的校验/CAS 语义（值域校验、不做半批），本包只修**结果读回**这一环。
+⛔ **超时仍必须响亮失败并点名 runId**（G5 已交付的语义，不得削弱）。
+⛔ **「读不到」与「真的返回空结果」必须继续可区分**（G5 的 P3，不得回退）。
 
 ---
 
-## 3　硬验收（缺一不可）
+## 2　硬验收（缺一不可）
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **P1** | ⭐ **判别性**：假 bus 在 spawn **之后**才出现该 runId 的 `dr-triage.result.v1` ⇒ `readResult` **仍能读到**并产生 CAS。⛔ 用 spawn 前的快照必然读不到 —— 这是本包的存在理由 | 驱动**生产组装**出的 triage runtime（见 P6），断言 `casCount === 决策条数` |
-| **P2** | ⛔ **读不到 ⇒ 响亮**：重试耗尽仍无结果 ⇒ 不得返回 `[]` 静默通过；错误/标记里**点名 runId** | 正反两例 |
-| **P3** | ⛔ **空决策 ≠ 读不到**：agent 真的返回 `{"decisions":[]}` ⇒ 走正常路径（0 条 CAS，不报错） | 判别性用例；与 P2 必须可区分 |
-| **P4** | `triageReport.runId` 等于实际 spawn 的 runId，非空串 | 断言相等 |
-| **P5** | `applyTriageBatch` 的既有语义未被削弱（非法 action 响亮拒绝、不做半批、越界丢弃计数） | 既有断言保留且仍有效（读到行号） |
-| **P6** | ⛔ **断言必须打在生产组装出的 deps 上**：`runChannelWrite` 在 `opts.spawnTriage` / `opts.triageSpawnRuntime` 存在时走注入分支、**跳过生产组装**。⛔ 自建 runtime 注入的用例不算数 | 照 G4c(v2)/G4d(v2) 的做法（`assembleGenerateDeps` 已导出的同款思路）；⛔ **源码字符串匹配一律不构成证据** |
-| **P7** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN`/`DOC_CHANNEL`/`RESEARCH_ORIGIN`/`EXPORT_ROOT` 均未设置）。基线：main `4312cae` 实测 **25 files / 458 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
-| **P8** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **P9** | 每处删除给出必要性说明 | — |
+| **R1** | ⭐ **两条路径都用新预算**：triage 的 `readResult` **与** 生成段的 `readBody` 都按 `AGENT_RESULT_TIMEOUT_MS` / `AGENT_RESULT_POLL_MS` 等待 | 分别断言；⛔ 只改 triage 不算完成 |
+| **R2** | ⛔ **可覆盖**：设 `AGENT_RESULT_TIMEOUT_MS` 为一个极小值 ⇒ 等待很快超时；不设 ⇒ 用 900000 缺省 | 正反两例，**打在生产组装出的 deps 上** |
+| **R3** | ⛔ **超时仍响亮并点名 runId**（G5 语义保留） | 判别性用例 |
+| **R4** | ⛔ **空结果 ≠ 读不到**（G5 的 P3 保留且仍有效） | 判别性用例 |
+| **R5** | ⛔ **不得靠真实等待把用例拖慢**：用例必须注入可控时钟/间隔（或用极小的 `AGENT_RESULT_POLL_MS`），全量测试时长不得显著增加 | 贴测试总时长；基线约 17s |
+| **R6** | ⛔ **断言打在生产组装出的 deps 上**（`runChannelWrite` 在注入分支下跳过生产装配；⛔ 自建 runtime 注入的用例不算数；⛔ 源码字符串匹配一律不构成证据） | 照 G5 已交付的 P6 做法 |
+| **R7** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN`/`DOC_CHANNEL`/`RESEARCH_ORIGIN`/`EXPORT_ROOT`/`AGENT_RESULT_*` 均未设置）。基线：main `0b619e8` 实测 **26 files / 472 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出** |
+| **R8** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **R9** | 每处删除给出必要性说明 | — |
 
 ---
 
-## 4　变异矩阵（逐断言归因）
+## 3　变异矩阵（逐断言归因）
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **Q1** | `readResult` 改回 `findTriageResult(runId, runsMessages)`（= 回到改动前的 pre-spawn 快照） | **P1 必须挂**；⛔ 杀不掉即判 P1 零功率、必须重写 |
-| **Q2** | 重试耗尽时返回 `[]` 而非响亮失败 | **P2 的失败侧必须挂** |
-| **Q3** | 让真实的 `{"decisions":[]}` 也走响亮失败路径 | **P3 必须挂**（空结果被误判成读不到） |
-| **Q4** | `triageReport.runId` 写死空串 | **P4 必须挂** |
+| **S1** | 生成段 `readBody` 保留 30×1s（只改 triage） | **R1 的生成段那条必须挂** |
+| **S2** | 忽略 `AGENT_RESULT_TIMEOUT_MS`，恒用缺省 | **R2 必须挂** |
+| **S3** | 超时返回 `[]`/`null` 而非抛错 | **R3 必须挂** |
+| **S4** | 把「结果为空数组」也当成读不到继续等 | **R4 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 5　⛔ 前几包实付的学费（直接照用）
+## 4　⛔ 前几包实付的学费（直接照用）
 
-1. **测试必须驱动生产组装**：注入 deps 会跳过生产装配分支，这一形态已在 G4c/G4d 连挂五轮。
-2. ⛔ **源码字符串匹配（`expect(source).toContain(...)` / `readFileSync(测试文件)`）一律不构成证据。**
-3. **`workflow.yaml` 新增的可选 pipeline input 必须带 `?`**（本包大概率不涉及，涉及则遵守）。
-4. **dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit**，**不是 H0 提交**；
+1. **测试必须驱动生产组装**；⛔ **源码字符串匹配一律不构成证据**。
+2. **变异矩阵各行必须是实测**：若某行杀不掉，如实写「未被杀」并说明，⛔ **不得编造失败现象**
+   （本线已两次出现 dev-note 报告结构上不可能发生的击杀，均被评审逐条推翻）。
+3. **dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit**，**不是 H0 提交**；
    ⛔ 不要为对齐 hash 做额外提交；⛔ 不得用「基线计数方式差异」解释测试数缺口。
-5. **变异矩阵各行必须是实测**，不得写预测；若某行杀不掉，如实写「未被杀」并说明，⛔ 不得编造失败现象。
+4. **贴测试证据要贴完整尾部**（`Test Files` / `Tests` 两行 + 有无 FAIL 段），不得只贴计数或只写结论。
 
 ---
 
-## 6　显式不做
+## 5　显式不做
 
 | 不做 | 理由 |
 |---|---|
-| 改 `applyTriageBatch` 的校验/CAS 语义 | 已交付且被断言保护；本包只修结果读回 |
-| 改生成段的 `readGenerateResult` | 已修好，本包照抄其形状即可 |
-| 改 worker 收割路径 | 生产实测正常（65 条证据、5 条 `worker.result.v1` 被正确收割） |
-| 改 `profiles/deploy/*.env` | 归部署方 |
-| 注册任何 bus 协议 | 已由派发方于 2026-08-09 19:00Z 完成（`dr-triage.result.v1` 已注册，生产实测可发布） |
+| 改 G5 的 `readTriageResult` / 响亮失败语义 | 已交付且被断言保护；本包只改**等待预算**与**可配置性** |
+| 改 worker 收割路径 | 生产实测正常 |
+| 改 `profiles/deploy/*.env`（含 `AGENT_RESULT_*` 取值） | 归部署方；本包只保证**缺省合理且可覆盖** |
+| 改模型档位 | 已拍死在 golden-order |
+| 注册任何 bus 协议 | 已完成 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 7　交付物落点
+## 6　交付物落点
 
-- 实现：`src/tick-inspect.ts`（`readTriageResult`）、`src/tick-run.ts`（生产 `readResult` + 重试 + 响亮失败 + 真实 runId）
-- 测试：`test/g5-triage-read.test.ts`（P1–P6）
-- 证据：`docs/dev-notes/dev_ledr_g5_triage_read_01.md`（P1–P9 逐条 + §4 变异四行**实测** + 还原证据 + 你采用的重试次数/间隔与理由）
+- 实现：`src/tick-run.ts`（triage `readResult` + 生成段 `readBody` 的等待预算与可配置性）
+- 测试：`test/g6-result-timeout.test.ts`（R1–R6）
+- 证据：`docs/dev-notes/dev_ledr_g6_result_timeout_01.md`（R1–R9 逐条 + §3 变异四行**实测** + 还原证据 +
+  **你采用的缺省值与依据**（须复述 §0 的实测分布）+ 全量测试时长对比）

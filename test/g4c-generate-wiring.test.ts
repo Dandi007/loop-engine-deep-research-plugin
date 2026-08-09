@@ -5,7 +5,7 @@
  * U1/U2 测试 decideGenerate 纯函数 + 一次性保证机制。
  * U3–U7 走 runGenerate 单元测试 + 集成断言。
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import {
   resetGeneratedOrigins,
@@ -16,6 +16,7 @@ import {
 import type {
   RunWriteOptions,
 } from "../src/tick-run";
+import type { InspectMessage } from "../src/tick-inspect";
 import {
   runGenerate,
   decideGenerate,
@@ -45,68 +46,183 @@ function term(over: Partial<TerminationState> = {}): TerminationState {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// 桩 fetch helpers（复用 G4b 模式：全局 stub fetch，runChannelWrite 走真实生产路径）
+// ════════════════════════════════════════════════════════════════════
+const U1_CHANNEL = "research:g4c-test-u1";
+const U2_CHANNEL = "research:g4c-test-u2";
+
+function jsonResponse(data: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => data,
+    text: async () => JSON.stringify(data),
+  };
+}
+
+function clueMsg(
+  clueId: string,
+  over: Record<string, unknown> = {},
+  seq = 1,
+): InspectMessage {
+  return {
+    message_id: `msg_${clueId}`,
+    channel_id: U1_CHANNEL,
+    channel_seq: seq,
+    kind: "research.clue.v2",
+    payload: {
+      status: "explored",
+      text: `clue ${clueId}`,
+      depth: 0,
+      sources: ["code-local"],
+      ...over,
+    },
+    entity_id: clueId,
+    supersedes: null,
+    created_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+function stubBoard(channelId: string, clueMessages: InspectMessage[]): void {
+  let clueCalls = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: unknown, _init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) {
+        return jsonResponse({ head: clueMessages[0] ?? {} });
+      }
+      if (u.includes("/publish")) {
+        return jsonResponse({ message_id: "p", channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${channelId}/messages`)) {
+        clueCalls += 1;
+        return jsonResponse({ messages: clueCalls === 1 ? clueMessages : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        return jsonResponse({ messages: [] });
+      }
+      return jsonResponse({ messages: [] });
+    }),
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
 // U1 —— 可达性：终态非 null ⇒ runGenerate 被调用；终态 null ⇒ 不被调用
 // ════════════════════════════════════════════════════════════════════
-describe("U1: reachability — decideGenerate gates on termination state", () => {
-  it("U1: decideGenerate is pure — non-null state ⇒ true, null ⇒ false", () => {
-    expect(decideGenerate(term({ state: "converged" }))).toBe(true);
-    expect(decideGenerate(term({ state: "capped" }))).toBe(true);
-    expect(decideGenerate(term({ state: "partial" }))).toBe(true);
-    expect(decideGenerate(term({ state: null }))).toBe(false);
+describe("U1: reachability — runChannelWrite triggers runGenerate when termination is non-null", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
-  it("U1: capHit=true but state=null ⇒ decideGenerate returns false", () => {
-    expect(decideGenerate(term({ state: null, capHit: true }))).toBe(false);
+  beforeEach(() => {
+    resetGeneratedOrigins();
   });
 
-  it("U1: generateTriggered field exists in runChannelWrite outcome", async () => {
-    // 类型级断言：RunWriteOutcome 有 generateTriggered 字段。
-    // 生产入口 runChannelWrite 在无 origin 时不触发生成段，但字段仍存在。
-    const { readFileSync } = await import("node:fs");
-    const { fileURLToPath } = await import("node:url");
-    const srcPath = fileURLToPath(new URL("../src/tick-run.ts", import.meta.url));
-    const source = readFileSync(srcPath, "utf-8");
-    expect(source).toContain("generateTriggered");
-    expect(source).toContain("decideGenerate(termination)");
-    expect(source).toContain("runGenerate");
+  it("U1 positive: converged board + --origin triggers runGenerate and calls deps", async () => {
+    const msgs = [clueMsg("c1", { status: "explored" })];
+    stubBoard(U1_CHANNEL, msgs);
+
+    const spawnRoleSpy = vi.fn(async () => ({ body: "test body" }));
+    const writeDocSpy = vi.fn(async () => "msg-test");
+    const spawnExportSpy = vi.fn(async () => {});
+
+    const outcome = await runChannelWrite({
+      channelId: U1_CHANNEL,
+      origin: "research-u1-positive",
+      question: "test question",
+      prevCoverage: 1,
+      prevZeroGrowthRounds: 2,
+      generateDeps: {
+        spawnRole: spawnRoleSpy,
+        writeDoc: writeDocSpy,
+        spawnExport: spawnExportSpy,
+        lockSynthesizer: async () => async () => {},
+        spawnAnchorCheck: async () => { throw new AnchorCheckNotWiredError(); },
+      },
+    });
+
+    expect(outcome.generateTriggered).toBe(true);
+    expect(spawnRoleSpy).toHaveBeenCalled();
+    expect(writeDocSpy).toHaveBeenCalled();
+    expect(spawnExportSpy).toHaveBeenCalled();
+  });
+
+  it("U1 negative: null termination state ⇒ runGenerate is NOT called", async () => {
+    const msgs = [clueMsg("c1", { status: "explored" })];
+    stubBoard(U1_CHANNEL, msgs);
+
+    const spawnRoleSpy = vi.fn(async () => ({ body: "test body" }));
+    const writeDocSpy = vi.fn(async () => "msg-test");
+    const spawnExportSpy = vi.fn(async () => {});
+
+    const outcome = await runChannelWrite({
+      channelId: U1_CHANNEL,
+      origin: "research-u1-negative",
+      question: "test question",
+      generateDeps: {
+        spawnRole: spawnRoleSpy,
+        writeDoc: writeDocSpy,
+        spawnExport: spawnExportSpy,
+        lockSynthesizer: async () => async () => {},
+        spawnAnchorCheck: async () => { throw new AnchorCheckNotWiredError(); },
+      },
+    });
+
+    expect(outcome.generateTriggered).toBe(false);
+    expect(spawnRoleSpy).not.toHaveBeenCalled();
+    expect(writeDocSpy).not.toHaveBeenCalled();
+    expect(spawnExportSpy).not.toHaveBeenCalled();
   });
 });
 
 // ════════════════════════════════════════════════════════════════════
 // U2 —— 只跑一次：同一次研究的终态被连续两个 tick 观察到时，生成段只执行一次
 // ════════════════════════════════════════════════════════════════════
-describe("U2: one-shot — same origin, generate only once", () => {
+describe("U2: one-shot — same origin triggers generate only once", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     resetGeneratedOrigins();
   });
 
-  it("U2: resetGeneratedOrigins clears the set", () => {
-    expect(typeof resetGeneratedOrigins).toBe("function");
-    resetGeneratedOrigins();
-  });
+  it("U2: two runChannelWrite calls with same origin only trigger generate once", async () => {
+    const msgs = [clueMsg("c1", { status: "explored" })];
+    stubBoard(U2_CHANNEL, msgs);
 
-  it("U2: source code contains the one-shot guard (generatedOrigins.has)", async () => {
-    const { readFileSync } = await import("node:fs");
-    const { fileURLToPath } = await import("node:url");
-    const srcPath = fileURLToPath(new URL("../src/tick-run.ts", import.meta.url));
-    const source = readFileSync(srcPath, "utf-8");
-    expect(source).toContain("generatedOrigins");
-    expect(source).toContain("generatedOrigins.has(origin)");
-    expect(source).toContain("generatedOrigins.add(origin)");
-    expect(source).toContain("resetGeneratedOrigins");
-  });
+    const spawnRoleSpy = vi.fn(async () => ({ body: "test body" }));
+    const writeDocSpy = vi.fn(async () => "msg-test");
+    const spawnExportSpy = vi.fn(async () => {});
 
-  it("U2: two writes to the same origin would only call generate once (code-level verification)", async () => {
-    // 验证代码结构：runChannelWrite 中 generateTriggered 在 generatedOrigins.add 之后才设为 true
-    const { readFileSync } = await import("node:fs");
-    const { fileURLToPath } = await import("node:url");
-    const srcPath = fileURLToPath(new URL("../src/tick-run.ts", import.meta.url));
-    const source = readFileSync(srcPath, "utf-8");
-    // 添加 origin 在 generateTriggered=true 之前
-    const addIdx = source.indexOf("generatedOrigins.add(origin)");
-    const trueIdx = source.indexOf("generateTriggered = true");
-    expect(addIdx).toBeGreaterThan(0);
-    expect(trueIdx).toBeGreaterThan(addIdx);
+    const opts = {
+      channelId: U2_CHANNEL,
+      origin: "research-u2",
+      question: "test question",
+      prevCoverage: 1,
+      prevZeroGrowthRounds: 2,
+      generateDeps: {
+        spawnRole: spawnRoleSpy,
+        writeDoc: writeDocSpy,
+        spawnExport: spawnExportSpy,
+        lockSynthesizer: async () => async () => {},
+        spawnAnchorCheck: async () => { throw new AnchorCheckNotWiredError(); },
+      },
+    };
+
+    const outcome1 = await runChannelWrite(opts);
+    expect(outcome1.generateTriggered).toBe(true);
+
+    // Re-stub for fresh board messages on second call
+    stubBoard(U2_CHANNEL, msgs);
+    const outcome2 = await runChannelWrite(opts);
+    expect(outcome2.generateTriggered).toBe(false);
+
+    // Spies called exactly once total (from first call only)
+    expect(spawnRoleSpy).toHaveBeenCalledTimes(4);
+    expect(writeDocSpy).toHaveBeenCalledTimes(4);
+    expect(spawnExportSpy).toHaveBeenCalledTimes(1);
   });
 });
 

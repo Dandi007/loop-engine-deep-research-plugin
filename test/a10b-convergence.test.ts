@@ -113,8 +113,10 @@ function renderPath(): string {
 
 function renderFleet(env: NodeJS.ProcessEnv = {}): { triggerStoreDir: string; fleetDir: string } {
   // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；测试统一显式提供。
+  // G4a —— 渲染需要 RESEARCH_QUESTION（无内置缺省、未配置即响亮失败）；测试统一显式提供。
   const res = runDriver([renderPath(), "--dry-run"], {
     TICK_CHANNEL: "research:v1-test.index",
+    RESEARCH_QUESTION: "test question",
     ...env,
   });
   if (res.code !== 0) throw new Error(`render failed: ${res.err}`);
@@ -188,6 +190,8 @@ async function runRealE2E(opts: {
         // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
         // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。
         TICK_CHANNEL: "research:p02-smoke-1dce60",
+        // G4a —— 真实驱动也要求 RESEARCH_QUESTION（无内置缺省、未配置即响亮失败）。
+        RESEARCH_QUESTION: "test question",
         PATH: `${dirname(bun)}:${process.env.PATH ?? ""}`,
         ...opts.env,
       },
@@ -249,6 +253,7 @@ describe("B1-guard: dependency-missing B1 must not silently pass", () => {
       LOOP_ENGINE_CLI: join(tmpdir(), "does-not-exist-loop-engine-cli.js"),
       LOOP_ENGINE_RUNNER: resolveBun() ?? "bun",
       TICK_CHANNEL: "research:v1-test.index",
+      RESEARCH_QUESTION: "test question",
     });
     // ⛔ 不可能是 pass：必须非零 + 响亮点名缺失。
     expect(res.code).not.toBe(0);
@@ -438,7 +443,7 @@ describe("B6: concurrent renders do not pollute each other", () => {
     //    execFileSync 是同步阻塞，串行执行下每个渲染都拿到唯一 RUN_ROOT，读回必然不碰撞，判据零功率。
     const procs = Array.from(
       { length: N },
-      () => runDriverAsync([renderPath(), "--dry-run"], { TICK_CHANNEL: "research:v1-test.index" }),
+      () => runDriverAsync([renderPath(), "--dry-run"], { TICK_CHANNEL: "research:v1-test.index", RESEARCH_QUESTION: "test question" }),
     );
     const results = await Promise.all(procs);
     const parsed = results.map((res) => {

@@ -25,7 +25,7 @@ import { renderReportBody } from "../src/generate";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "deep-research-loop.sh");
 const PROFILES_DIR = join(ROOT, "profiles", "deploy");
-const RELEVANT_ENV = ["TICK_CHANNEL", "EVIDENCE_CHANNEL", "ALLOWED_ROOT", "MAX_WRITES"];
+const RELEVANT_ENV = ["TICK_CHANNEL", "EVIDENCE_CHANNEL", "ALLOWED_ROOT", "MAX_WRITES", "RESEARCH_QUESTION"];
 
 function readProfile(name: string): Record<string, string> {
   const text = readFileSync(join(PROFILES_DIR, `${name}.env`), "utf8");
@@ -183,6 +183,8 @@ describe("E4: precedence explicit env > profile > built-in default", () => {
     // TICK_CHANNEL 是渲染硬前提（无默认、响亮失败），必须显式给；MAX_WRITES 则无显式值，
     // 演示「内置缺省」层：不设 profile 也不设 MAX_WRITES ⇒ 内置缺省 64 直达渲染。
     childEnv.TICK_CHANNEL = "research:v1-test.index";
+    // G4a —— RESEARCH_QUESTION 也是渲染硬前提（无内置缺省），必须显式给。
+    childEnv.RESEARCH_QUESTION = "test question";
     const input = tickInput(render(childEnv).out);
     expect(input.max_writes).toBe(64);
   });

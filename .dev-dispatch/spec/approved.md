@@ -1,152 +1,121 @@
-# G2b —— triage 接线：把 `spawnTriage()` 从 no-op 接到真实 `dr-triage` role
+# D1 —— 部署固化：把「靠手工 env 搀扶」变成受版本管理的部署配置
 
-> 上游依据：`wf-dc0c15` `spec.md`(rev7) §2.2 / §3.1 / §3.2 第 4 步 / §3.4、`golden-order.md` Q6。
-> 前置已合入本仓 main `b48157f`（G2a：生成段接线）；`agent-runtime` main `efa7579` 已有 `dr-triage` role。
-> **本包是 G2a 的姊妹包**：G2a 接生成段，本包接收集段的 triage。**照 G2a 已合入的 `src/generate.ts` 的既有形状做**，别另发明一套。
-
----
-
-## 0　现状：`spawnTriage()` 在运行壳里是 no-op
-
-`src/tick.ts` 已能产出 `{ kind: "triage" }` 决策并调 `deps.spawnTriage()`，
-但 `src/tick-run.ts:471-473` 写着：
-
-```ts
-case "triage":
-  // 本包不处理 triage 的 spawn 副作用；triage 决策不写卡，跳过。
-  skipped += 1;
-  break;
-```
-
-⇒ **triage 从未真的被派发过，proposed 卡永远不会被裁走。**
-
-### ⛔ 这不只是「探索面变窄」，它会让终态语义失真
-
-`spec` §3.4 的**正常收敛**条件是 `zeroGrowthRounds ≥ 2` **且** 在途 = 0 **且** `proposed = 0`。
-proposed 永不被裁走 ⇒ **`proposed = 0` 永不成立 ⇒ 永远走不到「正常收敛」，只能撞 `maxClues`/`maxDepth` 触顶终止。**
-而 §3.4 硬约束「**终态必须区分**：因触顶而停 ≠ 收敛」——
-⇒ 现状下**每一次研究的终态都会被标成触顶**，报告的完备性主张随之失真。**本包是 plan §0 终态口径的必要项。**
+> 上游依据：`wf-dc0c15` `spec.md`(rev7) §5.5、`wf-ecf9fc` `plan.md` §7、`golden-order.md`「2026-08-09 02:10」拍板（导出落点）。
+> 前置已合入 main `1e6708a`（G1 / G2a / G2b 全部完成；G3 由 A8f 覆盖）。
+> **本包是 Phase 6 端到端验收的最后一块前置**：plan §0 的 DoD 里写着「全程无人工介入、**零手工 env 搀扶**（部署配置受版本管理）」。
 
 ---
 
-## 1　⛔ 三条必须照做的既有事实（G2a 用三轮 review 换来的，别再踩）
+## 0　现状：三处「能跑但靠手工搀扶」
 
-### 1.1 `--input` **只校验、不注入 prompt** —— 语料必须走位置参数
+`bin/deep-research-loop.sh` 实测（本包基线 `1e6708a`）：
 
-| 位置 | 事实 |
-|---|---|
-| `agent-runtime/src/dispatch.ts:1107-1108` | `prompt = personaContent + "\n\n" + prompt` —— prompt **只**由 persona + **位置参数**构成 |
-| `agent-runtime/src/dispatch.ts:922` | `--input` 只做 `validateJsonSchema(...)`，**校验完就扔** |
-| 本仓 `src/generate.ts`（G2a 已合入） | `argv` 以 `"--", serializeCorpusToPositional(corpus)` 结尾 —— **照抄这个形状** |
+| 行 | 现状 | 问题 |
+|---|---|---|
+| `:32` | `export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"` | ⛔ **缺省仍是 smoke channel**。生产不显式设它就会往冒烟板写——而 **bus append-only 无 DELETE，写错不可回退** |
+| `:41` | `export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"` | 无默认值（**设计如此**：真实 channel 名不可由板名推导，静默推导会错写进 append-only bus）。但**生产配置必须有一个受管的显式值**，不能靠人记得 export |
+| `:46` | `export ALLOWED_ROOT="${ALLOWED_ROOT:-}"` | 同上：`code-local` worker 没有它会响亮失败（A8f 的 `MissingAllowedRootError`），但生产得有受管值 |
 
-⇒ 板面快照必须序列化进**位置参数**。**只把它写进 `--input` 文件不算接上。**
+⇒ **「部署」目前等于「有人记得把三个 env 敲对」。** 本包把它变成受版本管理的配置文件。
 
-### 1.2 ⛔ **跨仓契约必须被断言**（G2a attempt 2 的 blocker，就栽在这）
+## 0.1 ⛔ 另一处已实测的部署面缺口：**依赖装没装，不在部署步骤里**
 
-G2a 曾把 `terminal_marker` 当字符串发，而 `agent-runtime` 的
-`synthesizer-input.v1.json` 声明它是 object —— **两边各自按自己那份文档都是对的，错误只在交界处显形**。
+G1 期实测（本 session 亲历）：生产 checkout 里 `yaml` 在 `devDependencies` 声明了但**没装**，
+而 **5 个接线回归文件都 import 它** ⇒ `npx vitest run` 报
+`Error: Failed to load url yaml`、**`0 test` collected**。
 
-⇒ **本包必须有一条断言：引擎组装的 triage 语料，能通过 `agent-runtime/profiles/roles/schemas/triage-input.v1.json`。**
-参照 G2a 已合入的 `test/generate.test.ts:507,518` 的做法（含 `AGENT_RUNTIME_PROFILES` env + 回退 + 可用性守卫，**不得硬编码绝对主机路径导致换机器整套变红**）。
+> ⛔ **「0 test collected」与「测试全绿」在摘要上极像，语义完全相反。**
+> 而这个 checkout **就是生产运行位** ⇒ **「部署完成」与「回归可执行」是两件事**，当时它们不相等。
 
-### 1.3 ⛔ **不得有「静默零 spawn 的假成功」**
-
-G2a attempt 2 的 major：`spawnProcess` 可选 + `if` 守卫 ⇒ 构造完 argv 静默丢弃却仍返回成功。
-⇒ 本包的 spawn 依赖**必填且无条件调用**（照 G2a 已合入的 `src/generate.ts:266,297-298`）。
-⇒ 临时 payload 文件在 `finally` 里清理（照 `src/generate.ts:300-302`）。
+⇒ 部署步骤必须包含依赖安装，且必须有一条**验证回归确实可执行**的检查（不是只看 `exit 0`，要看**收集到的用例数 > 0**）。
 
 ---
 
-## 2　要做什么
+## 1　要做什么
 
-### 2.1 `spawnTriage` 的生产实现
+### 1.1 受版本管理的部署配置（profile 形式，进 repo）
 
-把 `tick-run.ts` 的 `case "triage"` 从 `skipped += 1` 换成真实派发：
-`agent-run --role dr-triage --run-id <id> --input <file> -- <序列化的板面快照>`。
+新增 `profiles/deploy/<name>.env`（或等价形式，**实现方可选形状，但必须进 git、可 diff、可 review**），
+至少覆盖：`TICK_CHANNEL` / `EVIDENCE_CHANNEL` / `ALLOWED_ROOT` / `MAX_WRITES` / 导出落点根。
 
-**板面快照**（形状必须对齐 `triage-input.v1.json`，见 §1.2）：
-```jsonc
-{ "question": "<研究主问题>",
-  "proposed_clues": [ { "clue_id", "clue_text", "depth"?, "sources"? } ],
-  "explored_summaries": [ "<已探索线索的一句话>" ]   // 可选
-}
-```
+`bin/deep-research-loop.sh` 增加一个**显式的 profile 选择入口**（如 `--profile <name>` 或 `DEPLOY_PROFILE`），
+加载顺序必须是：**显式 env > profile 文件 > 内置缺省**，且**加载了哪个 profile 要打印出来**（可观测）。
 
-### 2.2 收割 `dr-triage.result.v1` 并逐条 CAS
+### 1.2 ⛔ 把 smoke channel 缺省改成「响亮失败」
 
-对返回的每条 `{clue_id, action, rationale}`：
+`TICK_CHANNEL` 的**内置缺省不得再是 `research:p02-smoke-1dce60`**。
+未经 profile 或显式 env 指定时 ⇒ **响亮失败并拒绝启动**，理由写进错误消息。
 
-| action | 动作 |
-|---|---|
-| `keep` | CAS `proposed → open` |
-| `drop` | CAS `proposed → dropped` |
+> **判据**：bus 是 append-only 无 DELETE 的。**一个「默认写到某个真实 channel」的缺省值，其代价是不可回退的**。
+> 与 `EVIDENCE_CHANNEL` 无默认值同一条道理——那条**设计如此**是对的，本条要向它对齐。
+> ⚠️ 但**不得反过来给 `EVIDENCE_CHANNEL` 编一个缺省**：它保持「无默认 + 响亮失败」。
 
-`rationale` 写进该卡的 `clue.rationale`（版本链留痕，`spec` §2.2）。
-⛔ **clue 的唯一写者仍是调度器**——是引擎按 decision 去 CAS，不是 role 直接改卡。
+### 1.3 导出落点写死 `DeepThought/<主题>/`
 
-### 2.3 ⛔ 两条必须由引擎侧兜住的校验
+按 2026-08-09 用户拍板：导出件落 `DeepThought/<主题>/`，带 `source_message_id` + 终态标记以与旧产物区分。
+`src/export.ts` 已有 `deriveExportPath` / `renderExportContent` / `source_message_id` 注释，**读它、按它的既有形状接，不要重写**。
+落点根走 §1.1 的配置，**不得硬编码到源码里**。
 
-**(a) `action` 值域**：`dr-triage-result.v1.json` 里写了 `enum: ["keep","drop"]`，
-但 **bus 注册时 `openSchema()` 会把顶层 properties 下一层的 `enum` 剥掉** ⇒ **注册态是裸 `string`，bus 拦不住非法值**。
-⇒ **引擎在消费侧必须自己校验值域**；非 `keep`/`drop` ⇒ **响亮拒绝该条**（不静默当 keep、也不当 drop）。
+### 1.4 部署步骤文档化 + 可执行验证
 
-**(b) `clue_id` 越界**：decision 里的 `clue_id` **不在本轮 proposed 集合内** ⇒ **丢弃该条并响亮记录**。
-理由：「查得到 ≠ 有权改」。⛔ 不得静默跳过，也不得据此去改一张不该动的卡。
-
-### 2.4 写入预算
-
-triage 的 CAS 写入**计入 `--max-writes` 预算**（与收割一致）；预算不足时**整批跳过并响亮报告**，不做半批。
+`docs/deploy.md`（或等价）写明生产部署步骤，且**每一步都要有对应的验证命令**：
+1. 各仓 `git pull`
+2. **依赖安装**（`npm ci`）
+3. ⛔ **回归可执行性验证**：跑一次测试并断言**收集到的用例数 > 0 且全绿**（§0.1 的教训）
+4. `--dry-run` 冒烟：**零手工 env**，只靠 profile，渲染出的 fleet input 里 `tick_channel` / `evidence_channel` / `allowed_root` / `max_writes` 全部非空且等于 profile 值
 
 ---
 
-## 3　硬验收（gate 逐条核，缺一不可）
+## 2　硬验收
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **T1** | ⛔ **从生产入口出发 + 假 agent-run 记 argv**，断言某条 `clue_text` 的字面**出现在位置参数**（`--` 之后）中 | 只断言 `--input` 被传了**不算数** |
-| **T2** | ⛔ **跨仓契约断言**：引擎组装的快照能通过 `agent-runtime/.../triage-input.v1.json` | 路径解析走 env + 回退 + 可用性守卫，**不得硬编码绝对路径** |
-| **T3** | `keep` ⇒ CAS `proposed→open`、`drop` ⇒ CAS `proposed→dropped`，且 `rationale` 落到卡上 | 各一条用例 |
-| **T4** | ⛔ **非法 `action`（如 `"maybe"`）被响亮拒绝**，既不当 keep 也不当 drop | 判别性用例；这是 §2.3(a) 的唯一执行点 |
-| **T5** | ⛔ **越界 `clue_id`（不在本轮 proposed 集合）被丢弃且响亮记录**，且**不改任何卡** | 断言「CAS 调用次数 = 0」 |
-| **T6** | 预算不足时**整批跳过并响亮报告**，不做半批 | 正反两例 |
-| **T7** | ⛔ **spawn 依赖必填且无条件调用**（无静默零-spawn 假成功）；临时文件在 `finally` 清理 | 读代码到行号 |
-| **T8** | 全量 `npx vitest run` 全绿，**文件数与用例数不少于基线 17 / 319** | 贴输出 |
-| **T9** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | 贴证据 |
-| **T10** | `tests/` 与 `src/` 的每一处删除都给出必要性说明（本包要改 `tick-run.ts` 的 no-op 分支，属必要） | — |
+| **E1** | ⛔ **不设任何相关 env 时，`TICK_CHANNEL` 不再回落到 smoke channel** —— 无 profile 且无显式 env ⇒ **响亮失败拒绝启动** | 正反两例：无 profile ⇒ 非零退出且错误消息点名；有 profile ⇒ 正常渲染 |
+| **E2** | ⛔ **`grep -rn "research:p02-smoke-1dce60" bin/ src/` 零命中**（smoke channel 字面从生产路径消失） | grep |
+| **E3** | **从 profile 出发的端到端渲染断言**：`--dry-run` 在**只设 `DEPLOY_PROFILE`、不设其它 env** 的子环境下跑，渲染出的 tick input 里 `tick_channel`/`evidence_channel`/`allowed_root`/`max_writes` **全部等于 profile 里的值** | ⛔ 用例必须**自证子环境里没有那些 env**（照 G1 的 D1b 写法：`expect(childEnv).not.toHaveProperty(...)`） |
+| **E4** | 加载优先级：**显式 env > profile > 内置缺省**，三层各一例 | 三条断言 |
+| **E5** | ⛔ **`EVIDENCE_CHANNEL` 仍保持「无默认 + 响亮失败」**，本包不得给它编缺省 | 反例：profile 里不给它 ⇒ 仍响亮失败 |
+| **E6** | 导出落点走配置、**源码里不硬编码 vault 路径**；导出件含 `source_message_id` 与终态标记 | grep + 用例 |
+| **E7** | `docs/deploy.md` 四步齐全，且**第 3 步是「用例数 > 0 且全绿」而不是只看 exit 0** | 读文档到行号 |
+| **E8** | 全量 `npx vitest run` **连跑 3 次全绿**，且文件数/用例数不少于基线 **18 / 333** | 贴三次输出 |
+| **E9** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **E10** | `src/`、`test/` 的每一处删除给出必要性说明 | — |
 
-> ⚠️ **本包不要求端到端真跑真 bus**：`dr-triage.result.v1` **尚未注册**（注册在异议窗口后由派发方执行），真发会 422。
-> 验收全部落在「接线可判别」上。⛔ **不得为让真跑通过而去注册协议。**
+> ⚠️ **E8 要求连跑 3 次**，理由：派发方在 G2a 合入后于生产 checkout 观察到**一次未能复现的失败**（1 failed / 318 passed），随后 9 次全绿，**未留下失败用例名**。
+> 故本包用「连跑 3 次」作为最低观察量，**若期间复现，请把失败用例名与完整输出贴进 dev-note**（这比修好它更重要——目前它连症状都没被记录）。
 
 ---
 
-## 4　变异矩阵（逐断言归因，不得只报 N/N）
+## 3　变异矩阵（逐断言归因）
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **N1** | 生产路径去掉位置参数里的快照（只留 `--input`） | **T1 必须挂**。⛔ 杀不掉即判 T1 零功率、必须重写 |
-| **N2** | 去掉 `action` 值域校验（非法值按 `keep` 处理） | **T4 必须挂** |
-| **N3** | 去掉 `clue_id` 越界检查（照单 CAS） | **T5 必须挂** |
+| **Q1** | 把 `TICK_CHANNEL` 的内置缺省改回 `research:p02-smoke-1dce60` | **E1 的失败侧 + E2 必须挂** |
+| **Q2** | 让 profile 加载覆盖显式 env（把优先级颠倒） | **E4 必须挂** |
+| **Q3** | 给 `EVIDENCE_CHANNEL` 编一个缺省值 | **E5 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 5　显式不做
+## 4　显式不做
 
 | 不做 | 理由 |
 |---|---|
 | 注册任何 bus 协议 | 不可逆，走公示流程，由派发方在异议窗口后执行 |
-| 改 `agent-runtime` | 不同仓。若发现 role/schema 需改，**停下在 review 说明，不跨仓改** |
-| 动生成段（`src/generate.ts` 的编排逻辑） | 归 G2a，已合入。本包只在需要复用其既有 helper 时**读它、照它的形状写**，不改它的行为 |
-| 改 `bin/deep-research-loop.sh` 的部署配置 | 归 D1 包 |
-| 端到端真跑真 bus | 协议未注册，真发必 422；留 Phase 6 |
+| 端到端真跑真研究 | 归 Phase 6；本包只做 `--dry-run` 层的配置贯通 |
+| 改 `agent-runtime` | 不同仓 |
+| 改生成段/收集段的编排逻辑 | 归 G2a/G2b，已合入 |
+| 修那个未复现的 flake | **本包只要求「连跑 3 次并如实记录」**；没有症状就动手修，等于凭猜改代码 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 6　交付物落点
+## 5　交付物落点
 
-- 实现：`src/tick-run.ts`（triage 分支的生产派发 + 收割 + CAS + 两条校验）、必要时 `src/tick.ts` 的类型扩展
-- 测试：`test/tick-run.test.ts` 或新增 `test/g2b-triage-wiring.test.ts`（T1–T7）
-- 证据：`docs/dev-notes/dev_ledr_g2b_triage_wiring_01.md`（T1–T10 逐条 + §4 变异矩阵三行 + 还原证据）
+- 实现：`profiles/deploy/*.env`（新增）、`bin/deep-research-loop.sh`（profile 加载 + 缺省改响亮失败）、
+  `src/export.ts`（落点走配置，若需要）
+- 文档：`docs/deploy.md`
+- 测试：`test/d1-deploy-config.test.ts`（E1–E7）
+- 证据：`docs/dev-notes/dev_ledr_d1_deploy_config_01.md`（E1–E10 逐条 + §3 变异矩阵三行 + 三次连跑输出）

@@ -97,7 +97,7 @@ fi
 #    真实证据 channel 存在且「无任何后缀」——没有 `.evidence` 兄弟 channel）。
 #    由板名做 `.board`→`.evidence` 之类推导在真实 channel 上静默推不出，且发布是 append-only
 #    无 DELETE、不可回退。因此这里**不给派生默认值**；部署方必须显式配置 EVIDENCE_CHANNEL 到
-#    **已核实存在**的证据 channel。未配置时留空，`--run` 一旦遇到 harvest 决策会响亮失败
+#    **由派发方于 2026-08-09 07:51Z 显式创建并复核（head_seq=0）**的证据 channel。未配置时留空，`--run` 一旦遇到 harvest 决策会响亮失败
 #    （§1.4 / H13/H14），绝不静默写进由字符串推导的错 channel。
 export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"
 # A8f——worker 可读的 repo 根：从 pipeline input namespace 注入 tick.md 供 `--run --allowed-root` 使用；

@@ -103,7 +103,6 @@ describe("Z2: old channel name absent from product files", () => {
   it("grep-equivalent: no product file under profiles/ bin/ src/ test/ docs/ contains the old literal", () => {
     const dirs = ["profiles", "bin", "src", "test", "docs"];
     const thisFile = fileURLToPath(import.meta.url);
-    const devNoteFile = join(ROOT, "docs", "dev-notes", "dev_ledr_d2_profile_01.md");
     const allFiles: string[] = [];
     for (const d of dirs) {
       const p = join(ROOT, d);
@@ -114,7 +113,7 @@ describe("Z2: old channel name absent from product files", () => {
     expect(allFiles.length).toBeGreaterThan(0);
     const oldLit = "research:v1" + "-deep-research";
     for (const f of allFiles) {
-      if (f === thisFile || f === devNoteFile) continue;
+      if (f === thisFile) continue;
       expect(readFileSync(f, "utf8")).not.toContain(oldLit);
     }
   });

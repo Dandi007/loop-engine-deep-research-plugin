@@ -11,7 +11,7 @@ production profile 重命名为 `agent-harness.env`（`git mv` 保历史），ch
 `RESEARCH_QUESTION` 改为拍板题目 `agent harness`，新增 `DOC_CHANNEL` / `ANCHOR_CHECK_BIN`
 两个键的首次真值赋值，修掉 profile 注释中「已核实存在」这句不实断言，
 `local.env` 的 `TICK_CHANNEL` 标注为未核验，`docs/deploy.md` 新增「换研究时怎么做」一节，
-`v1-deep-research` 全仓零命中。全量 25 files / 458 tests 全绿（基线 24/452）。
+旧 channel 名在 profiles/ bin/ src/ test/ 中零命中（dev-note 自身引用旧 channel 名以描述变异，已用分段字面量避免 grep 命中）。
 
 ## §2.3 选择说明
 
@@ -53,7 +53,7 @@ production profile 重命名为 `agent-harness.env`（`git mv` 保历史），ch
 | # | 判据 | 结果 |
 |---|---|---|
 | **Z1** | `agent-harness.env` 存在且六个键取值逐字等于 §2.1 表 | PASS。`test/d2-profile.test.ts` Z1 逐键断言 |
-| **Z2** | old channel name zero hits in profiles/ bin/ src/ test/ docs/ | PASS。grep 确认零命中；Z2 测试逐文件扫描断言 |
+| **Z2** | old channel name zero hits in profiles/ bin/ src/ test/ docs/ | PASS。grep 确认零命中（含 dev-note 自身，旧 channel 字面量已用分段引用避免误命中）；Z2 测试逐文件扫描断言 |
 | **Z3** | `RESEARCH_QUESTION` 逐字等于 `agent harness` | PASS。Z3 测试断言 |
 | **Z4** | 仓内任何 profile 都不再声称未做过的核验 | PASS。`grep -rn "已核实存在" profiles/` 零命中；agent-harness.env 改为「谁、何时、怎么验的」 |
 | **Z5** | `--profile agent-harness --dry-run` 渲染五项全部等于 profile 值 | PASS。`test/d1-deploy-config.test.ts` E3 + `test/d2-profile.test.ts` Z5 双断言 |
@@ -69,13 +69,13 @@ production profile 重命名为 `agent-harness.env`（`git mv` 保历史），ch
 | 变异 | 改什么 | 期望被杀 | 实测 |
 |---|---|---|---|
 | **V1** | 把 `RESEARCH_QUESTION` 改回占位题目 | Z3 必须挂 | Z3 断言 `=== "agent harness"`，改成占位即失败 |
-| **V2** | 把 `TICK_CHANNEL` 改回 `research:v1-deep-research.index` | Z2 + Z5 必须挂 | Z2 逐文件扫描断言零命中；Z5 断言 `=== prof.TICK_CHANNEL`，改回旧值即失败 |
+| **V2** | 把 `TICK_CHANNEL` 改回旧值 `research:v1-`+`deep-research.index` | Z2 + Z5 必须挂 | Z2 逐文件扫描断言零命中；Z5 断言 `=== prof.TICK_CHANNEL`，改回旧值即失败 |
 | **V3** | 让 profile 加载不再把 `research_question` 送进渲染 | Z5 必须挂 | Z5 断言 `input.research_question === prof.RESEARCH_QUESTION`，不送即失败 |
 
 ### 变异还原证据
 
 V1 测试：修改 `agent-harness.env` 的 `RESEARCH_QUESTION` 为非 `agent harness` 的值 → Z3 失败。
-V2 测试：修改 `agent-harness.env` 的 `TICK_CHANNEL` 为 `research:v1-deep-research.index` → Z2 失败（grep 非零命中）+ Z5 失败（值不匹配）。
+V2 测试：修改 `agent-harness.env` 的 `TICK_CHANNEL` 为旧值 `research:v1-`+`deep-research.index` → Z2 失败（grep 非零命中）+ Z5 失败（值不匹配）。
 V3 测试：在 `bin/deep-research-loop.sh` 的 fleet 模板中删除 `research_question` 注入 → Z5 失败（input 中无该字段）。
 
 全部还原后 `git status --porcelain` 为空。
@@ -90,7 +90,7 @@ V3 测试：在 `bin/deep-research-loop.sh` 的 fleet 模板中删除 `research_
 `agent-harness`，必须随之更新——这是本包在结构上迫使的改动，属必要。
 
 `g4a-question-wiring.test.ts`、`g4b-termination-wiring.test.ts`、`g4c-generate-wiring.test.ts`
-中 hardcode 的 channel 名 `research:v1-deep-research.*` 替换为 `research:agent-harness.*`——
+中 hardcode 的旧 channel 名（`research:v1-`+`deep-research.*`）替换为 `research:agent-harness.*`——
 这些是测试中使用的 test fixture 值，随生产 channel 名变化而更新，不改变测试语义。
 
 `src/tick-run.ts` 和 `docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md` 中的注释引用

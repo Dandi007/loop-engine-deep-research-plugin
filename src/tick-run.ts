@@ -43,7 +43,19 @@ import {
   type HarvestDeps,
   type HarvestReport,
 } from "./harvest";
-import { casUpdateClue, getEntity, publishClue, publishEvidence } from "./bus";
+import { casUpdateClue, getEntity, publishClue, publishEvidence, publishDoc } from "./bus";
+import {
+  runGenerate,
+  decideGenerate,
+  AnchorCheckNotWiredError,
+  spawnGenerateRole,
+  DEFAULT_GENERATE_CONFIG,
+  type GenerateConfig,
+  type GenerateDeps,
+  type GenerateSpawnRuntime,
+  type EvidenceView,
+} from "./generate";
+import { runExport, type ExportInput } from "./export";
 
 /**
  * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
@@ -322,6 +334,27 @@ export class TriggerBodyTerminationError extends Error {
     );
     this.name = "TriggerBodyTerminationError";
   }
+}
+
+/**
+ * G4c —— EXPORT_ROOT 未配置 ⇒ 响亮失败（spec §1.3）。
+ * ⛔ 不得静默跳过导出（产物 2 消失且没人知道）。
+ */
+export class MissingExportRootError extends Error {
+  constructor() {
+    super(
+      "G4c: EXPORT_ROOT is not configured. Refusing to silently skip the export — product 2 would vanish with no trace.",
+    );
+    this.name = "MissingExportRootError";
+  }
+}
+
+/** G4c —— 一次性保证：已生成过的 origin 集合（module-level，同进程内多 tick 共享）。 */
+const generatedOrigins = new Set<string>();
+
+/** G4c —— 测试/重置用：清空一次性保证记录。 */
+export function resetGeneratedOrigins(): void {
+  generatedOrigins.clear();
 }
 
 /**
@@ -939,6 +972,20 @@ export interface RunWriteOptions {
    * 生产由 tick.md 从 `{{trigger_body}}` 解析后以 `--prev-zero-growth` 传入；首轮无前值传 0。
    */
   prevZeroGrowthRounds?: number;
+  /**
+   * G4c —— 本次研究 id（生成段产物回写的 origin）。
+   * 取值来源必须显式且稳定（同一次研究的多个 tick 必须得到同一个 origin，
+   * 否则 writeDoc 的幂等键失效）。
+   */
+  origin?: string;
+  /**
+   * G4c —— 生成段配置（缺省 DEFAULT_GENERATE_CONFIG）。
+   */
+  generateConfig?: GenerateConfig;
+  /**
+   * G4c —— 注入的 generate deps（测试用）；缺省走生产接线。
+   */
+  generateDeps?: Partial<GenerateDeps>;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -964,6 +1011,11 @@ export interface RunWriteOutcome {
    * `termination.coverage` / `termination.zeroGrowthRounds` 写进下一条 trigger 的 body。
    */
   termination: TerminationState;
+  /**
+   * G4c —— 本 tick 是否触发了生成段（runGenerate 被调用且非空转）。
+   * 供 tick 消费者（tick.md pipeline）判断是否已跑过生成段，避免重复触发。
+   */
+  generateTriggered: boolean;
 }
 
 /**
@@ -1354,6 +1406,95 @@ export async function runChannelWrite(
     },
     DEFAULT_TICK_CONFIG,
   );
+
+  // G4c —— 生成段触发边：终态非 null 且 origin 已配置且同一次研究尚未生成过 ⇒ 调用 runGenerate。
+  // ⛔ 一次性保证：同 origin 只跑一次（幂等——writeDoc 的 idempotencyKey 保护 bus 写入，
+  //    但导出与 spawn 的重复执行不受它保护，此处杜绝重复触发）。
+  let generateTriggered = false;
+  const origin = opts.origin;
+  if (origin && decideGenerate(termination) && !generatedOrigins.has(origin)) {
+    generatedOrigins.add(origin);
+    generateTriggered = true;
+    const cfg = opts.generateConfig ?? DEFAULT_GENERATE_CONFIG;
+    const blockCount = postWriteState.cards.filter((c) => c.status === "blocked").length;
+    const evidenceViews = collectEvidenceViews(messages);
+    if (evidenceChannelId && evidenceChannelId !== opts.channelId) {
+      const evidenceMessages = await readChannelMessages(evidenceChannelId);
+      evidenceViews.push(...collectEvidenceViews(evidenceMessages));
+    }
+    const generateDeps: GenerateDeps = {
+      readTermination: async () => termination,
+      countBlocked: async () => blockCount,
+      readQuestion: async () => {
+        if (opts.question !== undefined) return opts.question;
+        throw new Error("G4c: readQuestion not wired (provide --question)");
+      },
+      readOrigin: async () => origin,
+      readEvidences: async () => evidenceViews,
+      spawnRole: opts.generateDeps?.spawnRole ??
+        (async (role, route, corpus) => {
+          const runId = randomUUID();
+          const runtime: GenerateSpawnRuntime = {
+            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+            runId,
+            spawnProcess: async (argv, env) => {
+              await spawnWorkerProcess({
+                cmd: argv[0],
+                args: argv.slice(1),
+                env,
+                onExit: () => {},
+              });
+              return {};
+            },
+            readBody: async (runId) => {
+              const results = findWorkerResult(runId, runsMessages);
+              if (results) {
+                const body = (results as Record<string, unknown>).body;
+                if (typeof body === "string") return body;
+              }
+              throw new Error(`generate role ${role} result not found for run ${runId}`);
+            },
+          };
+          return spawnGenerateRole(role, route, corpus, runtime);
+        }),
+      spawnAnchorCheck: opts.generateDeps?.spawnAnchorCheck ??
+        (async () => { throw new AnchorCheckNotWiredError(); }),
+      spawnExport: opts.generateDeps?.spawnExport ??
+        (async (body, sourceMessageId) => {
+          const exportRoot = process.env.EXPORT_ROOT;
+          if (!exportRoot) throw new MissingExportRootError();
+          const question = opts.question ?? "untitled";
+          const input: ExportInput = {
+            report: { doc_kind: "report", digest: "", body, origin },
+            sourceMessageId,
+            createdAt: new Date().toISOString(),
+            topic: question,
+          };
+          await runExport(
+            { writeFile: async (path, content) => { const { writeFileSync } = await import("node:fs"); writeFileSync(path, content, "utf8"); } },
+            input,
+            exportRoot,
+          );
+        }),
+      writeDoc: opts.generateDeps?.writeDoc ??
+        (async (doc, key) => {
+          const channelId = opts.channelId;
+          const resp = await publishDoc(channelId, doc, key);
+          return resp.message_id;
+        }),
+      lockSynthesizer: opts.generateDeps?.lockSynthesizer ??
+        (async () => {
+          let released = false;
+          return async () => {
+            if (released) return;
+            released = true;
+          };
+        }),
+      spawnRuntime: opts.generateDeps?.spawnRuntime,
+    };
+    await runGenerate(generateDeps, cfg);
+  }
+
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -1365,6 +1506,7 @@ export async function runChannelWrite(
     triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
+    generateTriggered,
   };
 }
 
@@ -1402,6 +1544,27 @@ function collectEvidenceClueIds(messages: InspectMessage[]): string[] {
     if (typeof clueId === "string" && clueId.length > 0) ids.push(clueId);
   }
   return ids;
+}
+
+/**
+ * G4c —— 从消息数组里收集 research.evidence.v2 的 EvidenceView（anchor/quote/claim/clue_id）。
+ * 供生成段的 readEvidences 使用。纯函数：不碰 IO，只折叠已读消息数组。
+ */
+function collectEvidenceViews(messages: InspectMessage[]): EvidenceView[] {
+  const views: EvidenceView[] = [];
+  for (const msg of messages) {
+    if (msg.kind !== "research.evidence.v2") continue;
+    const p = msg.payload as Partial<EvidenceView> | null;
+    if (!p) continue;
+    const clueId = p.clue_id;
+    const anchor = p.anchor;
+    const quote = p.quote;
+    const claim = p.claim;
+    if (typeof clueId === "string" && typeof anchor === "string" && typeof quote === "string" && typeof claim === "string") {
+      views.push({ clue_id: clueId, anchor, quote, claim });
+    }
+  }
+  return views;
 }
 
 /**
@@ -1449,6 +1612,8 @@ export interface RunCliOptions {
    * 首轮无前值时不传，runChannelWrite 缺省 0。
    */
   prevZeroGrowthRounds?: number;
+  /** G4c——本次研究 id（--origin）；生成段产物回写的 origin。 */
+  origin?: string;
 }
 
 /**
@@ -1468,6 +1633,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let question: string | undefined;
   let prevCoverage: number | undefined;
   let prevZeroGrowthRounds: number | undefined;
+  let origin: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1518,6 +1684,14 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       prevZeroGrowthRounds = value;
       i += 1;
+    } else if (args[i] === "--origin") {
+      origin = args[i + 1];
+      if (!origin) {
+        throw new Error(
+          "G4c: invalid --origin (must specify the research id).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1534,5 +1708,6 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;
   if (prevZeroGrowthRounds !== undefined)
     result.prevZeroGrowthRounds = prevZeroGrowthRounds;
+  if (origin !== undefined) result.origin = origin;
   return result;
 }

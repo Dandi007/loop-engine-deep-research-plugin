@@ -104,6 +104,25 @@ describe("E1: TICK_CHANNEL default is a loud failure, not the smoke channel", ()
     const input = tickInput(res.out);
     expect(input.tick_channel).toBe(readProfile("production").TICK_CHANNEL);
   });
+
+  it("--profile with a missing operand fails loudly instead of degrading silently", () => {
+    const childEnv = cleanChildEnv();
+    let res: { code: number; out: string; err: string };
+    try {
+      const out = execFileSync("bash", [BIN, "--dry-run", "--profile"], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: childEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      res = { code: 0, out, err: "" };
+    } catch (e) {
+      const err = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+      res = { code: err.status ?? -1, out: String(err.stdout ?? ""), err: String(err.stderr ?? "") };
+    }
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/--profile/);
+  });
 });
 
 // ── E2：smoke channel 字面从生产路径消失 ─────────────────────────────
@@ -204,7 +223,12 @@ describe("E6: export root is config-driven; content carries source_message_id + 
     expect(src).toMatch(/vaultRoot/);
     expect(src).not.toMatch(/\/data\//);
     const path = deriveExportPath(exportInput(), prof.EXPORT_ROOT);
-    expect(path.startsWith(`${prof.EXPORT_ROOT}/DeepThought/`)).toBe(true);
+    // ⛔ 反双嵌套：EXPORT_ROOT 必须是 vault 根（不含 DeepThought 段）。若 profile 写成
+    //   …/DeepThought，deriveExportPath 再追加 'DeepThought/' ⇒ 双重嵌套；此断言能抓住它。
+    expect(prof.EXPORT_ROOT).not.toMatch(/DeepThought\s*$/);
+    const slug = exportInput().topic.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/^-+|-+$/g, "");
+    const date = exportInput().createdAt.slice(0, 10);
+    expect(path).toBe(`${prof.EXPORT_ROOT}/DeepThought/${slug}/${date}-${slug}.md`);
   });
 
   it("export content carries source_message_id and the terminal marker", () => {

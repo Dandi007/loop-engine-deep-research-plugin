@@ -22,7 +22,11 @@ for ((_i=0; _i<${#_args[@]}; _i++)); do
     --dry-run) DRY_RUN=1 ;;
     --profile)
       _i=$((_i+1))
-      PROFILE="${_args[$_i]:-}"
+      if [ -z "${_args[$_i]:-}" ] || [[ "${_args[$_i]}" == --* ]]; then
+        echo "[deep-research-loop] --profile requires an operand (usage: --profile <name>, e.g. --profile production)" >&2
+        exit 3
+      fi
+      PROFILE="${_args[$_i]}"
       ;;
   esac
 done

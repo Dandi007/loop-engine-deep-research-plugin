@@ -23,10 +23,13 @@ function run(argv: string[], env: NodeJS.ProcessEnv = {}): string {
 
 // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；测试统一显式提供。
 const TEST_TICK_CHANNEL = "research:v1-test.index";
+// G4a —— 渲染需要 RESEARCH_QUESTION（无内置缺省、未配置即响亮失败）；测试统一显式提供。
+const TEST_QUESTION = "test research question";
 
 function dryRun(): string {
   return run([join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"], {
     TICK_CHANNEL: TEST_TICK_CHANNEL,
+    RESEARCH_QUESTION: TEST_QUESTION,
   });
 }
 
@@ -207,7 +210,7 @@ describe("N9 template switched to real tick entry, selfcheck preserved", () => {
     // 3) workflow seed payload 把 tick_channel 从 pipeline input namespace 注入。
     expect(workflowText).toMatch(/tick_channel:\s*"\{\{tick_channel\}\}"/);
     // 4) tick.md 在非空 tick_channel 时确实执行 --run（而不是永远落 --selfcheck）。
-    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"/);
+    expect(tickMd).toMatch(/tick_args=\("\$tick_entry" --run "\$tick_channel"\)/);
     // 5) 渲染产物：pipeline input 里 tick_channel 有非空值（真实 wiring 成立）。
     const doc = parse(dryRun());
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -259,7 +262,7 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     //    ⇒ 必填 `{{evidence_channel}}` 填充即抛「模板填充缺值」⇒ tick 节点无法起跑；`?` 渲成空串。
     expect(workflowText).toMatch(/evidence_channel:\s*"\{\{evidence_channel\?\}\}"/);
     // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run。
-    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"\s+\-\-evidence-channel\s+"\$evidence_channel"/);
+    expect(tickMd).toMatch(/tick_args\+=\(--evidence-channel\s+"\$evidence_channel"\)/);
     // 5) 渲染产物：pipeline input 里 evidence_channel 有非空值（真实 wiring 成立）。
     //    ⛔ 装配脚本**无派生默认值**（spec §1.4 / H15：证据 channel 不得由板 channel 推导），
     //    部署方必须显式配置。这里显式注入一个非派生值以证明「fleet → workflow → template」
@@ -267,7 +270,7 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     const explicit = "research:p02-smoke-1dce60.evidence";
     const rendered = run(
       [join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"],
-      { EVIDENCE_CHANNEL: explicit, TICK_CHANNEL: TEST_TICK_CHANNEL },
+      { EVIDENCE_CHANNEL: explicit, TICK_CHANNEL: TEST_TICK_CHANNEL, RESEARCH_QUESTION: TEST_QUESTION },
     );
     const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;

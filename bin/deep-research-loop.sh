@@ -80,6 +80,15 @@ if [ -z "$TICK_CHANNEL" ]; then
   echo "[deep-research-loop] TICK_CHANNEL is not set. Refusing to start: the bus is append-only with no DELETE, so a default that writes to a real channel is irreversible. Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set TICK_CHANNEL explicitly." >&2
   exit 3
 fi
+# G4a —— 研究主问题（`tick-entry --run --question`）：从部署配置一路贯通到 triage 语料。
+# ⛔ **无内置缺省**（与 TICK_CHANNEL 同一条道理）：一个编出来的缺省问题会让整场研究跑偏，
+#    而 bus 写入 append-only 不可回退。也**绝不**从 channel 名 / topic slug 推导问题字符串
+#    （同 EVIDENCE_CHANNEL 当初拒绝做的静默推导）。未由 profile 或显式 env 提供 ⇒ 响亮失败拒绝启动。
+export RESEARCH_QUESTION="${RESEARCH_QUESTION:-}"
+if [ -z "$RESEARCH_QUESTION" ]; then
+  echo "[deep-research-loop] RESEARCH_QUESTION is not set. Refusing to start: a research question is required for --question, and an invented or derived default would skew the whole study (bus writes are append-only and irreversible). Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set RESEARCH_QUESTION explicitly." >&2
+  exit 3
+fi
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
 # ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：

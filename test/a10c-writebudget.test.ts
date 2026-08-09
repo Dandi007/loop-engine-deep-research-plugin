@@ -42,6 +42,8 @@ function renderedDefaultMaxWrites(): number {
   delete childEnv.MAX_WRITES;
   // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
   childEnv.TICK_CHANNEL = "research:v1-test.index";
+  // G4a —— 渲染需要 RESEARCH_QUESTION（无内置缺省、未配置即响亮失败）；显式提供。
+  childEnv.RESEARCH_QUESTION = "test question";
   const out = execFileSync("bash", [BIN, "--dry-run"], {
     cwd: ROOT,
     encoding: "utf8",
@@ -72,17 +74,11 @@ describe("A10c D3: --max-writes plumbed from bin → fleet → workflow → tick
     expect(wf).toMatch(/max_writes:\s*"\{\{max_writes\}\}"/);
   });
 
-  it("tick.md passes --max-writes to tick-entry --run (all four branches)", () => {
+  it("tick.md passes --max-writes to tick-entry --run (incremental argv build)", () => {
     const md = readFileSync(TICK_MD, "utf8");
     expect(md).toMatch(/max_writes="\{\{max_writes\}\}"/);
-    // 每条 `--run` 分支都必须带上 --max-writes。
-    const runLines = md
-      .split("\n")
-      .filter((l) => l.includes('"$tick_entry" --run'));
-    expect(runLines.length).toBeGreaterThanOrEqual(4);
-    for (const line of runLines) {
-      expect(line).toMatch(/--max-writes\s+"\$max_writes"/);
-    }
+    // G4a 重构（spec §1.2）：不再展开组合分支树，改增量拼 argv；--max-writes 无条件追加。
+    expect(md).toMatch(/tick_args\+=\(--max-writes\s+"\$max_writes"\)/);
   });
 });
 
@@ -122,7 +118,7 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,
       encoding: "utf8",
-      env: { ...process.env, MAX_WRITES: "64", TICK_CHANNEL: "research:v1-test.index" },
+      env: { ...process.env, MAX_WRITES: "64", TICK_CHANNEL: "research:v1-test.index", RESEARCH_QUESTION: "test question" },
     });
     const doc = parse(out);
     const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -202,6 +198,8 @@ describe("G1 D1: default budget is a finite positive integer >= MIN_VIABLE_BUDGE
     expect(childEnv).not.toHaveProperty("MAX_WRITES");
     // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
     childEnv.TICK_CHANNEL = "research:v1-test.index";
+    // G4a —— 渲染需要 RESEARCH_QUESTION（无内置缺省、未配置即响亮失败）；显式提供。
+    childEnv.RESEARCH_QUESTION = "test question";
 
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,

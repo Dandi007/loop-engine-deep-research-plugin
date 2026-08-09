@@ -143,6 +143,7 @@ describe("F2/F3: unresolvable runner ⇒ loud failure, never falls back to node"
       LOOP_ENGINE_CLI: fake.cli,
       LOOP_ENGINE_RUNNER: join(fake.dir, "does-not-exist"),
       TICK_CHANNEL: "research:v1-test.index",
+      RESEARCH_QUESTION: "test question",
     });
     expect(res.code).not.toBe(0);
     expect(res.err).toMatch(/runner|bun/i);
@@ -166,6 +167,7 @@ describe("F4: driver puts a trigger into TRIGGER_STORE_DIR before drain", () => 
       RUNNER_LOG: log,
       DD_RUN_ROOT: runRoot,
       TICK_CHANNEL: "research:v1-test.index",
+      RESEARCH_QUESTION: "test question",
     });
     expect(res.code).toBe(0);
     const lines = readFileSync(log, "utf8").trim().split("\n");
@@ -195,6 +197,7 @@ describe("F5: trigger record shape {id, status:'open', body} is claimable", () =
       RUNNER_LOG: log,
       DD_RUN_ROOT: runRoot,
       TICK_CHANNEL: "research:v1-test.index",
+      RESEARCH_QUESTION: "test question",
     });
     const lines = readFileSync(log, "utf8").trim().split("\n");
     const payload = JSON.parse(lines[3]);
@@ -234,10 +237,11 @@ describe("F6: trigger_store_dir wired end-to-end through the assembly", () => {
     expect(tickMd).toMatch(/\$trigger_store_dir/);
     // 渲染后 input.trigger_store_dir 有非空值（真实 wiring 成立）。
     // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败），显式提供。
+    // G4a —— 渲染需要 RESEARCH_QUESTION（无内置缺省），显式提供。
     const rendered = execFileSync("bash", [SCRIPT, "--dry-run"], {
       cwd: ROOT,
       encoding: "utf8",
-      env: { ...process.env, TICK_CHANNEL: "research:v1-test.index" },
+      env: { ...process.env, TICK_CHANNEL: "research:v1-test.index", RESEARCH_QUESTION: "test question" },
     });
     const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;

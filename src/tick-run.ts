@@ -1262,7 +1262,7 @@ export async function spawnAgentRunWorker(opts: {
  * 提供 runGenerate 所需的全部副作用（读终态/blocked 计数/question/origin/evidences、
  * spawnRole/spawnRuntime、anchorCheck/export/writeDoc/lockSynthesizer）。
  */
-function assembleGenerateDeps(
+export function assembleGenerateDeps(
   opts: RunWriteOptions,
   termination: TerminationState,
   postWriteState: BoardState,

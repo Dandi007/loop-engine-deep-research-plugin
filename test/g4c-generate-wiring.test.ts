@@ -32,11 +32,12 @@ import {
   MissingExportRootError,
   MissingDocChannelError,
   MissingOriginError,
+  assembleGenerateDeps,
 } from "../src/tick-run";
 import { runGenerate, DEFAULT_GENERATE_CONFIG, type GenerateDeps } from "../src/generate";
 import { deriveExportPath } from "../src/export";
 import type { InspectMessage } from "../src/tick-inspect";
-import type { TerminationState } from "../src/tick";
+import type { TerminationState, BoardState } from "../src/tick";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TICK_MD = join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md");
@@ -608,6 +609,24 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
     const err = new AnchorCheckNotWiredError();
     expect(err.name).toBe("AnchorCheckNotWiredError");
     expect(err.message).toContain("anchor-check is not wired");
+  });
+
+  it("discriminative T5: production assembleGenerateDeps spawnAnchorCheck throws AnchorCheckNotWiredError", async () => {
+    const oneShotDir = uniqueOneShotDir("u7-t5");
+    const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
+    const deps = assembleGenerateDeps(
+      {
+        channelId: CHANNEL,
+        origin: "test-origin",
+        docChannelId: "research:doc",
+        question: "test question",
+        oneShotDir,
+      },
+      term(),
+      postWriteState,
+    );
+    await expect(deps.spawnAnchorCheck("anchor-check")).rejects.toThrow(AnchorCheckNotWiredError);
+    rmSync(oneShotDir, { recursive: true, force: true });
   });
 });
 

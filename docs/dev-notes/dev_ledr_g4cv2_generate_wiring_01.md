@@ -13,8 +13,13 @@ input_commit: `3b692f3232e0178118c7f4eac484d44b6277b3ef`
 `writeDoc` 返回 message_id 并传给 `spawnExport`；`spawnExport` 检查 `EXPORT_ROOT` 并 `mkdir -p`。
 `spawnAnchorCheck` 生产抛 `AnchorCheckNotWiredError`（头部标 `unavailable`）。
 `lockSynthesizer` 用 `openSync(lockPath, "wx")` 原子文件锁。
-新增 `test/g4c-generate-wiring.test.ts`（17 条，U1–U9、U11）。
-全量 **22 files / 408 tests** 全绿（基线 21/391 之上）。
+新增 `test/g4c-generate-wiring.test.ts`（18 条，U1–U9、U11）。
+全量 **22 files / 409 tests** 全绿（基线 21/391 之上）。
+
+```
+ Test Files  22 passed (22)
+      Tests  409 passed (409)
+```
 
 ## 产品改动
 
@@ -52,7 +57,7 @@ input_commit: `3b692f3232e0178118c7f4eac484d44b6277b3ef`
 - **`workflows/deep-research/tick/templates/tick.md`**：加 `research_origin="{{research_origin}}"`
   和 `doc_channel="{{doc_channel}}"`；增量拼 argv 加 `--origin` / `--doc-channel`。
 
-- **`test/g4c-generate-wiring.test.ts`**：17 条测试（U1–U9、U11）。
+- **`test/g4c-generate-wiring.test.ts`**：18 条测试（U1–U9、U11）。
 
 ## 验收证据
 
@@ -64,7 +69,7 @@ input_commit: `3b692f3232e0178118c7f4eac484d44b6277b3ef`
 | **U4** | 导出件带 source_message_id，等于 writeDoc 返回的 message_id | ✅ |
 | **U5** | EXPORT_ROOT 未配置 ⇒ MissingExportRootError；导出路径结构正确 | ✅ |
 | **U6** | createdAt 取自 bus created_at，无 new Date() 兜底 | ✅ grep 源码 |
-| **U7** | anchor-check 未接线 ⇒ 头部标 unavailable | ✅ 生产 dep 抛 AnchorCheckNotWiredError |
+| **U7** | anchor-check 未接线 ⇒ 头部标 unavailable | ✅ 生产 dep 抛 AnchorCheckNotWiredError + 判别性 T5（直接调用 assembleGenerateDeps 断言 spawnAnchorCheck 抛错） |
 | **U8** | --origin 与 --doc-channel argv 记录 | ✅ 渲染 tick.md + 假 tick-entry |
 | **U9** | 值缺省 ⇒ 不出现该 flag | ✅ 正反两例 |
 | **U11** | synthesizer 并发 = 1，export 最后 | ✅ 两例 |

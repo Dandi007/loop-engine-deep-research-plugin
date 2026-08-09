@@ -33,10 +33,13 @@ import {
 import {
   assembleBoard,
   buildRunsFromMessages,
+  findTriageResult,
   findWorkerResult,
   readChannelMessages,
   readGenerateResult,
+  readTriageResult,
   type InspectMessage,
+  type TriageResultDecision,
 } from "./tick-inspect";
 import {
   harvestCard,
@@ -99,13 +102,6 @@ export interface TriageCorpus {
     sources?: string[];
   }>;
   explored_summaries?: string[];
-}
-
-/** G2b —— `dr-triage.result.v1` 的一条决策（`{clue_id, action, rationale}`）。 */
-export interface TriageResultDecision {
-  clue_id: string;
-  action: "keep" | "drop";
-  rationale: string;
 }
 
 /** G2b —— 一次 triage 的收割报告（整批预算跳过的判别点 / 校验拒绝计数）。 */
@@ -210,26 +206,6 @@ export async function spawnTriageRole(
     // 载荷文件用后即删，不泄漏 tmp（§1.3）。
     rmSync(inputPath, { force: true });
   }
-}
-
-/**
- * G2b §2.3(b) —— 从已读的 `board:agent-runs` 消息数组里，按 run_id 找该 run 的
- * `dr-triage.result.v1` 决策列表。找不到 ⇒ 返回 null。
- */
-export function findTriageResult(
-  runId: string,
-  messages: InspectMessage[],
-): TriageResultDecision[] | null {
-  let found: unknown = null;
-  for (const msg of messages) {
-    if (msg.kind !== "dr-triage.result.v1") continue;
-    const payload = (msg.payload ?? {}) as Record<string, unknown>;
-    if (payload.run_id !== runId) continue;
-    found = payload;
-  }
-  if (found === null) return null;
-  const decisions = (found as { decisions?: unknown }).decisions;
-  return Array.isArray(decisions) ? (decisions as TriageResultDecision[]) : [];
 }
 
 /** G2b §2.3(a) —— 非法 action 被响亮拒绝（bus `openSchema()` 会剥掉 enum，bus 拦不住）。 */
@@ -484,11 +460,11 @@ export interface WriteDeps {
   harvest?: HarvestDeps;
   /**
    * G2b —— triage 派发（可选，缺省走生产 `spawnTriageRole`）。
-   * 喂入引擎组装的板面快照语料，回收 `dr-triage.result.v1` 决策列表。
+   * 喂入引擎组装的板面快照语料，回收 `dr-triage.result.v1` 决策列表与 runId。
    * ⛔ 遇 triage 决策必须**无条件调用**（§1.3 / T7）；缺省经 `triageSpawnRuntime`
    *   （其 `spawnProcess` 必填）。两者都不提供时遇 triage 决策 ⇒ 响亮失败，绝不静默跳过。
    */
-  spawnTriage?: (corpus: TriageCorpus) => Promise<TriageResultDecision[]>;
+  spawnTriage?: (corpus: TriageCorpus) => Promise<{ decisions: TriageResultDecision[]; runId: string }>;
   /** G2b —— 缺省 spawnTriage 的生产运行时（不注入 spawnTriage 时使用）。 */
   triageSpawnRuntime?: TriageSpawnRuntime;
   /**
@@ -836,15 +812,18 @@ export async function runWrite(
                 "WriteDeps.spawnTriage has no default: provide spawnTriage or a triageSpawnRuntime",
               );
             }
-            return spawnTriageRole(corp, deps.triageSpawnRuntime);
+            return spawnTriageRole(corp, deps.triageSpawnRuntime).then(
+              (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
+            );
           });
-        const result = await spawnTriage(corpus);
+        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
         const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
         const applied = await applyTriageBatch(
           deps,
           { writes, maxWrites },
           proposedIds,
-          result,
+          triageDecisions,
+          triageRunId,
         );
         writes = applied.writes;
         triageReports.push(applied.report);
@@ -881,6 +860,7 @@ async function applyTriageBatch(
   ctx: { writes: number; maxWrites: number },
   proposedIds: Set<string>,
   decisions: TriageResultDecision[],
+  runId: string,
 ): Promise<{ writes: number; report: TriageReport }> {
   // (a) action 值域：bus `openSchema()` 会剥掉 enum ⇒ bus 拦不住，引擎消费侧必须自校验。
   let invalidActions = 0;
@@ -909,7 +889,7 @@ async function applyTriageBatch(
     return {
       writes: ctx.writes,
       report: {
-        runId: "",
+        runId,
         budgetSkipped: true,
         invalidActions,
         outOfScopeDropped,
@@ -935,7 +915,7 @@ async function applyTriageBatch(
   return {
     writes,
     report: {
-      runId: "",
+      runId,
       budgetSkipped: false,
       invalidActions,
       outOfScopeDropped,
@@ -1538,9 +1518,20 @@ export async function runChannelWrite(
               });
               return {};
             },
-            readResult: async (runId) => findTriageResult(runId, runsMessages) ?? [],
+            readResult: async (runId) => {
+              for (let i = 0; i < 30; i++) {
+                const result = await readTriageResult(runId);
+                if (result !== null) return result;
+                await new Promise((r) => setTimeout(r, 1000));
+              }
+              throw new Error(
+                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after 30 retries`,
+              );
+            },
           };
-        return spawnTriageRole(corpus, runtime);
+        return spawnTriageRole(corpus, runtime).then(
+            (decisions) => ({ decisions, runId: runtime.runId }),
+          );
       }),
   };
   const result = await runWrite(

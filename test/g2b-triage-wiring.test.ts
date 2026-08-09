@@ -26,9 +26,9 @@ import type {
   WriteDeps,
   WriteCasInput,
   TriageCorpus,
-  TriageResultDecision,
   TriageSpawnRuntime,
 } from "../src/tick-run";
+import type { TriageResultDecision } from "../src/tick-inspect";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -169,7 +169,7 @@ describe.skipIf(!agentRuntimeAvailable)(
       const deps = baseDeps({
         spawnTriage: vi.fn(async (corpus: TriageCorpus) => {
           captured = corpus;
-          return [];
+          return { decisions: [], runId: "t2-test" };
         }),
       });
       await runWrite(deps, [triageDecision()], 10);
@@ -196,10 +196,13 @@ describe("T3: triage decisions CAS proposed→open / proposed→dropped with rat
         captured.push(input);
         return { success: true };
       }),
-      spawnTriage: vi.fn(async () => [
-        { clue_id: "c1", action: "keep", rationale: "keep it" },
-        { clue_id: "c2", action: "drop", rationale: "drop it" },
-      ] as TriageResultDecision[]),
+      spawnTriage: vi.fn(async () => ({
+        decisions: [
+          { clue_id: "c1", action: "keep", rationale: "keep it" },
+          { clue_id: "c2", action: "drop", rationale: "drop it" },
+        ] as TriageResultDecision[],
+        runId: "t3-test",
+      })),
     });
     const result = await runWrite(deps, [triageDecision()], 10);
 
@@ -226,9 +229,12 @@ describe("T4: invalid action is rejected loudly, never treated as keep/drop", ()
     const cas = vi.fn(async (input: WriteCasInput) => ({ success: true }));
     const deps = baseDeps({
       cas,
-      spawnTriage: vi.fn(async () => [
-        { clue_id: "c1", action: "maybe", rationale: "x" },
-      ] as unknown as TriageResultDecision[]),
+      spawnTriage: vi.fn(async () => ({
+        decisions: [
+          { clue_id: "c1", action: "maybe", rationale: "x" },
+        ] as unknown as TriageResultDecision[],
+        runId: "t4-test",
+      })),
     });
     await expect(runWrite(deps, [triageDecision()], 10)).rejects.toBeInstanceOf(
       InvalidTriageActionError,
@@ -248,10 +254,13 @@ describe("T5: out-of-scope clue_id is discarded loudly and CASes nothing", () =>
     const cas = vi.fn(async (input: WriteCasInput) => ({ success: true }));
     const deps = baseDeps({
       cas,
-      spawnTriage: vi.fn(async () => [
-        { clue_id: "c1", action: "keep", rationale: "in scope" },
-        { clue_id: "ghost", action: "keep", rationale: "not mine" },
-      ] as TriageResultDecision[]),
+      spawnTriage: vi.fn(async () => ({
+        decisions: [
+          { clue_id: "c1", action: "keep", rationale: "in scope" },
+          { clue_id: "ghost", action: "keep", rationale: "not mine" },
+        ] as TriageResultDecision[],
+        runId: "t5-test",
+      })),
     });
     await expect(runWrite(deps, [triageDecision()], 10)).rejects.toBeInstanceOf(
       OutOfScopeTriageClueError,
@@ -268,11 +277,14 @@ describe("T6: insufficient write budget skips the whole batch loudly, no half ba
     const cas = vi.fn(async (input: WriteCasInput) => ({ success: true }));
     const deps = baseDeps({
       cas,
-      spawnTriage: vi.fn(async () => [
-        { clue_id: "c1", action: "keep", rationale: "r1" },
-        { clue_id: "c2", action: "drop", rationale: "r2" },
-        { clue_id: "c3", action: "keep", rationale: "r3" },
-      ] as TriageResultDecision[]),
+      spawnTriage: vi.fn(async () => ({
+        decisions: [
+          { clue_id: "c1", action: "keep", rationale: "r1" },
+          { clue_id: "c2", action: "drop", rationale: "r2" },
+          { clue_id: "c3", action: "keep", rationale: "r3" },
+        ] as TriageResultDecision[],
+        runId: "t6-sufficient",
+      })),
     });
     const decision = triageDecision([
       { clueId: "c1", clueText: "a" },
@@ -289,11 +301,14 @@ describe("T6: insufficient write budget skips the whole batch loudly, no half ba
     const cas = vi.fn(async (input: WriteCasInput) => ({ success: true }));
     const deps = baseDeps({
       cas,
-      spawnTriage: vi.fn(async () => [
-        { clue_id: "c1", action: "keep", rationale: "r1" },
-        { clue_id: "c2", action: "keep", rationale: "r2" },
-        { clue_id: "c3", action: "keep", rationale: "r3" },
-      ] as TriageResultDecision[]),
+      spawnTriage: vi.fn(async () => ({
+        decisions: [
+          { clue_id: "c1", action: "keep", rationale: "r1" },
+          { clue_id: "c2", action: "keep", rationale: "r2" },
+          { clue_id: "c3", action: "keep", rationale: "r3" },
+        ] as TriageResultDecision[],
+        runId: "t6-insufficient",
+      })),
     });
     const decision = triageDecision([
       { clueId: "c1", clueText: "a" },
@@ -338,7 +353,7 @@ describe("T7: spawn is required & unconditionally called; temp file cleaned in f
     const deps: WriteDeps = {
       cas: vi.fn(async () => ({ success: true })),
       spawnWorker: vi.fn(async () => {}),
-      spawnTriage: vi.fn(async () => []),
+      spawnTriage: vi.fn(async () => ({ decisions: [], runId: "t7-test" })),
       // ⛔ 不提供 readQuestion
     };
     await expect(runWrite(deps, [triageDecision()], 10)).rejects.toBeInstanceOf(

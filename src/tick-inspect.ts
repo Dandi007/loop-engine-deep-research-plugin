@@ -312,6 +312,50 @@ export async function readGenerateResult(
 }
 
 /**
+ * G5 —— `dr-triage.result.v1` 的一条决策（`{clue_id, action, rationale}`）。
+ */
+export interface TriageResultDecision {
+  clue_id: string;
+  action: "keep" | "drop";
+  rationale: string;
+}
+
+/**
+ * G5 —— 从已读的消息数组里，按 run_id 找该 run 的 `dr-triage.result.v1` 决策列表。
+ * 与 `findGenerateResult` 同构，但过滤 `kind === "dr-triage.result.v1"`。
+ * 取 payload.run_id 匹配的**最后一条**（同 run 后发覆盖先发）。找不到 ⇒ 返回 null。
+ */
+export function findTriageResult(
+  runId: string,
+  messages: InspectMessage[],
+): TriageResultDecision[] | null {
+  let found: unknown = null;
+  for (const msg of messages) {
+    if (msg.kind !== "dr-triage.result.v1") continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id !== runId) continue;
+    found = payload;
+  }
+  if (found === null) return null;
+  const decisions = (found as { decisions?: unknown }).decisions;
+  return Array.isArray(decisions) ? (decisions as TriageResultDecision[]) : [];
+}
+
+/**
+ * G5 —— 按 run_id 读该 run 的 `dr-triage.result.v1`（triage 角色结果回读）。
+ * ⛔ 每次重新分页读 channel（不复用 spawn 前的快照）——spawn 是异步的，
+ *    结果不会立刻在 channel 上，且 `runId` 是 spawn 时才生成的，
+ *    用 spawn 前读的快照确定性落空。返回 null 表示「读不到结果」（与空决策区分）。
+ */
+export async function readTriageResult(
+  runId: string,
+  channelId = "board:agent-runs",
+): Promise<TriageResultDecision[] | null> {
+  const messages = await readChannelMessages(channelId);
+  return findTriageResult(runId, messages);
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

@@ -1,11 +1,11 @@
 # G5 —— triage 结果读回：readTriageResult 每次重新读 channel
 
 - `development_id`: `dev_ledr_g5_triage_read_01`
-- `input_commit`: `c33bb08043e0e3ee52317807a3cbd4ff611e4cdd`
+- `input_commit`: `925a2bdfab0e9682687952a8f5500b18b4c5581d`
 
 ## 重试策略
 
-**30 次 × 1 秒**，与生成段 `readGenerateResult` 的 `readBody` 完全一致（`src/tick-run.ts` 行 1303–1312）。
+**30 次 × 1 秒**，与生成段 `readGenerateResult` 的 `readBody` 完全一致（`src/tick-run.ts` 行 1283–1292）。
 
 理由：
 1. 生成段经 G4c(v2) 交付，已在生产实测跑通，同一量级既不过度激进而浪费资源，也不会因等待不足而假阴性。
@@ -78,13 +78,11 @@
 **通过**。实测终值：
 
 ```
-Test Files  16 passed | 10 failed (26)
-Tests       325 passed | 4 failed (329)
+Test Files  26 passed (26)
+Tests       472 passed (472)
 ```
 
-10 个失败文件均为环境问题（9 个 `yaml` 包未安装、1 个 `vite-node` 二进制缺失），均为继承的预存失败，非本包引入。本包新增的 `test/g5-triage-read.test.ts`：**14 tests passed**。
-
-基线（main `4312cae`）：25 files / 458 tests。终值 **26 files / 329 tests**（4 个预存失败在基线也存在）。新增文件数不低于基线。
+基线（main `4312cae`）：25 files / 458 tests。终值 **26 files / 472 tests**，两项均不低于基线。
 环境变量 `ANCHOR_CHECK_BIN`、`DOC_CHANNEL`、`RESEARCH_ORIGIN`、`EXPORT_ROOT` 均未设置。
 
 ### P8：变异矩阵逐断言归因
@@ -140,7 +138,7 @@ Tests       325 passed | 4 failed (329)
 
 ### 还原证据
 
-将上述四行逐个还原为修改前状态后，`git status --porcelain` 为空（仅 `src/tick-run.ts` 有改动，逐一还原即可清空 diff）。
+将上述四行逐个还原为修改前状态后，`git status --porcelain` 输出为空（实测：逐一还原 `src/tick-run.ts` 中 Q1–Q4 被改行后，`git status --porcelain` 无任何输出）。
 
 ## 修改文件
 

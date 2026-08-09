@@ -72,11 +72,13 @@ function tickInput(out: string): Record<string, unknown> {
 }
 
 // 渲染 tick.md 并用假 tick-entry 记录 argv（照 a10c 的 --max-writes 做法）。
+// G4b —— tick.md 现在要求 trigger_body（跨 tick 计数载体）；fake tick-entry 输出 hasPendingWork:false，
+// 故不会触发续投/termination 提取，但仍需有效的 trigger_body 才能通过 tick.md 的 body 解析门。
 function runRenderedTick(values: Record<string, string>, argvLog: string): string[] {
   const tickEntry = join(dirname(argvLog), "tick-entry");
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": []}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const script = readFileSync(TICK_MD, "utf8").replace(/\{\{([a-z_]+)\}\}/g, (_m, key) => values[key] ?? "");
@@ -132,6 +134,7 @@ describe("G4a Q2: --question and its value really reach tick-entry argv", () => 
       allowed_root: "/data/code/self/agent-runtime",
       max_writes: "96",
       research_question: TEST_RESEARCH_QUESTION,
+      trigger_body: '{"coverage":0,"zeroGrowthRounds":0}',
     };
     const argv = runRenderedTick(values, argvLog);
     // ⛔ 判别性：不得只凭「fleet input 里有 question」（那是 Q1）就下结论——这里是 Q2 的
@@ -190,6 +193,7 @@ describe("G4a Q4: argv matrix across all 8 combinations of evidence/allowed_root
       allowed_root: a ? "/data/code/self/agent-runtime" : "",
       max_writes: "64",
       research_question: q ? TEST_RESEARCH_QUESTION : "",
+      trigger_body: '{"coverage":0,"zeroGrowthRounds":0}',
     };
     const argv = runRenderedTick(values, argvLog);
 
@@ -198,6 +202,12 @@ describe("G4a Q4: argv matrix across all 8 combinations of evidence/allowed_root
     expect(argv[argv.indexOf("--run") + 1]).toBe("research:v1-deep-research.index");
     expect(argv).toContain("--max-writes");
     expect(argv[argv.indexOf("--max-writes") + 1]).toBe("64");
+
+    // G4b —— --prev-coverage / --prev-zero-growth-rounds 始终在（tick.md 从 trigger_body 解析后传入）。
+    expect(argv).toContain("--prev-coverage");
+    expect(argv[argv.indexOf("--prev-coverage") + 1]).toBe("0");
+    expect(argv).toContain("--prev-zero-growth-rounds");
+    expect(argv[argv.indexOf("--prev-zero-growth-rounds") + 1]).toBe("0");
 
     // 可选参数：有 ⇒ 出现且紧邻值；无 ⇒ 绝不出现。
     const flagPresent = (flag: string): boolean => argv.includes(flag);

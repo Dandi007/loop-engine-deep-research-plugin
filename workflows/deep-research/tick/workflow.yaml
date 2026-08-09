@@ -23,6 +23,9 @@ seed:
       max_writes: "{{max_writes}}"
       # G4a —— 研究主问题（--question）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
       research_question: "{{research_question}}"
+      # G4b —— trigger body（跨 tick 计数载体）：claim.bind 已把 trigger 记录的 body 绑进 pipeline input
+      # （fleet.yaml.tpl），tick.md 读 {{trigger_body}} 解析出上一轮的 coverage/zeroGrowthRounds。
+      trigger_body: "{{trigger_body}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

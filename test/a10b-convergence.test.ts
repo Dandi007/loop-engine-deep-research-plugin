@@ -345,9 +345,10 @@ function makeFakeTick(values: {
   runnerLog: string;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
+  // G4b —— fake tick-entry 也输出 termination（tick.md 续投时从中提取 coverage/zeroGrowthRounds）。
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": []}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -380,6 +381,7 @@ describe("B3: board has a non-terminal clue ⇒ still invests a next trigger", (
         tick_channel: "research:p02-smoke-1dce60",
         evidence_channel: "",
         allowed_root: "",
+        trigger_body: '{"coverage":0,"zeroGrowthRounds":0}',
         trigger_store_dir: storeDir,
         loop_store_cli: join(dir, "store-cli.js"),
         loop_engine_runner: runner,
@@ -409,6 +411,7 @@ describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)
         tick_channel: "research:p02-smoke-1dce60",
         evidence_channel: "",
         allowed_root: "",
+        trigger_body: '{"coverage":0,"zeroGrowthRounds":0}',
         trigger_store_dir: storeDir,
         loop_store_cli: join(dir, "store-cli.js"),
         loop_engine_runner: runner,

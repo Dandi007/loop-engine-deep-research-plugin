@@ -182,9 +182,11 @@ fi
 
 # A9 —— drain 之前投下首个触发（status:"open"），否则 claimableCount() 恒 0 ⇒ 0 tick。
 # 实测 loop-store 契约：put '{"id":"...","status":"open","body":{...}}' → 落盘 <id>.json。
+# G4b —— 首个触发的 body 必须显式带 coverage:0 / zeroGrowthRounds:0（spec §1.2）：首轮无前值用 0/0，
+#   且 tick.md 对 body 字段缺失会响亮失败（不得静默回落，R5），故首轮 body 也必须满足字段约束。
 TRIGGER_ID="a9-$(date +%s%N)-$$"
 "$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
-  "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
+  "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true,\"coverage\":0,\"zeroGrowthRounds\":0}}"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"

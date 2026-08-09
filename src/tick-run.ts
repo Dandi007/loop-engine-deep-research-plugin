@@ -17,7 +17,8 @@ import { randomUUID, createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, rmSync, writeFileSync, openSync, closeSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ClueV2, DocV2 } from "./protocol";
 import {
   decideTick,
@@ -51,6 +52,7 @@ import {
   DEFAULT_GENERATE_CONFIG,
   spawnGenerateRole,
   buildReportMarker,
+  computeAnchorCheckResult,
   type EvidenceView,
   type GenerateDeps,
   type GenerateSpawnRuntime,
@@ -1013,6 +1015,12 @@ export interface RunWriteOptions {
    * 注入后 `assembleGenerateDeps` 不执行。
    */
   generateDeps?: GenerateDeps;
+  /**
+   * G4d —— 注入的 anchor-check 子进程 spawn（测试用）。
+   * 缺省走 `execFileSync("python3", ...)` 真实调用 `tools/anchor-check.py`。
+   * 注入后由调用方接管 spawn（可用于记录 argv 或返回假输出）。
+   */
+  spawnAcProcess?: (argv: string[]) => string;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -1320,7 +1328,60 @@ export function assembleGenerateDeps(
       },
     },
     spawnAnchorCheck: async () => {
-      throw new AnchorCheckNotWiredError();
+      const evidences = await (async (): Promise<EvidenceView[]> => {
+        if (!opts.evidenceChannelId) return [];
+        const msgs = await readChannelMessages(opts.evidenceChannelId);
+        return msgs
+          .filter((m) => m.kind === "research.evidence.v2")
+          .map((m) => {
+            const p = (m.payload ?? {}) as Record<string, unknown>;
+            return {
+              clue_id: String(p.clue_id ?? ""),
+              anchor: String(p.anchor ?? ""),
+              quote: String(p.quote ?? ""),
+              claim: String(p.claim ?? ""),
+            };
+          });
+      })();
+      const corpusFile = join(tmpdir(), `anchor-check-corpus-${randomUUID()}.json`);
+      writeFileSync(corpusFile, JSON.stringify(evidences));
+      try {
+        const repoRoot = opts.allowedRoot || process.env.ALLOWED_ROOT || undefined;
+        const acPy = join(
+          dirname(fileURLToPath(import.meta.url)),
+          "..",
+          "tools",
+          "anchor-check.py",
+        );
+        const argv = ["python3", acPy, "--corpus", corpusFile, "--json"];
+        if (repoRoot) argv.push("--repo-root", repoRoot);
+        const spawnAc = opts.spawnAcProcess ?? ((a: string[]) =>
+          execFileSync(a[0], a.slice(1), {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }));
+        const rawJson = spawnAc(argv);
+        const parsed = JSON.parse(rawJson);
+        const result = computeAnchorCheckResult(parsed);
+        const exportRoot = process.env.EXPORT_ROOT;
+        if (exportRoot && opts.question) {
+          try {
+            const slug = String(opts.question)
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
+              .replace(/^-+|-+$/g, "") || "untitled";
+            const reportDir = join(exportRoot, "DeepThought", slug);
+            mkdirSync(reportDir, { recursive: true });
+            writeFileSync(join(reportDir, "anchor-check.json"), rawJson);
+          } catch {
+            // 落盘失败不阻断导出
+          }
+        }
+        return result;
+      } finally {
+        rmSync(corpusFile, { force: true });
+      }
     },
     spawnExport: async (reportBody: string, sourceMessageId: string) => {
       const exportRoot = process.env.EXPORT_ROOT;

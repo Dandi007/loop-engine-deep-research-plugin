@@ -33,7 +33,6 @@ export interface GenerateConfig {
   /** debater 三立场（立论 / 反方 / 裁判）的 role+route，route 互不相同。 */
   debaters: readonly [GenerateRoleSpec, GenerateRoleSpec, GenerateRoleSpec];
   synthesizer: GenerateRoleSpec;
-  anchorCheckRoute: string;
   exportRoute: string;
 }
 
@@ -45,7 +44,6 @@ export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
     { role: "dr-debater-judge", route: "ds-v4-pro/ccs" },
   ],
   synthesizer: { role: "dr-synthesizer", route: "opus-5/ccs" },
-  anchorCheckRoute: "anchor-check",
   exportRoute: "export",
 };
 
@@ -116,6 +114,42 @@ export function parseReportMarker(body: string): ReportMarker | null {
 export function renderReportHead(marker: ReportMarker, anchorRate: number | null): string {
   const rate = anchorRate === null ? "unavailable" : String(anchorRate);
   return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
+}
+
+/**
+ * G4d §2 —— 核验率口径：由 anchor-check.py --json 的原始输出计算 {defects, verificationRate}。
+ *
+ * 口径：
+ *   - verificationRate = current_verified_hit / total（分母必须是 total，不得用 current_parsed）
+ *   - total === 0 ⇒ verificationRate = null（unavailable，不是 100%）
+ *   - sums_ok === false ⇒ verificationRate = null（视同校验失败，不得折算成正常数字）
+ *   - defects = current_failed + unparseable + old_format + discarded + len(loud_failures)
+ */
+export function computeAnchorCheckResult(raw: {
+  total: number;
+  current_parsed: number;
+  current_verified_hit: number;
+  current_failed: number;
+  old_format: number;
+  unparseable: number;
+  discarded: number;
+  sums_ok: boolean;
+  loud_failures: Array<{ anchor: string; error: string }>;
+}): { defects: number; verificationRate: number | null } {
+  if (!raw.sums_ok) {
+    return { defects: raw.total, verificationRate: null };
+  }
+  if (raw.total === 0) {
+    return { defects: 0, verificationRate: null };
+  }
+  const verificationRate = raw.current_verified_hit / raw.total;
+  const defects =
+    raw.current_failed +
+    raw.unparseable +
+    raw.old_format +
+    raw.discarded +
+    raw.loud_failures.length;
+  return { defects, verificationRate };
 }
 
 /**
@@ -326,7 +360,7 @@ export interface GenerateDeps {
   /** 缺省 spawnRole 的生产运行时（不注入 spawnRole 时使用）。 */
   spawnRuntime?: GenerateSpawnRuntime;
   /** anchor-check：返回缺陷数与核验率（核验率用于报告头部标注，软闸门 <90% 不阻断导出）。 */
-  spawnAnchorCheck(route: string): Promise<{ defects: number; verificationRate: number }>;
+  spawnAnchorCheck(): Promise<{ defects: number; verificationRate: number | null }>;
   spawnExport(body: string, sourceMessageId: string): Promise<void>;
   /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。
    *  返回发布出的 message_id。 */
@@ -416,7 +450,7 @@ export async function runGenerate(
   // ⛔ 崩溃与真实 0% 核验率要可区分：崩溃时头部标 unavailable（评审 minor），而非伪装成 0。
   let anchorRate: number | null = null;
   try {
-    const ac = await deps.spawnAnchorCheck(cfg.anchorCheckRoute);
+    const ac = await deps.spawnAnchorCheck();
     anchorRate = ac.verificationRate;
   } catch {
     // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。

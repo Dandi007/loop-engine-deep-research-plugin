@@ -1,214 +1,170 @@
-# G4c(v2) —— 生成段接进生产：`runGenerate` 至今**零调用者**
+# G4d —— anchor-check 确定性接线：核验率的来源自己必须是机械的
 
-> 派发方：`line-deep-research`。**这是已核实的生产缺陷，不是加功能。**
-> 前置：G4a(v2) + G4b(v3) 均已合入 main `f655317`。
->
-> ⚠️ **这是重开包。上一个 development（`dev_ledr_g4c_generate_wiring_01`，PR #38）跑了 5 个 attempt，
-> attempt 5 的 final review 判 APPROVE，但 dd 的 acceptance 阶段 `npm test` 返回 `exit_code 1` ⇒ 判 FAILED。**
-> **那 5 轮的全部 finding 与已验证正确的解法形状，已前置写进本 spec 的 §2–§4。⛔ 照做，不要重新发现一遍。**
->
-> ### ⛔ 本包最该记住的一条：**评审判过 ≠ 命令跑过。**
-> attempt 5 的 final review 没有 finding，而同一份代码上 `npm test` 是红的。
-> **验收命令必须由你自己真的跑一遍并贴出完整尾部输出。**
+> 派发方：`line-deep-research`。前置：G4c(v2)（生成段接进生产）已合入 main `f286f0e`。
 
 ---
 
-## 0　已核实的事实（grep 到行号，非推断）
+## ⛔ 先读：上一包（G4c(v2)）实付的学费，本包直接照用
 
-| # | 事实 | 证据 |
-|---|---|---|
-| A | **`runGenerate` 在 `src/` 内零调用者** | `grep -rn 'from "./generate"' src/` 只命中 `src/export.ts:14`，且只取两个纯函数 |
-| B | tick 决策集里没有 generate | `tick.ts` 的 kind 只有 `reclaim/harvest/dispatch/block/triage` |
-| C | fleet 只有一条 pipeline | `fleet.yaml.tpl` 全文只有 `- label: tick` |
-| D | `src/export.ts` 零 importer；`EXPORT_ROOT` 无运行时消费者 | `grep -rn EXPORT_ROOT bin/ src/ workflows/` |
+**1. 测试必须驱动生产的 dep 组装，不能各自注入 stub。**
+`runChannelWrite` 在 `opts.generateDeps` 存在时走注入分支、**完全跳过 `assembleGenerateDeps`**。
+上一包因此连续三轮出现「验收项看着有、变异杀不掉」（U1/U5/U7 全中此病）。
+**已交付的正确机制：`assembleGenerateDeps` 现在是导出函数**（`src/tick-run.ts`），
+用例可直接调用它拿到**生产组装出的 deps** 再断言。⛔ 本包凡涉及生产 dep 的验收项，一律照此写。
 
-⇒ `runGenerate`（`generate.ts:348-424`）本身完整，**但生产里没有任何一条边指向它**
-⇒ plan §0 的产物 1（report）与 2（导出件）**都产不出**。
+**2. `workflow.yaml` 新增的可选 pipeline input 必须带 `?`。**
+上一包死于 `doc_channel: "{{doc_channel}}"` 缺 `?`：值为空时模板按必填渲染 ⇒ tick 节点报错，
+而 loop 照报 `drained`、exit 0。既有正确写法：`"{{evidence_channel?}}"` / `"{{allowed_root?}}"`。
+**验收必须在相关 env 均未设置的干净环境下跑全量。**
 
-> **判据**：**「模块写好了」与「生产会调用它」是两条独立命题。** 单测全绿、`git log` 有合入记录，**都不构成可达性证据**。
-
----
-
-## 1　要做什么（总述）
-
-生产 `--run` 在本轮决策执行完、拿到 G4b 的 `TerminationState` 之后：
-`decideGenerate(term)` 为真 ⇒ 调用 `runGenerate(deps, cfg)`。
-
-⛔ `decideGenerate` 已是交付好的纯函数（`generate.ts:83`），**调用它，不要另判一套**。
+**3. 继承的未决缺口（本包一并补上）**：
+`spawnExport` 里「回读不到 doc message ⇒ 响亮失败」这条支路**没有任何用例**；
+而原 U6 用例是对 `src/export.ts` 做源码字符串匹配（**查错了文件**，风险在 `tick-run.ts`），属零功率。
+⇒ 本包须补一条**判别性**用例：驱动生产 `spawnExport`，令 doc channel 里**不存在**该 `sourceMessageId`，
+断言**响亮失败**且不落回系统时钟。**⛔ 不得用源码字符串匹配充当该断言。**
 
 ---
 
-## 2　⛔ 前置给你的解法形状（上一轮已验证正确，照做）
+## 0　现状：两处
 
-以下每一条都是上一轮 5 个 attempt **被评审逐条打回后最终收敛的正确形状**。⛔ 不要另起炉灶。
+### 0.1 `spawnAnchorCheck` 被建模成 **agent route**，这是占位残留
 
-### 2.1 `spawnRole` 的 `readBody` —— **读 `dr-doc.result.v1`，不是 `worker.result.v1`**
-
-⛔ **上一轮在这里连挂两轮**。两个坑：
-
-1. **快照坑**：不得用 `findWorkerResult(runId, runsMessages)` —— `runsMessages` 是 spawn **之前**读的
-   `board:agent-runs` 快照（普通数组，不重读不变更），而 `runId` 是 spawn 时才生成的
-   ⇒ 确定性落空。**必须每次重新分页读 channel。**
-2. **形状坑**：`WorkerResultV1` 的冻结形状是 `{run_id, evidences, proposed_clues, materials}`
-   （`harvest.ts:48-53`）—— **没有 `body` 字段**。生成角色产出的是 **`dr-doc.result.v1`**。
-
-**正确形状**（上一轮 attempt 5 交付、final review 判过）：在 `src/tick-inspect.ts` 加
-
+`src/generate.ts:36/48`：
 ```ts
-export async function readGenerateResult(
-  runId: string, channelId = "board:agent-runs",
-): Promise<{ body: string } | null> {
-  const messages = await readChannelMessages(channelId);   // ⛔ 每次重读
-  return findGenerateResult(runId, messages);              // 过滤 kind === "dr-doc.result.v1"
-}
+anchorCheckRoute: string;
+// DEFAULT_GENERATE_CONFIG
+anchorCheckRoute: "anchor-check",
 ```
+G2a 把 debater/synthesizer 的占位 route 换成了真实 route，**唯独这一条没换** —— 因为它根本不该是 route。
 
-`readBody` 用它 + **重试等待**（spawn 是异步的，结果不会立刻在 channel 上；上一轮用 30 次 × 1s）。
+> ### ⛔ 判据：**拿 LLM route 去跑一个确定性校验器，等于把「机械核验」换成「模型说它核验了」。**
+> 而**核验率是软闸门的判据来源**（`golden-order` 2026-08-09 拍板：核验率 < 90% ⇒ V2 验收判不过）。
+> **一个判据的来源，自己必须是机械的。**
 
-### 2.2 一次性保证 —— **跨进程 + 成功之后才标记**
+### 0.2 校验器本体不在本仓
 
-⛔ **上一轮在这里也连挂两轮**：
+`anchor-check.py`（v3，N2b 已迭代）目前在 katana 仓
+`plugins/deep-research/skills/deep-research/loop-orchestration/tools/`，
+同目录还有 `anchor-check-selftest.sh` 与 `fixtures/`。
+而**唯一的消费者**是本仓 `src/generate.ts:418`。
 
-1. **进程内状态无效**：每个 tick 都是全新进程（`tick.md` 每轮 `exec node … tick-entry.ts`），
-   模块级 `Set` 每轮都是空的 ⇒ **完全不覆盖 spec 要求的威胁模型**。必须有**跨进程持久**载体。
-2. **先标记后执行 = 把响亮失败变成永久静默跳过**：若在 `runGenerate` **之前**标记且不回滚，
-   任何失败都把标记留下 ⇒ 首个 tick 响亮失败退出、fleet 退回 claim、其后每个 tick 都看到标记 ⇒
-   **永远静默跳过**。⛔ **标记必须在 `runGenerate` 成功返回之后才写。**
-
-标记 key 必须同时含 **origin 与 channelId**（只用 origin 会让不同研究互相污染）。
-
-### 2.3 导出 —— 三个已知坑
-
-1. ⛔ **必须 `mkdirSync(dirname(path), { recursive: true })`**：`src/` 全仓原无 `mkdir`，
-   首次真导出必 ENOENT，且抛在 doc **已发进 append-only bus 之后**。
-2. ⛔ **`createdAt` 取 bus `created_at`，绝不落回系统时钟**：`export.ts:11/:22` 是硬不变量
-   （`deriveExportPath` 把该日期放进文件名，导出必须同输入⇒同字节可重生成）。
-   回读不到该 message ⇒ **响亮失败**，⛔ 不得 `?? new Date().toISOString()`。
-3. ⛔ `EXPORT_ROOT` 未配置 ⇒ **响亮失败**，不得静默跳过。
-
-### 2.4 dep 形状缺陷：`spawnExport` 拿不到 `source_message_id`
-
-`generate.ts:331` 是 `spawnExport(body: string): Promise<void>`，而 plan §0 产物 2 硬要求导出件带
-`source_message_id`；上游 `writeDoc` 返回 `void`，message id 被丢弃。
-⇒ **本包必须修这个契约**：`writeDoc` 返回发布出的 message id，并传给导出。
-
-### 2.5 `--origin` / `--doc-channel` 必须**从 bin 一路贯通到 argv**
-
-⛔ **上一轮在这里挂了一轮**：触发边挂在 `origin && …` 上，而 `tick.md` / `fleet.yaml.tpl` /
-`workflow.yaml` / `bin/` **全都不供给 `--origin`** ⇒ 生成段从生产入口**静默地永不进入**。
-这正是 G4a 那个包存在的理由的原样复发（「CLI 支持、引擎依赖、生产不传」）。
-
-照 `MAX_WRITES` / `RESEARCH_QUESTION` 已走通的同一条链接：
-`bin/deep-research-loop.sh` → `fleet.yaml.tpl` → `tick/workflow.yaml` → `tick.md` → `tick-entry --run`。
-
-### 2.6 ⭐⭐ `workflow.yaml` 里新增的可选输入**必须带 `?` 标记**
-
-⛔ **上一轮就死在这一个字符上**（dd acceptance `npm test` exit 1 ⇒ development FAILED）。
-
-`workflows/deep-research/tick/workflow.yaml` 既有的可选输入写法是：
-
-```yaml
-      evidence_channel: "{{evidence_channel?}}"
-      allowed_root: "{{allowed_root?}}"
-```
-
-上一轮新增的写成了 `doc_channel: "{{doc_channel}}"`（**无 `?`**）⇒ `DOC_CHANNEL` 为空时
-（**当前所有 deploy profile 的默认值**）模板按必填渲染 ⇒ **tick 节点报错**。
-
-**派发方实测的因果证据**：`DOC_CHANNEL` 空 ⇒ `test/a10b-convergence.test.ts` 的 **B2** 连挂 3/3；
-`DOC_CHANNEL` 给值 ⇒ 同文件 12/12 全绿。
-
-**⛔ 放大器比 bug 本身更严重**：
-`loop-events.jsonl` 记 `{"kind":"round_end","detail":{"ticked":["tick"],"errors":1}}`，
-而同目录 `drain.json` 记 `{"reason":"drained"}` 且脚本 **exit 0**
-⇒ **每个 tick 都在报错，而从外面看是一次干净的收敛。**
-
-⇒ **本包新增的每一个可选 pipeline input 都必须带 `?`，并且必须在 `DOC_CHANNEL` / `RESEARCH_ORIGIN`
-未设置的干净环境下跑通全量测试。**
-
-### 2.7 `writeDoc` 的目标 channel
-
-⛔ 不得静默默认到板 channel（`research.doc.v2` 发进 clue 板是 append-only 不可回退的错误落点）。
-无 `--doc-channel` ⇒ **响亮失败**。
-
-### 2.8 anchor-check 本包**不接**，但必须是「可观测的未接线」
-
-`generate.ts:414-421` 已设计好：`spawnAnchorCheck` 抛错 ⇒ `anchorRate` 保持 `null` ⇒
-`renderReportHead` 头部标 **`unavailable`**。
-⇒ 本包的生产实现**必须抛一个专有且响亮的错误**（如 `AnchorCheckNotWiredError`）。
-⛔ 不得返回编造的核验率；⛔ 不得静默返回 0（`0%` 与 `unavailable` 是两件事）。真实接线归 **G4d**。
-
-### 2.9 `lockSynthesizer` 必须是**真的单例锁**
-
-⛔ 上一轮交付过一个 no-op 桩（只翻转一个局部 boolean，不获取、不等待、不排他）。
-`generate.ts:344-349` 的语义是**单例 lock，wait-then-run，不是拿不到就跳过**。
+⇒ **居所随消费者走**：本包把三者引入本仓 `tools/`（派发方 2026-08-09 拍板；plan §6 写的旧居所是「katana workflow 还是消费者」时定的，前提已变）。
+⛔ katana 侧的删除**不在本包**（归 R4，不同仓）。
 
 ---
 
-## 3　硬验收（缺一不可）
+## 1　校验器的真实接口（读过源码，别照文档猜）
+
+```
+anchor-check.py --corpus <json 文件|bus:<channel>> [--repo-root <path>] --json
+```
+
+`--json` 输出（`anchor-check.py:199-209` 逐字）：
+```jsonc
+{ "total": N, "current_parsed": N, "current_verified_hit": N, "current_failed": N,
+  "old_format": N, "unparseable": N, "discarded": N, "sums_ok": bool,
+  "loud_failures": [ {"anchor": …, "error": …} ] }
+```
+
+⚠️ **它不输出 `verificationRate`** —— 而 `GenerateDeps.spawnAnchorCheck` 要求返回
+`{ defects: number, verificationRate: number }`。**这个换算由本包定义，且必须按 §2 的口径。**
+
+其它已读到的事实：
+- `--repo-root` 对**现行格式**锚点是必需的（locator 是仓内相对路径，不含仓名）；缺失时校验器**响亮失败，绝不猜**。引擎侧已有 `ALLOWED_ROOT`（`--allowed-root` 已贯通），用它。
+- `sums_ok` 为 `false` 表示**发生了无声丢弃**（`discarded > 0` 或三类计数之和对不上）。
+
+---
+
+## 2　⛔ 核验率的口径（本包最重要的一条判断）
+
+**`verificationRate = current_verified_hit / total`。**
+
+⛔ **分母必须是 `total`，不得用 `current_parsed`。**
+
+> **理由**：若分母取 `current_parsed`（只算「能解析的那些」），那么一份 90% 锚点不可解析、
+> 剩下 10% 全部命中的证据集，会报出 **100% 核验率**。
+> **分母偷偷变小 = 软闸门被架空**，而软闸门正是 V2 验收的硬判据。
+> ⇒ 不可解析、旧格式、被丢弃的锚点**全部计入分母**：它们就是「没核验成」。
+
+**`defects = current_failed + unparseable + old_format + discarded + len(loud_failures)`**
+（即 `total - current_verified_hit` 再加上 loud_failures 的重复计入部分 —— **实现方按上式直算即可，但必须在 dev-note 里写明你采用的表达式**）。
+
+**⛔ `total === 0` 时不得报 100%**：没有锚点可核验**不是「全部核验通过」**。
+此时核验率应为 **`null`（unavailable）**，与「崩溃」走同一条既有路径（`generate.ts:414-421` 的 catch ⇒ 头部标 `unavailable`）。
+> 与 R2a 那次「`decisions: []` 通过 schema 校验」是同一个错的形状：**空集合不是成功。**
+
+**⛔ `sums_ok === false` 必须响亮**：发生无声丢弃时不得把它折算进一个看起来正常的核验率，
+应视同校验失败（核验率 `null` + 在报告与落盘件里点名 `sums_ok=false`）。
+
+---
+
+## 3　要做什么
+
+1. **引入校验器**：`tools/anchor-check.py`、`tools/anchor-check-selftest.sh`、`tools/fixtures/`（三者一并，selftest 是它自己的有牙回归，别只搬主文件）。
+2. **`spawnAnchorCheck` 改成确定性子进程调用**：
+   - 把引擎已读到的 evidences（`readEvidences` 的结果）序列化成临时 JSON → `--corpus <file>`；
+   - `--repo-root` 用 `ALLOWED_ROOT`；`--json` 取结构化输出；临时文件在 `finally` 清理。
+   - ⛔ **不得**再经 `agent-run` / route 派发。`GenerateConfig` 的 `anchorCheckRoute` 字段随之移除或改名为不含「route」语义的形状（**实现方可选，但不得留一个没有消费者的 route 字段**）。
+3. **报告落盘**（plan §0 产物 3）：把 `--json` 的完整输出写到导出件同目录
+   `<EXPORT_ROOT>/DeepThought/<主题-slug>/`，文件名可判别（如 `anchor-check.json`）。
+   ⛔ 落盘失败**不得**阻断导出（软闸门语义），但必须在报告头部或落盘件里可见。
+4. **报告头部**沿用既有 `renderReportHead(marker, anchorRate)`（`generate.ts:116`），不重造。
+
+---
+
+## 4　硬验收（缺一不可）
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **U1** | ⭐ **可达性**：从**生产入口**（`runChannelWrite`）出发，终态非 null + origin 已配置 ⇒ `runGenerate` **真的被调用**（注入假 deps，断言 spy 被调用）；终态为 null ⇒ **不被调用** | 正反两例。⛔ **`expect(source).toContain(...)` 这类源码字符串搜索一律不算数**（上一轮 attempt 1 就死在这个形状上） |
-| **U2** | ⛔ **只跑一次**：同一 origin 连续两次 `runChannelWrite` ⇒ 生成段只执行一次（spawn / writeDoc / 导出次数都不翻倍）；且**跨进程那一半必须被判别**（内存 Set 若先命中，文件标记分支就从不决策 ⇒ 该用例零功率）| 判别性用例；⛔ 必须能杀掉「删掉文件标记读写、只留内存 Set」这个变异 |
-| **U3** | ⛔ **失败不留标记**：`runGenerate` 抛错 ⇒ 标记**未被写入**，下一个 tick 仍会重试 | 判别性用例 |
-| **U4** | ⛔ 导出件带 `source_message_id`，且**等于 report doc 实际发布出的 message id** | 断言两者相等；⛔ 只断言字段存在不算数 |
-| **U5** | ⛔ 导出落点 `<EXPORT_ROOT>/DeepThought/<主题-slug>/…`；`EXPORT_ROOT` 未配置 ⇒ **响亮失败**；父目录自动创建 | 正反两例 + grep 源码无硬编码 vault 路径 |
-| **U6** | ⛔ `createdAt` 取自 bus `created_at`；回读不到 ⇒ **响亮失败**，grep 生产路径无 `new Date()` 兜底 | 判别性用例 + 读到行号 |
-| **U7** | ⛔ **anchor-check 未接线 ⇒ 头部标 `unavailable`**，不得是编造值、不得是 `0%`。**且该断言必须打在生产组装出的 dep 上**（把生产默认改成返回 `{defects:0,verificationRate:0}` 必须被杀） | ⛔ 上一轮此条零功率：所有用例都自建 `GenerateDeps` 注入自己的 stub，生产默认从未被执行 |
-| **U8** | ⛔ **`--origin` 与 `--doc-channel` 各有一条 argv 记录用例**：渲染 `tick.md` + 假 `tick-entry`，断言 flag **及其值**出现在 argv | 照 `test/g4a-question-wiring.test.ts:124-143/177-199`；⛔ 字符串包含不算数 |
-| **U9** | ⛔ **值缺省 ⇒ 不出现该 flag**（不是空串参数） | 正反两例 |
-| **U10** | ⭐ **全量 `npx vitest run` 真的全绿**，且**在 `DOC_CHANNEL` / `RESEARCH_ORIGIN` 均未设置的干净环境下** | ⛔ **必须实跑并贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段）。基线：main `f655317` 实测 **21 files / 391 tests**；终值两项均不得低于基线。⛔ 不得用「基线计数方式差异」解释缺口 —— 同一条命令，口径可比 |
-| **U11** | `synthesizer` 并发 = 1 且**绝不跳过**；导出在最后；`doc_kind` 由 role 推出（不读 payload） | 既有断言保留且仍有效（读到行号） |
-| **U12** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **U13** | 每处删除给出必要性说明 | — |
-
-> ⚠️ **本包不要求端到端真跑真 bus**：`dr-doc.result.v1` 的注册由派发方处置。验收全部落在「接线可判别」上。
+| **V1** | ⛔ **不再经 route/agent-run**：生产路径 grep 无 `anchorCheckRoute` 的派发消费者；`spawnAnchorCheck` 实现是子进程调用 `tools/anchor-check.py` | 读代码到行号 + 假 spawn 记 argv，断言 argv[0] 指向 `tools/anchor-check.py` 且带 `--json` |
+| **V2** | ⭐ **核验率口径**：分母是 `total`。判别性用例：构造 `total=10 / current_parsed=1 / current_verified_hit=1`（9 条不可解析）⇒ 核验率**必须是 10%，不得是 100%** | 这条是 §2 的唯一执行点，⛔ 杀不掉即判零功率 |
+| **V3** | ⛔ **`total===0` ⇒ 核验率 `null`（unavailable），不得是 100%** | 判别性用例 |
+| **V4** | ⛔ **`sums_ok===false` ⇒ 视同失败**（核验率 `null` + 可见地点名），不得折算成正常数字 | 判别性用例 |
+| **V5** | ⛔ **软闸门不变**：核验率 < 90% **仍然导出**，但必须标在报告头部；校验器崩溃 ⇒ 头部 `unavailable`（与真实 0% 可区分） | 正反两例（<90% 与 ≥90%）+ 崩溃一例 |
+| **V6** | **落盘**：`anchor-check` 的 `--json` 全文写到导出件同目录；落盘失败不阻断导出 | 正反两例 |
+| **V7** | ⛔ **`--repo-root` 真的被传**（用 `ALLOWED_ROOT`）；缺失时校验器自己响亮失败的行为未被吞掉 | 假 spawn 记 argv + 一例失败传播 |
+| **V8** | **校验器自带的 selftest 可跑且通过**：`tools/anchor-check-selftest.sh` exit 0 | 贴输出。⛔ 只搬主文件不搬 selftest 与 fixtures 不算完成 |
+| **V9** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4c 合入后的 main 实测为准，自己先跑一次记下来）** | 贴输出 |
+| **V10** | 变异矩阵（§5）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **V11** | `src/`、`test/` 的每处删除给出必要性说明 | — |
 
 ---
 
-## 4　变异矩阵（逐断言归因）
+## 5　变异矩阵（逐断言归因）
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **T1** | 去掉生产里对 `runGenerate` 的调用 | **U1 正例必须挂**；⛔ 杀不掉即判 U1 零功率 |
-| **T2** | 去掉跨进程文件标记，只留内存 Set | **U2 必须挂** |
-| **T3** | 把标记移到 `runGenerate` **之前** | **U3 必须挂** |
-| **T4** | 导出的 `source_message_id` 用常量/空串 | **U4 必须挂** |
-| **T5** | 生产 `spawnAnchorCheck` 改成返回 `{defects:0, verificationRate:0}` | **U7 必须挂**；⛔ 杀不掉即判 U7 零功率 |
-| **T6** | `workflow.yaml` 的新增可选输入去掉 `?` | **U10 全量必须变红** |
-| **T7** | `createdAt` 恢复 `?? new Date().toISOString()` 兜底 | **U6 必须挂** |
+| **W1** | 把核验率分母从 `total` 改成 `current_parsed` | **V2 必须挂**；⛔ 杀不掉即判 V2 零功率 |
+| **W2** | 让 `total===0` 返回 `verificationRate: 1`（100%） | **V3 必须挂** |
+| **W3** | 忽略 `sums_ok`，照常折算核验率 | **V4 必须挂** |
+| **W4** | 不传 `--repo-root` | **V7 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 5　显式不做
+## 6　显式不做
 
 | 不做 | 理由 |
 |---|---|
-| anchor-check 真实接线（引入 `tools/anchor-check.py`、确定性子进程、报告落盘） | 归 **G4d**；本包只保证「未接线」**可观测** |
+| 删 katana 侧的 `loop-orchestration/tools/` | 不同仓，归 **R4** |
+| 改 `anchor-check.py` 的校验算法 | 它是 v3、已有 selftest；本包只搬运 + 接线 + 定义换算口径。**若发现算法缺陷，停下在 review 说明，不顺手改** |
 | 播种入口 | 归 **G4e** |
-| 改 `profiles/deploy/*.env` 的取值（含 `DOC_CHANNEL` 该填什么） | 归 **D2**。本包只保证**它为空时不炸** |
-| 改 `runGenerate` 的编排顺序或串行边语义 | 已交付且被断言保护；本包只接线 + 修 §2.4 那一处 dep 契约 |
-| 一次性标记改成 bus 侧/run-root 作用域、`lockSynthesizer` 陈旧锁回收 | 已记为独立 finding，归后续包；⛔ 本包不扩面 |
+| 改 `profiles/deploy/*.env` 的题目与 channel 取值 | 归 **D2** |
 | 注册任何 bus 协议 | 不可逆，走公示流程 |
-| 改 `agent-runtime` / katana | 不同仓 |
+| 端到端真跑真 bus | 归 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 6　交付物落点
+## 7　交付物落点
 
-- 实现：`src/tick-run.ts`（触发边 + deps 组装 + 一次性保证）、`src/tick-inspect.ts`（`readGenerateResult`）、
-  `src/generate.ts`（仅 §2.4 的 dep 契约）、`src/export.ts`、`src/bus.ts`（如需）、
-  `bin/deep-research-loop.sh`、`workflows/deep-research/fleet.yaml.tpl`、
-  `workflows/deep-research/tick/workflow.yaml`、`workflows/deep-research/tick/templates/tick.md`
-- 测试：`test/g4c-generate-wiring.test.ts`（U1–U9、U11）
-- 证据：`docs/dev-notes/dev_ledr_g4cv2_generate_wiring_01.md`（U1–U13 逐条 + §4 变异七行 + 还原证据）
+- 引入：`tools/anchor-check.py`、`tools/anchor-check-selftest.sh`、`tools/fixtures/`
+- 实现：`src/generate.ts`（dep 形状 + 核验率换算）、`src/tick-run.ts`（deps 组装，若需要）
+- 测试：`test/g4d-anchor-check.test.ts`（V1–V7）
+- 证据：`docs/dev-notes/dev_ledr_g4d_anchor_check_01.md`（V1–V11 逐条 + §5 变异四行 + selftest 输出 + **你采用的 defects 表达式**）
 
 > **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（该字段本来的语义）。
-> 真正的要求是**正文描述交付物本身**：测试文件数/用例数、变异矩阵各行**实测**结果、最终代码行为必须与交付一致；
-> 若中途 rework 改了实现，正文数字与结论同步更新。
+> 真正的要求是**正文描述交付物本身**；若中途 rework 改了实现，正文数字与结论同步更新。
 > ⛔ **不要为对齐 commit hash 做额外提交。**

@@ -1,138 +1,153 @@
-# G4c —— 生成段接进生产：`runGenerate` 至今**零调用者**
+# G4c-2 —— 收尾 G4c：一个缺失的 `?` 让每个 tick 都在报错，而外面看是一次干净的收敛
 
-> 派发方：`line-deep-research`。**这是已核实的生产缺陷，不是加功能。**
-> 前置：G4a(v2)（`--question` 贯通）+ G4b(v3)（终态贯通）均已合入 main `f655317`。
-
----
-
-## 0　已核实的事实
-
-| # | 事实 | 证据 |
-|---|---|---|
-| A | **`runGenerate` 在 `src/` 内零调用者** | `grep -rn 'from "./generate"' src/` **只命中 `src/export.ts:14`**，且只取 `parseReportMarker` / `renderReportBody` 两个纯函数 |
-| B | **tick 决策集里没有 generate** | `tick.ts` 的 kind 只有 `reclaim/harvest/dispatch/block/triage`；`tick-run.ts` 的 switch 同样五个 |
-| C | **fleet 只有一条 pipeline** | `fleet.yaml.tpl` 全文只有 `- label: tick` |
-| D | **`src/export.ts` 零 importer**；`EXPORT_ROOT` 无运行时消费者 | `grep -rn EXPORT_ROOT bin/ src/ workflows/` 只命中 `bin` 的 export 与测试文件 |
-
-⇒ **`runGenerate` 本身是完整的**（`generate.ts:348-424` 已编排 debater×3 → writeDoc → synthesizer(lock) → anchor-check → report doc → export），
-**但生产里没有任何一条边指向它** ⇒ plan §0 的产物 1（report）与 2（导出件）**都产不出**。
-
-> **判据（本线已记）**：**「模块写好了」与「生产会调用它」是两条独立命题。**
-> 单元测试全绿、`git log` 有合入记录，**都不构成可达性证据**。
+> 派发方：`line-deep-research`。
+> **本包继承 G4c（`dev_ledr_g4c_generate_wiring_01`，PR #38）已完成的全部产物**，只补最后三件事。
 
 ---
 
-## 1　要做什么
+## 0　为什么会有这个包（读完再动手）
 
-### 1.1 触发边
+G4c 跑了 5 个 attempt，attempt 5 的 **final review 判 APPROVE**，但 **dd 的 acceptance 阶段执行 `npm test` 得到 `exit_code 1`**，development 因此判 **FAILED**（`.dd-evidence/acceptance.json` 有逐字记录）。
 
-生产 `--run` 在本轮决策执行完、拿到 G4b 的 `TerminationState` 之后：
-`decideGenerate(term)` 为真 ⇒ 调用 `runGenerate(deps, cfg)`。
+> ### ⛔ 判据：**评审判过 ≠ 命令跑过。**
+> attempt 5 的 final review 没有 finding，而同一份代码上 `npm test` 是红的。
+> **只有真的把验收命令跑一遍，才知道它是不是绿的。**
 
-⛔ **`decideGenerate` 已是交付好的纯函数**（`generate.ts:83`：`term.state !== null`），**调用它，不要另判一套**。
-⛔ **幂等**：同一次研究的终态可能被多个 tick 观察到 ⇒ **必须保证生成段只跑一次**
-（`writeDoc` 的 idempotencyKey 已按 `dr-doc:<role>:<origin>` 构造，但**导出与 spawn 的重复执行不受它保护**）。
-本包必须给出一个明确的一次性保证机制并断言它。
+**你继承的这条分支已经包含 G4c 的全部实现**（21 个 commit，皆在 main `f655317` 之上）。⛔ **不要重做已完成的部分**，逐条列在 §1。
 
-### 1.2 十个 deps 的真实实现
+---
 
-`GenerateDeps`（`generate.ts:306-338`）的每一项都要有生产实现。**已有的东西一律复用，别重写**：
+## 1　⛔ 已完成、**不要碰**的部分
 
-| dep | 怎么实现 |
+以下均已交付并被 review 确认，本包**不得重写、不得"顺手优化"**：
+
+| 已完成 | 位置 |
 |---|---|
-| `readTermination` | G4b 已让 `--run` 算出 `TerminationState`，直接用 |
-| `countBlocked` | 板面里 `status === "blocked"` 的卡数（`tick.ts:370` 已有同款算法） |
-| `readQuestion` | G4a(v2) 的 `--question` |
-| `readOrigin` | 本次研究 id。**取值来源必须显式且稳定**（同一次研究的多个 tick 必须得到同一个 origin，否则 `writeDoc` 的幂等键失效） |
-| `readEvidences` | 从 evidence channel 回读（`--evidence-channel` 已贯通）；字段 `anchor/quote/claim/clue_id` |
-| `spawnRuntime` | 复用 `tick-run.ts` 里派 worker/triage 用的那套 `agent-run` 运行时 |
-| `writeDoc` | 发 `research.doc.v2`；`src/bus.ts` 已有发布原语，照 `publishClue`/`publishEvidence` 的形状加 |
-| `lockSynthesizer` | 单例 lock，**wait-then-run，不是拿不到就跳过**（`generate.ts:333-337` 注释已写死语义） |
-| `spawnExport` | 见 §1.3 |
-| `spawnAnchorCheck` | ⚠️ 见 §1.4 —— **本包不接真实实现** |
-
-### 1.3 ⛔ 导出：先修一个 dep 形状缺陷
-
-`generate.ts:331` 的签名是 `spawnExport(body: string): Promise<void>` ——
-**它拿不到 `source_message_id`**，而 plan §0 产物 2 硬要求导出件带 `source_message_id`。
-上游 `writeDoc` 在它之前发出了 report doc，**但 `writeDoc` 返回 `void`，message id 被丢弃**。
-
-⇒ **本包必须修这个形状**（改 `runGenerate` 的 dep 契约属本包范围，因为本包正是它的接线方）：
-让 `writeDoc` 返回发布出的 message id，并把它传给导出。
-
-导出实现复用 `src/export.ts` 的既有形状（`deriveExportPath` / `renderExportContent`），
-落点 `<EXPORT_ROOT>/DeepThought/<主题-slug>/`（D1 已确立，**源码不得硬编码 vault 路径**）。
-⛔ `EXPORT_ROOT` 未配置 ⇒ **响亮失败**，不得静默跳过导出（静默跳过 = 产物 2 消失且没人知道）。
-
-### 1.4 ⚠️ anchor-check 本包**不接**，但必须是「可观测的未接线」
-
-`generate.ts:414-421` 已经设计好：`spawnAnchorCheck` 抛错 ⇒ `anchorRate` 保持 `null` ⇒
-`renderReportHead` 在报告头部标 **`unavailable`**（而不是伪装成 0%）。
-
-⇒ 本包的 `spawnAnchorCheck` 实现**必须抛一个专有且响亮的错误**（如 `AnchorCheckNotWiredError`），
-使报告头部如实标 `unavailable`。
-⛔ **不得**返回一个编造的核验率（那会让软闸门判据凭空出现）；
-⛔ **不得**静默返回 0（`0%` 与 `unavailable` 是两件事，既有代码明确区分）。
-真实接线归 **G4d**。
+| 生成段触发边（终态非 null + origin + 未生成过 ⇒ `runGenerate`），含有牙的可达性用例 | `src/tick-run.ts` 触发边、`test/g4c-generate-wiring.test.ts` U1 |
+| 一次性保证：内存 Set + 跨进程文件标记，**标记在 `runGenerate` 成功之后才写**（失败不永久堵死重试） | `src/tick-run.ts` `hasGeneratedInAnyProcess` / `markGeneratedInAnyProcess` |
+| 生产 `spawnRole` 读 **`dr-doc.result.v1`**（该 kind 才有 `body`；`worker.result.v1` 没有），每次重读 + 重试等待 spawn 落地 | `src/tick-inspect.ts` `readGenerateResult`、`src/tick-run.ts` `readBody` |
+| 导出：`mkdirSync(dirname, {recursive:true})`、`source_message_id` 取自真实发布 id、`createdAt` 优先取 bus `created_at` | `src/tick-run.ts` `spawnExport` |
+| `--origin` / `--doc-channel` 从 `bin/` → `fleet.yaml.tpl` → `workflow.yaml` → `tick.md` → `tick-entry` 的生产贯通 | 四个文件 |
+| `writeDoc` 拒绝静默默认到板 channel（无 `--doc-channel` 即响亮失败） | `src/tick-run.ts` `writeDoc` |
+| `lockSynthesizer` mkdir 互斥锁 | `src/tick-run.ts` |
 
 ---
 
-## 2　硬验收（缺一不可）
+## 2　要做的三件事
+
+### 2.1 ⭐ F1（blocker）：`doc_channel` 缺 `?` 可选标记
+
+`workflows/deep-research/tick/workflow.yaml:29` 当前是：
+
+```yaml
+      doc_channel: "{{doc_channel}}"
+```
+
+**同一文件紧邻两行的既有可选输入是**：
+
+```yaml
+      evidence_channel: "{{evidence_channel?}}"     # :20
+      allowed_root: "{{allowed_root?}}"             # :21
+```
+
+⇒ `DOC_CHANNEL` 为空时（**当前所有 deploy profile 的默认值**，D2 尚未执行）模板按**必填**渲染，**tick 节点报错**。
+
+**派发方实测的因果证据（决定性）**：
+
+| 条件 | 结果 |
+|---|---|
+| `DOC_CHANNEL` 为空 | `test/a10b-convergence.test.ts` 的 **B2** 失败，连跑 3 次 **3/3 挂** |
+| `DOC_CHANNEL=research:p02-smoke-1dce60.docs` | 同文件 **12/12 全绿** |
+| attempt 3 产出 `36b651d`（本改动引入前）同一 worktree 同一时刻重跑 | **12/12 全绿** ⇒ 是本改动引入的回归 |
+
+**⛔ 放大器比 bug 本身更严重**（本包真正要消灭的东西）：
+
+```
+/data/loop-engine/runs/2026-08-09T215954-f5c1c472/loop-events.jsonl
+  {"kind":"round_end","detail":{"round":1,"ticked":["tick"],"errors":1}}
+同目录 drain.json
+  {"reason":"drained","rounds":1}          ← 且脚本 exit 0
+```
+
+⇒ **每个 tick 都在报错，而从外面看是一次干净的收敛。**
+
+**要求**：让 `doc_channel` 与既有两个可选输入**同形**（可选、空值不报错）。
+⛔ **不得**改成"给它编一个缺省 channel"——bus 写入 append-only 无 DELETE，doc 发错 channel 不可回退；
+`writeDoc` 现有的「无 `--doc-channel` 即响亮失败」语义**必须原样保留**。
+
+### 2.2 F2：`--origin` / `--doc-channel` 的生产贯通目前只有**字符串包含**断言
+
+现状（G4c attempt 4 评审 minor，未修）：`test/g4c-generate-wiring.test.ts` 只用
+`expect(source).toContain("--origin")` 对模板文件做字符串匹配 —— 这正是 spec 判定**不构成可达性证据**的形状，
+且它对 §2.1 这类渲染层缺陷**零判别力**（`{{doc_channel}}` 写错成必填，字符串包含照样绿）。
+
+**照本仓已有的正确形状写**：`test/g4a-question-wiring.test.ts:124-143 / 177-199` —— 渲染 `tick.md` +
+**假 `tick-entry` 记录 argv**，断言 flag **及其值**真的出现在 argv 里。
+
+### 2.3 F3：`createdAt` 仍可能落回系统时钟
+
+`src/tick-run.ts` 的 `spawnExport`：`reportMsg?.created_at ?? new Date().toISOString()`。
+而 `src/export.ts:11 / :22` 把「日期取自 bus `created_at`、**绝不取系统时钟**」写成硬不变量
+（`deriveExportPath` 把该日期放进文件名，导出必须**同输入⇒同字节**可重生成）。
+
+**要求**：回读不到该 message ⇒ **响亮失败**，⛔ 不得落回系统时钟。
+
+---
+
+## 3　硬验收（缺一不可）
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **U1** | ⭐ **可达性**：从**生产入口**（`tick-entry --run`）出发，终态非 null 时 `runGenerate` **真的被调用**；终态为 null 时**不被调用** | 正反两例；⛔ 断言「函数存在」或「决策为真」**不算数** |
-| **U2** | ⛔ **只跑一次**：同一次研究的终态被**连续两个 tick** 观察到时，生成段**只执行一次**（spawn 次数、writeDoc 次数、导出次数都不翻倍） | 判别性用例；这是 §1.1 幂等要求的唯一执行点 |
-| **U3** | ⛔ **导出件带 `source_message_id`**，且该值 **等于 report doc 实际发布出的 message id**（不是编造、不是空串） | 断言两者相等；⛔ 只断言「字段存在」不算数 |
-| **U4** | ⛔ **导出落点** = `<EXPORT_ROOT>/DeepThought/<主题-slug>/…`，且 `EXPORT_ROOT` 未配置 ⇒ **响亮失败** | 正反两例；grep 源码无硬编码 vault 路径 |
-| **U5** | ⛔ **anchor-check 未接线时头部标 `unavailable`**，⛔ **不得**出现编造的核验率、⛔ **不得**是 `0%` | 断言头部字面；`0%` 与 `unavailable` 必须可区分 |
-| **U6** | 串行边保持：`synthesizer` 并发 = 1、**绝不跳过 synthesizer**、导出在最后 | 既有断言保留且仍有效（读到行号） |
-| **U7** | `doc_kind` 仍由 role 推出（debater ⇒ `argument`，synthesizer ⇒ `report`），**不读 payload** | 既有判别性用例保留 |
-| **U8** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4b 合入后的 main 实测为准，自己先跑一次记下来）** | 贴基线与终值 |
-| **U9** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **U10** | `src/`、`test/`、`workflows/` 的每处删除给出必要性说明 | — |
-
-> ⚠️ **本包不要求端到端真跑真 bus**：`dr-doc.result.v1` 在派发方完成注册前真发会 422。
-> 验收全部落在「接线可判别」上。⛔ **不得为让真跑通过而去注册协议。**
+| **F1** | ⭐ **全量 `npx vitest run` 真的全绿**，且**在 `DOC_CHANNEL` 未设置的干净环境下**（这是缺省部署形态） | ⛔ **必须在你自己的 workspace 里实跑并贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段），不得只贴计数、不得只写结论 |
+| **F2** | 基线：main `f655317` 实测 **21 files / 391 tests**；本包终值**文件数与用例数均不低于基线** | 贴两次实测输出 |
+| **F3** | ⛔ **B2 判别性**：把 `workflow.yaml` 的 `doc_channel` 改回**无 `?`** ⇒ B2 **必须挂** | 变异 M1，见 §4 |
+| **F4** | ⛔ `--origin` **与** `--doc-channel` 各有一条 **argv 记录**用例：渲染 `tick.md` + 假 `tick-entry`，断言 flag **及其值**出现在 argv | ⛔ 只断言模板文件里含该字符串**不算数** |
+| **F5** | ⛔ **值缺省时不得出现该 flag**：`DOC_CHANNEL` / `RESEARCH_ORIGIN` 为空 ⇒ argv 里**没有**对应 flag（不是空串参数） | 正反两例 |
+| **F6** | ⛔ `createdAt` 回读不到 message ⇒ **响亮失败**，不得落回系统时钟；grep 生产路径无 `new Date()` 兜底 | 判别性用例 + 读到行号 |
+| **F7** | `writeDoc` 的「无 `--doc-channel` 即响亮失败」语义**未被削弱** | 既有断言保留且仍有效（读到行号） |
+| **F8** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **F9** | `src/`、`test/`、`workflows/` 的每处删除给出必要性说明 | — |
 
 ---
 
-## 3　变异矩阵（逐断言归因）
+## 4　变异矩阵（逐断言归因）
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **T1** | 去掉生产里对 `runGenerate` 的调用（回到改动前） | **U1 的正例必须挂**；⛔ 杀不掉即判 U1 零功率 |
-| **T2** | 去掉一次性保证（每个 tick 都跑生成段） | **U2 必须挂** |
-| **T3** | 让导出的 `source_message_id` 用一个常量/空串而非真实 message id | **U3 必须挂** |
-| **T4** | 让 `spawnAnchorCheck` 返回 `{defects:0, verificationRate:0}` 而不是抛错 | **U5 必须挂**（`unavailable` 变成 `0%`） |
+| **M1** | `workflow.yaml` 的 `doc_channel` 去掉 `?`（= 回到 G4c attempt 5 的状态） | **F1 全量必须变红、B2 必须挂**；⛔ 杀不掉即判本包核心零功率 |
+| **M2** | 让 `tick.md` 在 `doc_channel` 非空时**不**追加 `--doc-channel` | **F4 的 doc-channel 那条必须挂** |
+| **M3** | 让 `tick.md` 在 `research_origin` 为空时也追加 `--origin ""` | **F5 必须挂** |
+| **M4** | `createdAt` 恢复 `?? new Date().toISOString()` 兜底 | **F6 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 4　显式不做
+## 5　显式不做
 
 | 不做 | 理由 |
 |---|---|
-| anchor-check 真实接线（引入 `tools/anchor-check.py`、改成确定性子进程、报告落盘） | 归 **G4d**。本包只保证「未接线」是**可观测**的 |
+| 重写 §1 列出的任何已完成部分 | 已交付并被 review 确认；本包只补三件事 |
+| anchor-check 真实接线 | 归 **G4d** |
 | 播种入口 | 归 **G4e** |
-| 改 `profiles/deploy/*.env` 的 channel 取值 | 归 **D2** |
-| 改 `runGenerate` 的**编排顺序**或串行边语义 | 它是已交付且被断言保护的；本包只接线 + 修 §1.3 那一处 dep 形状 |
-| 注册任何 bus 协议 | 不可逆，走公示流程 |
-| 改 `agent-runtime` | 不同仓 |
-| 端到端真跑真 bus | 协议未注册，真发必 422；留 Phase 6 |
+| 改 `profiles/deploy/*.env`（含新增 `DOC_CHANNEL` 取值） | 归 **D2**。本包**只保证 `DOC_CHANNEL` 为空时不炸**，不决定它该是什么值 |
+| `lockSynthesizer` 的陈旧锁回收 | 已记为独立 finding，归后续包；本包不扩面 |
+| 一次性标记改成 bus 侧/run-root 作用域 | 同上，独立 finding |
+| 注册任何 bus 协议 | 不可逆，走公示流程（派发方处置） |
+| 端到端真跑真 bus | 归 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 5　交付物落点
+## 6　交付物落点
 
-- 实现：`src/tick-run.ts`（触发边 + deps 组装 + 一次性保证）、`src/generate.ts`（仅 §1.3 的 dep 契约）、
-  `src/export.ts`（生产写入，若需要）、`src/bus.ts`（发布 `research.doc.v2` 的原语，若需要）
-- 测试：`test/g4c-generate-wiring.test.ts`（U1–U7）
-- 证据：`docs/dev-notes/dev_ledr_g4c_generate_wiring_01.md`（U1–U10 逐条 + §3 变异四行 + 还原证据）
+- 修复：`workflows/deep-research/tick/workflow.yaml`、`src/tick-run.ts`（仅 §2.3 那一处）
+- 测试：`test/g4c2-assembly.test.ts`（F4/F5/F6）；B2 保持原样**不得修改**（它是 F1 的判据）
+- 证据：`docs/dev-notes/dev_ledr_g4c2_fix_01.md`（F1–F9 逐条 + §4 变异四行 + 还原证据）
 
 > **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（该字段本来的语义）。
-> 真正的要求是**正文描述交付物本身**：测试文件数/用例数、变异矩阵各行实测结果、最终代码行为必须与交付一致；
-> 若中途 rework 改了实现，正文数字与结论同步更新。⛔ **不要为对齐 commit hash 做额外提交。**
+> 真正的要求是**正文描述交付物本身**：测试文件数/用例数、变异矩阵各行**实测**结果、最终代码行为必须与交付一致；
+> 若中途 rework 改了实现，正文数字与结论同步更新。
+> ⛔ **不要为对齐 commit hash 做额外提交。**
+> ⛔ **不得用「基线计数方式差异」解释测试数缺口** —— 基线与终值是同一条 `npx vitest run`，口径可比。

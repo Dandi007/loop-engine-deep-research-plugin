@@ -1,82 +1,79 @@
-# G4b(v3) —— 终态贯通：生产 `--run` 从不计算终止判定，「正常收敛」当前**不可达**
+# G4c —— 生成段接进生产：`runGenerate` 至今**零调用者**
 
-> 派发方：`line-deep-research`（deep-research V2 收尾线）。**这是已核实的生产缺陷，不是加功能。**
-> 前置已合入 main `70898c4`（G4a(v2) `--question` 贯通已完成）。
->
-> ⚠️ **这是第三次开这个包。前两次都不是实现方的问题：**
-> - v1（PR #35）：implementer 首选档持续 60s 首包超时（100 分钟内 55 次，约 5.4 分钟/step）。已换到实测健康的档（本包沿用）。
-> - v2（PR #36）：**派发方 spec §5 里有一条自指、逻辑上不可满足的要求** ——「dev-note 的 `input_commit` 必须等于最终交付 commit」。
->   note 本身就是交付 commit 的一部分，每改一次 note 就产生新 commit，note 立刻又「过期」。三轮 attempt 全烧在上面。
->   **本包 §5 已整节更正**（见下）。⛔ **不要为对齐 commit hash 做任何额外提交。**
->
-> **除 §5 外，spec 内容与前两轮逐字相同。**
+> 派发方：`line-deep-research`。**这是已核实的生产缺陷，不是加功能。**
+> 前置：G4a(v2)（`--question` 贯通）+ G4b(v3)（终态贯通）均已合入 main `f655317`。
 
 ---
 
-## 0　两条已核实的事实（grep 到行号，非推断）
+## 0　已核实的事实
 
-### 0.1 生产 `--run` 路径**从不调用** `decideTermination`
+| # | 事实 | 证据 |
+|---|---|---|
+| A | **`runGenerate` 在 `src/` 内零调用者** | `grep -rn 'from "./generate"' src/` **只命中 `src/export.ts:14`**，且只取 `parseReportMarker` / `renderReportBody` 两个纯函数 |
+| B | **tick 决策集里没有 generate** | `tick.ts` 的 kind 只有 `reclaim/harvest/dispatch/block/triage`；`tick-run.ts` 的 switch 同样五个 |
+| C | **fleet 只有一条 pipeline** | `fleet.yaml.tpl` 全文只有 `- label: tick` |
+| D | **`src/export.ts` 零 importer**；`EXPORT_ROOT` 无运行时消费者 | `grep -rn EXPORT_ROOT bin/ src/ workflows/` 只命中 `bin` 的 export 与测试文件 |
 
-```
-grep -n "termination" src/tick-run.ts   →   零命中
-```
+⇒ **`runGenerate` 本身是完整的**（`generate.ts:348-424` 已编排 debater×3 → writeDoc → synthesizer(lock) → anchor-check → report doc → export），
+**但生产里没有任何一条边指向它** ⇒ plan §0 的产物 1（report）与 2（导出件）**都产不出**。
 
-`decideTermination`（`src/tick.ts:359`）的调用者只有两处，**都不是生产写路径**：
-- `src/tick-entry.ts:73` —— `--selfcheck`（空板面自检）
-- `src/tick-inspect.ts:112` —— `--inspect`（只读观察）
-
-⇒ **生产每个 tick 只做「决策 → 执行 → 报 `hasPendingWork`」，从不判断研究是否结束。**
-
-### 0.2 ⛔ 更硬的一条：`zeroGrowthRounds` **没有任何跨 tick 持久化**，导致「正常收敛」永不可达
-
-三个调用点**全部硬编码 `prevCoverage: 0, prevZeroGrowthRounds: 0`**
-（`tick-entry.ts:74-75`、`tick-inspect.ts:113-114`）。
-
-代入 `tick.ts:362-363`：
-
-```ts
-const zeroGrowthRounds = coverage > input.prevCoverage ? 0 : input.prevZeroGrowthRounds + 1;
-//                                    ^^^ 恒为 0                        ^^^ 恒为 0
-```
-
-⇒ `zeroGrowthRounds` **恒为 0 或 1**，而阈值 `zeroGrowthThreshold = 2`（`tick.ts:88`）
-⇒ **条件 1（正常收敛）永远不成立**，唯一可达终态是 `capped`（触顶）。
-
-> ⛔ 这正是 `spec` §3.4 明令要区分的两件事：**因触顶而停 ≠ 收敛**。
-> 现状下**每一次研究的终态都只能是触顶**，报告的完备性主张随之失真。
-> G2b 修掉了「proposed 永不被裁走」那一半；**这一半（计数器无记忆）还在。**
+> **判据（本线已记）**：**「模块写好了」与「生产会调用它」是两条独立命题。**
+> 单元测试全绿、`git log` 有合入记录，**都不构成可达性证据**。
 
 ---
 
 ## 1　要做什么
 
-### 1.1 生产 `--run` 必须计算并返回终止判定
+### 1.1 触发边
 
-`runChannelWrite` 在执行完本轮决策后，**用本轮真实板面**调用 `decideTermination`，
-并把 `TerminationState` 放进 `--run` 的 JSON 输出（与既有 `hasPendingWork` 并列）。
+生产 `--run` 在本轮决策执行完、拿到 G4b 的 `TerminationState` 之后：
+`decideGenerate(term)` 为真 ⇒ 调用 `runGenerate(deps, cfg)`。
 
-⛔ **不得新造一套判定逻辑**：`decideTermination` / `computeCoverage` 是已交付的纯函数，**调用它们**。
+⛔ **`decideGenerate` 已是交付好的纯函数**（`generate.ts:83`：`term.state !== null`），**调用它，不要另判一套**。
+⛔ **幂等**：同一次研究的终态可能被多个 tick 观察到 ⇒ **必须保证生成段只跑一次**
+（`writeDoc` 的 idempotencyKey 已按 `dr-doc:<role>:<origin>` 构造，但**导出与 spawn 的重复执行不受它保护**）。
+本包必须给出一个明确的一次性保证机制并断言它。
 
-### 1.2 ⛔ `prevCoverage` / `prevZeroGrowthRounds` 必须跨 tick 传递
+### 1.2 十个 deps 的真实实现
 
-**走已经铺好的 trigger body 通道，不要新造存储：**
+`GenerateDeps`（`generate.ts:306-338`）的每一项都要有生产实现。**已有的东西一律复用，别重写**：
 
-| 位置 | 现状 |
+| dep | 怎么实现 |
 |---|---|
-| `workflows/deep-research/fleet.yaml.tpl:27-28` | `claim.bind` 已把 `trigger_id: id` / **`trigger_body: body`** 绑进 pipeline input |
-| `tick.md:46` | 续投时写死 `"body":{"tick":true}` —— **body 是可用载体，但当前只放了一个常量** |
-| `tick.md` | **从不读 `{{trigger_body}}`** —— 载体已通，两端都没接 |
+| `readTermination` | G4b 已让 `--run` 算出 `TerminationState`，直接用 |
+| `countBlocked` | 板面里 `status === "blocked"` 的卡数（`tick.ts:370` 已有同款算法） |
+| `readQuestion` | G4a(v2) 的 `--question` |
+| `readOrigin` | 本次研究 id。**取值来源必须显式且稳定**（同一次研究的多个 tick 必须得到同一个 origin，否则 `writeDoc` 的幂等键失效） |
+| `readEvidences` | 从 evidence channel 回读（`--evidence-channel` 已贯通）；字段 `anchor/quote/claim/clue_id` |
+| `spawnRuntime` | 复用 `tick-run.ts` 里派 worker/triage 用的那套 `agent-run` 运行时 |
+| `writeDoc` | 发 `research.doc.v2`；`src/bus.ts` 已有发布原语，照 `publishClue`/`publishEvidence` 的形状加 |
+| `lockSynthesizer` | 单例 lock，**wait-then-run，不是拿不到就跳过**（`generate.ts:333-337` 注释已写死语义） |
+| `spawnExport` | 见 §1.3 |
+| `spawnAnchorCheck` | ⚠️ 见 §1.4 —— **本包不接真实实现** |
 
-⇒ 续投时把本轮的 `{coverage, zeroGrowthRounds}` 写进下一条 trigger 的 body；
-下一轮 tick 读回来，作为 `prevCoverage` / `prevZeroGrowthRounds` 传给 `decideTermination`。
+### 1.3 ⛔ 导出：先修一个 dep 形状缺陷
 
-⛔ **首轮无前值** ⇒ 用 `0 / 0`（与现状一致，且首轮本来就不该收敛）。
-⛔ **body 解析失败 / 字段缺失** ⇒ **响亮失败**，不得静默回落到 `0 / 0`
-（静默回落 = 计数器被无声重置 = 本缺陷原样复发，而且更难查）。
+`generate.ts:331` 的签名是 `spawnExport(body: string): Promise<void>` ——
+**它拿不到 `source_message_id`**，而 plan §0 产物 2 硬要求导出件带 `source_message_id`。
+上游 `writeDoc` 在它之前发出了 report doc，**但 `writeDoc` 返回 `void`，message id 被丢弃**。
 
-### 1.3 显式不做：不要在这里触发生成段
+⇒ **本包必须修这个形状**（改 `runGenerate` 的 dep 契约属本包范围，因为本包正是它的接线方）：
+让 `writeDoc` 返回发布出的 message id，并把它传给导出。
 
-`decideGenerate` 的接线归 **G4c**。本包只让**终态本身可算、可达、可观察**。
+导出实现复用 `src/export.ts` 的既有形状（`deriveExportPath` / `renderExportContent`），
+落点 `<EXPORT_ROOT>/DeepThought/<主题-slug>/`（D1 已确立，**源码不得硬编码 vault 路径**）。
+⛔ `EXPORT_ROOT` 未配置 ⇒ **响亮失败**，不得静默跳过导出（静默跳过 = 产物 2 消失且没人知道）。
+
+### 1.4 ⚠️ anchor-check 本包**不接**，但必须是「可观测的未接线」
+
+`generate.ts:414-421` 已经设计好：`spawnAnchorCheck` 抛错 ⇒ `anchorRate` 保持 `null` ⇒
+`renderReportHead` 在报告头部标 **`unavailable`**（而不是伪装成 0%）。
+
+⇒ 本包的 `spawnAnchorCheck` 实现**必须抛一个专有且响亮的错误**（如 `AnchorCheckNotWiredError`），
+使报告头部如实标 `unavailable`。
+⛔ **不得**返回一个编造的核验率（那会让软闸门判据凭空出现）；
+⛔ **不得**静默返回 0（`0%` 与 `unavailable` 是两件事，既有代码明确区分）。
+真实接线归 **G4d**。
 
 ---
 
@@ -84,15 +81,19 @@ const zeroGrowthRounds = coverage > input.prevCoverage ? 0 : input.prevZeroGrowt
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **R1** | ⛔ **可达性**：存在一条从**生产入口**（`tick-entry --run`）出发的用例，其 JSON 输出里含 `termination`；⛔ 只验 `--selfcheck`/`--inspect` **不算数**（那两条本来就有） | 读用例到行号 |
-| **R2** | ⭐ **「正常收敛」可达**：构造连续多轮零增长，断言 `zeroGrowthRounds` **能长到 ≥ 2** 且 `state === "converged"`。⛔ 这条在改动前**必然挂**——它是本包的存在理由 | 多轮驱动用例 |
-| **R3** | ⛔ **判别性**：同样多轮但**覆盖度有增长** ⇒ `zeroGrowthRounds` 被重置、**不得**收敛 | 反例（一个永远收敛的检查等于没有检查） |
-| **R4** | **跨 tick 传递真的经过 trigger body**：断言续投写出的 trigger body 里含本轮的 `coverage` / `zeroGrowthRounds`，且下一轮从 `{{trigger_body}}` 读回 | 两端各一条；⛔ 只断言「函数收了参数」不算数 |
-| **R5** | ⛔ **body 缺失/损坏 ⇒ 响亮失败**，不得静默回落 `0/0` | 正反两例 |
-| **R6** | `capped` 与 `converged` **仍然可区分**：触顶路径产出 `capped`，零增长路径产出 `converged` | 各一条 |
-| **R7** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4a 合入后的 main 实测为准，请自己先跑一次记下来）** | 贴基线与终值两次输出 |
-| **R8** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **R9** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明 | — |
+| **U1** | ⭐ **可达性**：从**生产入口**（`tick-entry --run`）出发，终态非 null 时 `runGenerate` **真的被调用**；终态为 null 时**不被调用** | 正反两例；⛔ 断言「函数存在」或「决策为真」**不算数** |
+| **U2** | ⛔ **只跑一次**：同一次研究的终态被**连续两个 tick** 观察到时，生成段**只执行一次**（spawn 次数、writeDoc 次数、导出次数都不翻倍） | 判别性用例；这是 §1.1 幂等要求的唯一执行点 |
+| **U3** | ⛔ **导出件带 `source_message_id`**，且该值 **等于 report doc 实际发布出的 message id**（不是编造、不是空串） | 断言两者相等；⛔ 只断言「字段存在」不算数 |
+| **U4** | ⛔ **导出落点** = `<EXPORT_ROOT>/DeepThought/<主题-slug>/…`，且 `EXPORT_ROOT` 未配置 ⇒ **响亮失败** | 正反两例；grep 源码无硬编码 vault 路径 |
+| **U5** | ⛔ **anchor-check 未接线时头部标 `unavailable`**，⛔ **不得**出现编造的核验率、⛔ **不得**是 `0%` | 断言头部字面；`0%` 与 `unavailable` 必须可区分 |
+| **U6** | 串行边保持：`synthesizer` 并发 = 1、**绝不跳过 synthesizer**、导出在最后 | 既有断言保留且仍有效（读到行号） |
+| **U7** | `doc_kind` 仍由 role 推出（debater ⇒ `argument`，synthesizer ⇒ `report`），**不读 payload** | 既有判别性用例保留 |
+| **U8** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4b 合入后的 main 实测为准，自己先跑一次记下来）** | 贴基线与终值 |
+| **U9** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **U10** | `src/`、`test/`、`workflows/` 的每处删除给出必要性说明 | — |
+
+> ⚠️ **本包不要求端到端真跑真 bus**：`dr-doc.result.v1` 在派发方完成注册前真发会 422。
+> 验收全部落在「接线可判别」上。⛔ **不得为让真跑通过而去注册协议。**
 
 ---
 
@@ -100,9 +101,10 @@ const zeroGrowthRounds = coverage > input.prevCoverage ? 0 : input.prevZeroGrowt
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **S1** | 把跨 tick 传递去掉，`prevZeroGrowthRounds` 恒传 `0`（= 回到改动前） | **R2 必须挂**；⛔ 杀不掉即判 R2 零功率、必须重写 |
-| **S2** | 让 body 缺失时静默回落 `0/0`（去掉响亮失败） | **R5 的失败侧必须挂** |
-| **S3** | 让 `coverage` 增长时**不**重置 `zeroGrowthRounds`（照单 +1） | **R3 必须挂** |
+| **T1** | 去掉生产里对 `runGenerate` 的调用（回到改动前） | **U1 的正例必须挂**；⛔ 杀不掉即判 U1 零功率 |
+| **T2** | 去掉一次性保证（每个 tick 都跑生成段） | **U2 必须挂** |
+| **T3** | 让导出的 `source_message_id` 用一个常量/空串而非真实 message id | **U3 必须挂** |
+| **T4** | 让 `spawnAnchorCheck` 返回 `{defects:0, verificationRate:0}` 而不是抛错 | **U5 必须挂**（`unavailable` 变成 `0%`） |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
@@ -113,27 +115,24 @@ const zeroGrowthRounds = coverage > input.prevCoverage ? 0 : input.prevZeroGrowt
 
 | 不做 | 理由 |
 |---|---|
-| 触发生成段（`decideGenerate` → `runGenerate`） | 归 **G4c** |
-| 接导出 / anchor-check | 归 **G4d** |
+| anchor-check 真实接线（引入 `tools/anchor-check.py`、改成确定性子进程、报告落盘） | 归 **G4d**。本包只保证「未接线」是**可观测**的 |
 | 播种入口 | 归 **G4e** |
 | 改 `profiles/deploy/*.env` 的 channel 取值 | 归 **D2** |
-| 改 `decideTermination` / `computeCoverage` 的判定语义 | 它们是已交付的纯函数，本包只**接线与持久化**，不改判定 |
+| 改 `runGenerate` 的**编排顺序**或串行边语义 | 它是已交付且被断言保护的；本包只接线 + 修 §1.3 那一处 dep 形状 |
 | 注册任何 bus 协议 | 不可逆，走公示流程 |
 | 改 `agent-runtime` | 不同仓 |
+| 端到端真跑真 bus | 协议未注册，真发必 422；留 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
 ## 5　交付物落点
 
-- 实现：`src/tick-run.ts`（`--run` 计算终态 + 读写跨 tick 计数）、
-  `workflows/deep-research/tick/templates/tick.md`（读 `{{trigger_body}}` + 续投写计数）、
-  必要时 `workflows/deep-research/fleet.yaml.tpl`
-- 测试：`test/g4b-termination-wiring.test.ts`（R1–R6）
-- 证据：`docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`（R1–R9 逐条 + §3 变异三行 + 还原证据）
+- 实现：`src/tick-run.ts`（触发边 + deps 组装 + 一次性保证）、`src/generate.ts`（仅 §1.3 的 dep 契约）、
+  `src/export.ts`（生产写入，若需要）、`src/bus.ts`（发布 `research.doc.v2` 的原语，若需要）
+- 测试：`test/g4c-generate-wiring.test.ts`（U1–U7）
+- 证据：`docs/dev-notes/dev_ledr_g4c_generate_wiring_01.md`（U1–U10 逐条 + §3 变异四行 + 还原证据）
 
-> **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（dd 交给你的那个，这本来就是该字段的语义）。
-> ⛔ **不要去追交付 commit** —— note 是交付 commit 的一部分，那个要求自指、不可满足。
+> **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（该字段本来的语义）。
 > 真正的要求是**正文描述交付物本身**：测试文件数/用例数、变异矩阵各行实测结果、最终代码行为必须与交付一致；
-> 若中途 rework 改了实现，正文数字与结论同步更新。⛔ **不得为对齐 commit hash 做额外提交。**
-> 派发方在 D1 上实测到「note 停在 attempt 1、数字与交付物对不上」，gate 会核对这一项。
+> 若中途 rework 改了实现，正文数字与结论同步更新。⛔ **不要为对齐 commit hash 做额外提交。**

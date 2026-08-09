@@ -16,7 +16,7 @@
  * 本模块不 import ./bus；读 / spawn / lock / 回写全部经 deps 注入。
  */
 import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TerminationState } from "./tick";
@@ -186,7 +186,13 @@ export interface SynthesizerCorpus {
   question: string;
   evidences: EvidenceView[];
   arguments: string[];
-  terminal_marker: string;
+  /**
+   * 终态标记：**结构化对象**（`{stop, blocked, capHit}`），由 `buildReportMarker()` 产出。
+   * ⛔ 不得用 `renderReportBody()` 的字符串——agent-runtime `synthesizer-input.v1.json` 把
+   *    `terminal_marker` 声明为 `{"type":"object"}`，字符串会在 `--input` 的 schema 守卫处
+   *    报 CONTRACT_ERROR（评审 blocker：`expected object, got string`）。
+   */
+  terminal_marker: ReportMarker;
 }
 
 /** evidence channel 回读的证据最小视图（anchor/quote/claim/clue_id）。 */
@@ -252,8 +258,12 @@ export interface GenerateSpawnRuntime {
   runId: string;
   /** 写 `--input` 载荷文件；缺省 `writeGenerateInputFile`。 */
   writeInputFile?: (corpus: DebaterCorpus | SynthesizerCorpus) => string;
-  /** 真实 spawn；测试注入假 agent-run 记录 argv。 */
-  spawnProcess?: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
+  /**
+   * 真实 spawn；测试注入假 agent-run 记录 argv。
+   * ⛔ **必填**：任何 generation 派发都必须真正启动子进程（评审 major）。
+   *    缺省/缺失即响亮失败，绝不静默构建 argv 后丢弃、返回一个从未启动的假成功。
+   */
+  spawnProcess: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
   /** 从 worker 结果读回 role 的 body。 */
   readBody: (runId: string) => Promise<string>;
 }
@@ -262,6 +272,9 @@ export interface GenerateSpawnRuntime {
  * G2a §1.1 —— 生产默认 agent-run 派发（类比 tick-run 的 `spawnAgentRunWorker`）：
  * 语料 → `--input` 载荷文件 → `buildGenerateRoleArgv` 把序列化语料放进位置参数 → spawn agent-run。
  * 这是 `buildGenerateRoleArgv` 的**唯一生产调用点**，杜绝「语料→argv」成为死代码（评审 blocker）。
+ * ⛔ `spawnProcess` 必填且**无条件调用**（评审 major）：缺失即编译/调用期失败，绝不静默丢弃 argv
+ *    返回「从未启动」的假成功。载荷文件的寿命绑定到本次派发：读回 body 后**随即移除**（评审 minor，
+ *    类比 tick-run 的 `onExit` unlink），防止每个 generation role 泄漏一个 tmp 文件。
  */
 export async function spawnGenerateRole(
   role: string,
@@ -272,18 +285,22 @@ export async function spawnGenerateRole(
   const inputPath = runtime.writeInputFile
     ? runtime.writeInputFile(corpus)
     : writeGenerateInputFile(corpus);
-  const argv = buildGenerateRoleArgv({
-    agentRunBin: runtime.agentRunBin,
-    role,
-    route,
-    runId: runtime.runId,
-    inputPath,
-    corpus,
-  });
-  if (runtime.spawnProcess) {
+  try {
+    const argv = buildGenerateRoleArgv({
+      agentRunBin: runtime.agentRunBin,
+      role,
+      route,
+      runId: runtime.runId,
+      inputPath,
+      corpus,
+    });
+    // ⛔ 无条件 spawn：runtime 缺 spawnProcess 在类型层即不可通过（必填），杜绝零-spawn 假成功。
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+    return { body: await runtime.readBody(runtime.runId) };
+  } finally {
+    // 载荷文件用后即删，不泄漏 tmp（评审 minor）。
+    rmSync(inputPath, { force: true });
   }
-  return { body: await runtime.readBody(runtime.runId) };
 }
 
 /** 执行壳的依赖注入面：所有副作用（读 / spawn / lock / 回写）都从这里走。 */
@@ -379,11 +396,12 @@ export async function runGenerate(
   }
 
   // synthesizer：单例 lock 串行化（wait-then-run）。拿锁后必跑，绝不跳过（D6 / spec §3）。
+  // ⛔ terminal_marker 传 `buildReportMarker()` 产出的结构化对象，不是渲染字符串（评审 blocker）。
   const synthCorpus: SynthesizerCorpus = {
     question,
     evidences,
     arguments: debaterOuts.map((o) => o.body),
-    terminal_marker: renderReportBody(marker),
+    terminal_marker: marker,
   };
   const release = await deps.lockSynthesizer();
   let synthBody: string;

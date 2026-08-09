@@ -2,7 +2,7 @@
 
 development_id: `dev_ledr_g2a_generate_wiring_01`
 attempt: `implement`（rework，继承前次实现提交）
-input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入的本 attempt 工作树 HEAD；
+input_commit: `fbdafc04d6026fd948c692ca9f432f763b70e0f7`（本 attempt 工作树 HEAD，由 dispatch 注入；
 本仓前置 `ee4a1e3`（spec line 5）为本开发的目标基，当前 HEAD 从其下游继承）
 
 ## 结论先行
@@ -33,8 +33,14 @@ input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入�
   `assertDistinctDebaterRoutes()` 保留（对 `debaters[].route` 判重，互不相同）。
 - **语料组装**（§2.2）：debater 语料 `{question, evidences[]}`（`anchor/quote/claim/clue_id` 从
   evidence channel 经 `readEvidences()` 回读）；judge 额外带 `prior_arguments`（advocate/opponent body）；
-  synthesizer 语料 `{question, evidences[], arguments[], terminal_marker}`，`terminal_marker` 复用既有
-  `renderReportBody()`（⛔ 不重造）。
+  synthesizer 语料 `{question, evidences[], arguments[], terminal_marker}`，`terminal_marker` 用
+  `buildReportMarker()` 产出的**结构化对象** `{stop, blocked, capHit}`（⛔ 不是 `renderReportBody()` 的
+  渲染字符串——agent-runtime `synthesizer-input.v1.json` 声明 `terminal_marker` 为 object，字符串会在
+  `--input` 守卫处 CONTRACT_ERROR；评审 blocker 修复）。
+- **生产派发**（§1.1）：`spawnGenerateRole` 是 `buildGenerateRoleArgv` 的唯一生产调用点；
+  ⛔ `GenerateSpawnRuntime.spawnProcess` **必填且无条件调用**（评审 major：缺省不得静默丢弃 argv
+  返回零-spawn 假成功）；`--input` 载荷文件**用后即删**（`rmSync`，评审 minor：不泄漏 tmp，类比
+  tick-run 的 onExit unlink）。
 - **位置参数**（§1.1）：`serializeCorpusToPositional()` 把语料序列化，`buildGenerateRoleArgv()` 把序列化
   文本放到 `--` 之后的位置参数；`--input` 只作 schema 守卫。
 - **doc_kind 由 role 推出**（§1.2 / §2.3）：`deriveDocKind(role)` —— `dr-synthesizer`→`report`，
@@ -58,9 +64,9 @@ input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入�
 | D4 | synthesizer 并发 = 1 断言保留；绝不跳过 synthesizer 断言保留 | `S4 singleton synthesizer lock (D6/serial)`（串行化）+ `D4: never skipped` |
 | D5 | 4MB 护栏正反两例（4MB-1 通过 / 4MB+1 拒绝） | `G2a D5`：`oneLess`/`atLimit` 通过、`oneMore` 拒绝；M3 拒绝侧被杀、通过侧不受影响 |
 | D6 | 报告头部同时含终态标记与 anchor-check 核验率；<90% 仍导出且头部标注 | `G2a D6`：rate ∈ {50, 95} 两例，头部均含 `dr-terminal` + `dr-anchor-rate`，且 export 均调用；崩溃与真实 0% 可区分（0 → `dr-anchor-rate 0`，崩溃 → `dr-anchor-rate unavailable`） |
-| D7 | 全量 `npx vitest run` 全绿，文件数与用例数 ≥ 基线 17 / 305 | `17 files / 317 tests` 全绿 |
+| D7 | 全量 `npx vitest run` 全绿，文件数与用例数 ≥ 基线 17 / 305 | `17 files / 319 tests` 全绿（新增 2 条 corpus schema 一致性用例） |
 | D8 | 变异矩阵逐断言归因，回显被改行，全部还原后 `git status --porcelain` 为空 | 见下 §4 |
-| D9 | 交付只加/改本仓代码与测试，不碰 `agent-runtime`、不注册协议 | `git diff --stat` 仅 `src/generate.ts` + `test/generate.test.ts` |
+| D9 | 交付只加/改本仓代码与测试，不碰 `agent-runtime`、不注册协议 | `git diff --stat` 仅 `src/generate.ts` + `test/generate.test.ts` + 本 dev-note |
 
 ## 变异矩阵（spec §4，逐断言归因）
 
@@ -72,7 +78,7 @@ input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入�
 - `G2a D1 ... > D1: runGenerate's default spawnRole turns readEvidences corpus into argv, anchor in positional` ✗
   （`expect(positional).toContain("code://repo@abc123:src/foo.ts#L42")`）
 
-结果：`2 failed / 30 passed`（只 D1 两条挂，其余不受影响）。还原后行恢复。
+结果：`2 failed / 32 passed`（只 D1 两条挂，其余不受影响）。还原后行恢复。
 ⛔ 因 D1 已从生产入口出发并断言位置参数里的证据文本，M1 的杀伤落在生产路径上，不再是自证其说。
 
 ### M2 —— `doc_kind` 改从 payload 读（`result.doc_kind ?? deriveDocKind(role)`）
@@ -81,7 +87,7 @@ input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入�
 - `G2a D2 ... > D2: a DEBATER payload carrying doc_kind:'report' ...` ✗
   （`expect(argumentDocs).toHaveLength(3)` —— advocate 被误判为 report，只剩 2 条 argument）
 
-结果：`1 failed / 4 passed`。还原后行恢复。
+结果：`1 failed / 33 passed`。还原后行恢复。
 
 ### M3 —— 去掉 4MB 上限判断（`if (bytes > limitBytes)` → `if (false && ...)`）
 改后回显：`if (false && bytes > limitBytes) {`
@@ -89,7 +95,7 @@ input_commit: `f30a9c97def4bbd3211f2554eee8de636f88df3c`（由 dispatch 注入�
 - `G2a D5 ... > D5: 4MB-1 and 4MB pass; 4MB+1 is rejected` ✗
   （`expect(() => assertDocBodyWithinLimit(oneMore)).toThrow(/exceeds/)` —— 拒绝侧挂；通过侧 `oneLess`/`atLimit` 不受影响）
 
-结果：`1 failed / 4 passed`。还原后行恢复。
+结果：`1 failed / 33 passed`。还原后行恢复。
 
 ### D8 —— 还原干净
 M1/M2/M3 每次改后已回显被改行；全部还原后 `git status --porcelain` 仅剩本包应提交的
@@ -98,7 +104,23 @@ M1/M2/M3 每次改后已回显被改行；全部还原后 `git status --porcelai
 
 ## 验证命令
 - `npm run typecheck`：exit 0。
-- `npm test`：`Test Files 17 passed (17)` / `Tests 317 passed (317)`。
+- `npm test`：`Test Files 17 passed (17)` / `Tests 319 passed (319)`。
+
+## 本轮 rework（继承 fbdafc0 前的评审反馈）修复
+- **[blocker] terminal_marker 类型**：synthesizer 语料的 `terminal_marker` 从渲染字符串改为
+  `buildReportMarker()` 产出的结构化对象 `{stop, blocked, capHit}`，与 agent-runtime
+  `synthesizer-input.v1.json` 的 object 声明一致，不再在 `--input` 守卫处 CONTRACT_ERROR。
+- **[major] corpus 与 schema 一致性**：新增 `G2a corpus schema conformance` 组，用极简 JSON-Schema
+  校验器把引擎侧组装的 debater（含 judge prior_arguments）与 synthesizer 语料对照
+  `debater-input.v1.json` / `synthesizer-input.v1.json` 实读校验；并含判别性断言：terminal_marker
+  若误传字符串必须报 `expected object`。
+- **[major] spawnProcess 必填**：`GenerateSpawnRuntime.spawnProcess` 由可选改必填，`spawnGenerateRole`
+  无条件调用，杜绝「构建 argv 后丢弃、返回零-spawn 假成功」。
+- **[minor] 载荷文件泄漏**：`spawnGenerateRole` 在 finally 中 `rmSync` 移除 `--input` 载荷文件（类比
+  tick-run onExit unlink），不再每 dispatch 泄漏一个 tmp 文件。
+- **[minor] D3 路径**：agent-runtime profiles 改经 `resolveAgentRuntimeProfiles()`（优先
+  `AGENT_RUNTIME_PROFILES` 环境变量），不存在时 D3/schema 用例 `describe.skipIf` 优雅跳过，
+  不再因硬编码绝对路径导致整条 suite 变红。
 
 ## 非目标（未触碰，越界即超出 scope）
 - 未做 triage 的 spawn 接线（归 G2b）；未注册任何 bus 协议（留给派发方公示流程）；

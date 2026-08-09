@@ -26,6 +26,7 @@ import type {
   GenerateSpawnRuntime,
   ReportMarker,
   DebaterCorpus,
+  SynthesizerCorpus,
 } from "../src/generate";
 import type { DocV2 } from "../src/protocol";
 import type { TerminationState } from "../src/tick";
@@ -38,17 +39,39 @@ const DEBATER_ROLES = new Set([
   "dr-debater-judge",
 ]);
 
-/** agent-runtime（前置合入 commit efa7579）的 profiles 根目录；测试读真实 role/route 值（spec §2.1）。 */
-const AGENT_RUNTIME_PROFILES =
-  process.env.AGENT_RUNTIME_PROFILES ?? "/data/code/self/agent-runtime/profiles";
+/**
+ * agent-runtime（前置合入 commit efa7579）的 profiles 根目录；测试读真实 role/route 值（spec §2.1）。
+ * ⛔ 不硬编码绝对主机路径：优先取 `AGENT_RUNTIME_PROFILES` 环境变量；未设时回退到常见宿主路径。
+ * 若该目录不存在（非本仓环境 / CI 无此路径），相关用例**优雅跳过**而非整条 suite 变红（评审 minor）。
+ */
+function resolveAgentRuntimeProfiles(): string | null {
+  const fromEnv = process.env.AGENT_RUNTIME_PROFILES;
+  if (fromEnv) return fromEnv;
+  const fallback = "/data/code/self/agent-runtime/profiles";
+  return existsSync(fallback) ? fallback : null;
+}
+
+const AGENT_RUNTIME_PROFILES = resolveAgentRuntimeProfiles();
+const agentRuntimeAvailable = AGENT_RUNTIME_PROFILES !== null;
 
 /** 从 agent-runtime profiles/roles/<role>.yaml 读出该 role 的 route（spec §2.1：别照本文猜）。 */
 function agentRoleRoute(role: string): string {
-  const p = join(AGENT_RUNTIME_PROFILES, "roles", `${role}.yaml`);
+  const root = resolveAgentRuntimeProfiles();
+  if (!root) throw new Error("agent-runtime profiles unavailable");
+  const p = join(root, "roles", `${role}.yaml`);
   if (!existsSync(p)) throw new Error(`missing agent-runtime role file: ${p}`);
   const doc = parse(readFileSync(p, "utf-8")) as { route?: string };
   if (!doc.route) throw new Error(`role file ${p} has no route`);
   return doc.route;
+}
+
+/** 从 agent-runtime 读某输入 schema（debater / synthesizer）。 */
+function readRoleInputSchema(name: "debater" | "synthesizer"): unknown {
+  const root = resolveAgentRuntimeProfiles();
+  if (!root) throw new Error("agent-runtime profiles unavailable");
+  const p = join(root, "roles", "schemas", `${name}-input.v1.json`);
+  if (!existsSync(p)) throw new Error(`missing agent-runtime schema file: ${p}`);
+  return JSON.parse(readFileSync(p, "utf-8")) as unknown;
 }
 
 function debaterSpawns(deps: GenerateDeps): unknown[][] {
@@ -410,29 +433,108 @@ describe("G2a D2: doc_kind is derived from role, never from payload", () => {
   });
 });
 
-describe("G2a D3: role/route wiring matches the real agent-runtime values", () => {
-  it("D3: the four roles' role/route pairs equal the values read from agent-runtime role files (not guessed)", () => {
-    // 每条 debater route 必须互不相同（spec §2.1 ⛔ / §2.1 表格）。
-    const routes = cfg.debaters.map((d) => d.route);
-    expect(routes).toHaveLength(3);
-    expect(new Set(routes).size).toBe(3);
+describe.skipIf(!agentRuntimeAvailable)(
+  "G2a D3: role/route wiring matches the real agent-runtime values",
+  () => {
+    it("D3: the four roles' role/route pairs equal the values read from agent-runtime role files (not guessed)", () => {
+      // 每条 debater route 必须互不相同（spec §2.1 ⛔ / §2.1 表格）。
+      const routes = cfg.debaters.map((d) => d.route);
+      expect(routes).toHaveLength(3);
+      expect(new Set(routes).size).toBe(3);
 
-    // 从 agent-runtime profiles/roles/<role>.yaml 实际读出 route，逐一核对（spec §2.1：别照本文猜）。
-    for (const d of cfg.debaters) {
-      expect(agentRoleRoute(d.role)).toBe(d.route);
-    }
-    expect(agentRoleRoute(cfg.synthesizer.role)).toBe(cfg.synthesizer.route);
-  });
+      // 从 agent-runtime profiles/roles/<role>.yaml 实际读出 route，逐一核对（spec §2.1：别照本文猜）。
+      for (const d of cfg.debaters) {
+        expect(agentRoleRoute(d.role)).toBe(d.route);
+      }
+      expect(agentRoleRoute(cfg.synthesizer.role)).toBe(cfg.synthesizer.route);
+    });
 
-  it("D3: every configured route exists in agent-runtime profiles/routes.yaml", () => {
-    const routesPath = join(AGENT_RUNTIME_PROFILES, "routes.yaml");
-    const doc = parse(readFileSync(routesPath, "utf-8")) as { routes?: Record<string, unknown> };
-    const known = new Set(Object.keys(doc.routes ?? {}));
-    for (const r of [...cfg.debaters.map((d) => d.route), cfg.synthesizer.route]) {
-      expect(known).toContain(r);
+    it("D3: every configured route exists in agent-runtime profiles/routes.yaml", () => {
+      const root = resolveAgentRuntimeProfiles()!;
+      const routesPath = join(root, "routes.yaml");
+      const doc = parse(readFileSync(routesPath, "utf-8")) as { routes?: Record<string, unknown> };
+      const known = new Set(Object.keys(doc.routes ?? {}));
+      for (const r of [...cfg.debaters.map((d) => d.route), cfg.synthesizer.route]) {
+        expect(known).toContain(r);
+      }
+    });
+  },
+);
+
+describe.skipIf(!agentRuntimeAvailable)(
+  "G2a corpus schema conformance (major finding)",
+  () => {
+    /** 极简 JSON-Schema 校验器：覆盖本仓语料 schema 用到的子集（type/required/properties/additionalProperties/items）。 */
+    function validateSchema(value: unknown, schema: Record<string, unknown>, path = "$"): string[] {
+      const errors: string[] = [];
+      const type = schema.type as string | undefined;
+      if (type === "object") {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+          errors.push(`${path}: expected object`);
+          return errors;
+        }
+        const obj = value as Record<string, unknown>;
+        for (const req of (schema.required as string[] | undefined) ?? []) {
+          if (!(req in obj)) errors.push(`${path}: missing required "${req}"`);
+        }
+        const props = (schema.properties as Record<string, unknown> | undefined) ?? {};
+        for (const [k, v] of Object.entries(obj)) {
+          if (k in props) {
+            errors.push(...validateSchema(v, props[k] as Record<string, unknown>, `${path}.${k}`));
+          } else if (schema.additionalProperties === false) {
+            errors.push(`${path}: unexpected property "${k}"`);
+          }
+        }
+      } else if (type === "array") {
+        if (!Array.isArray(value)) {
+          errors.push(`${path}: expected array`);
+          return errors;
+        }
+        const items = schema.items as Record<string, unknown> | undefined;
+        if (items) {
+          value.forEach((v, i) => errors.push(...validateSchema(v, items, `${path}[${i}]`)));
+        }
+      } else if (type === "string") {
+        if (typeof value !== "string") errors.push(`${path}: expected string`);
+      } else if (type === "integer") {
+        if (typeof value !== "number" || !Number.isInteger(value)) errors.push(`${path}: expected integer`);
+      } else if (type === "boolean") {
+        if (typeof value !== "boolean") errors.push(`${path}: expected boolean`);
+      }
+      return errors;
     }
-  });
-});
+
+    it("debater corpus conforms to debater-input.v1.json (incl. judge prior_arguments)", () => {
+      const schema = readRoleInputSchema("debater") as Record<string, unknown>;
+      const evidences: DebaterCorpus["evidences"] = [
+        { clue_id: "c1", anchor: "a1", quote: "q1", claim: "c1" },
+      ];
+      const advocate: DebaterCorpus = { question: "q?", evidences };
+      expect(validateSchema(advocate, schema)).toEqual([]);
+      const judge: DebaterCorpus = { question: "q?", evidences, prior_arguments: ["b1", "b2"] };
+      expect(validateSchema(judge, schema)).toEqual([]);
+    });
+
+    it("synthesizer corpus conforms to synthesizer-input.v1.json (terminal_marker is an OBJECT)", () => {
+      const schema = readRoleInputSchema("synthesizer") as Record<string, unknown>;
+      const evidences: DebaterCorpus["evidences"] = [{ clue_id: "c1", anchor: "a1", quote: "q1", claim: "c1" }];
+      // 引擎侧组装：terminal_marker = buildReportMarker 产出的结构化对象（不是渲染字符串）。
+      const marker: ReportMarker = { stop: "converged", blocked: 0, capHit: false };
+      const synth: SynthesizerCorpus = {
+        question: "q?",
+        evidences,
+        arguments: ["b1", "b2"],
+        terminal_marker: marker,
+      };
+      expect(validateSchema(synth, schema)).toEqual([]);
+
+      // 判别性：若 terminal_marker 误传成渲染字符串（旧 bug），schema 校验必须报错。
+      const buggy = { ...synth, terminal_marker: renderReportBody(marker) } as unknown as SynthesizerCorpus;
+      const errs = validateSchema(buggy, schema);
+      expect(errs.some((e) => e.includes("terminal_marker") && e.includes("expected object"))).toBe(true);
+    });
+  },
+);
 
 describe("G2a D5: 4MB body guard (both directions)", () => {
   it("D5: 4MB-1 and 4MB pass; 4MB+1 is rejected", () => {

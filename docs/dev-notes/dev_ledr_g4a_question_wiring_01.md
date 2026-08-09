@@ -2,7 +2,7 @@
 
 development_id: `dev_ledr_g4a_question_wiring_01`
 attempt: `implement`（rework，继承前次实现提交；修复 Q8 证据完整性的 input_commit 同步）
-input_commit: `fd9299fd5b0efbb6dbf6db1f35203243924f66c1`
+input_commit: `bc8a30cb898c830e5e99d71f1f787233b36b5d8a`
 
 ## 根因（spec §0，逐条 grep 到行号）
 

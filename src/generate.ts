@@ -33,7 +33,6 @@ export interface GenerateConfig {
   /** debater 三立场（立论 / 反方 / 裁判）的 role+route，route 互不相同。 */
   debaters: readonly [GenerateRoleSpec, GenerateRoleSpec, GenerateRoleSpec];
   synthesizer: GenerateRoleSpec;
-  anchorCheckRoute: string;
   exportRoute: string;
 }
 
@@ -45,7 +44,6 @@ export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
     { role: "dr-debater-judge", route: "ds-v4-pro/ccs" },
   ],
   synthesizer: { role: "dr-synthesizer", route: "opus-5/ccs" },
-  anchorCheckRoute: "anchor-check",
   exportRoute: "export",
 };
 
@@ -113,8 +111,10 @@ export function parseReportMarker(body: string): ReportMarker | null {
  * 保留 renderReportBody 的终态标记行格式（parseReportMarker / export 依赖它），
  * 核验率作为**紧随其后的独立行**标注（软闸门：<90% 不阻断导出，但必须标在头部）。
  */
-export function renderReportHead(marker: ReportMarker, anchorRate: number | null): string {
-  const rate = anchorRate === null ? "unavailable" : String(anchorRate);
+export function renderReportHead(marker: ReportMarker, anchorRate: number | null, anchorSumsOkFalse?: boolean): string {
+  const rate = anchorRate === null
+    ? (anchorSumsOkFalse ? "unavailable sums_ok=false" : "unavailable")
+    : String(anchorRate);
   return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
 }
 
@@ -303,6 +303,19 @@ export async function spawnGenerateRole(
   }
 }
 
+/** anchor-check --json 输出的完整形状（spec §2）。 */
+export interface AnchorCheckResult {
+  total: number;
+  current_parsed: number;
+  current_verified_hit: number;
+  current_failed: number;
+  old_format: number;
+  unparseable: number;
+  discarded: number;
+  sums_ok: boolean;
+  loud_failures: Array<{ anchor: string; error: string }>;
+}
+
 /** 执行壳的依赖注入面：所有副作用（读 / spawn / lock / 回写）都从这里走。 */
 export interface GenerateDeps {
   readTermination(): Promise<TerminationState>;
@@ -325,9 +338,11 @@ export interface GenerateDeps {
   ): Promise<{ body: string }>;
   /** 缺省 spawnRole 的生产运行时（不注入 spawnRole 时使用）。 */
   spawnRuntime?: GenerateSpawnRuntime;
-  /** anchor-check：返回缺陷数与核验率（核验率用于报告头部标注，软闸门 <90% 不阻断导出）。 */
-  spawnAnchorCheck(route: string): Promise<{ defects: number; verificationRate: number }>;
+  /** anchor-check：运行确定性锚点校验器，返回其完整 --json 输出。 */
+  spawnAnchorCheck(): Promise<AnchorCheckResult>;
   spawnExport(body: string, sourceMessageId: string): Promise<void>;
+  /** anchor-check JSON 落盘：写到导出件同目录（软闸门，失败不阻断导出）。 */
+  writeAnchorCheckJson?(json: string): Promise<void>;
   /** 产物回写：发一条 research.doc.v2（doc_kind 由 role 推出，body ≤ 4MB，digest 缺省按 body 计算）。
    *  返回发布出的 message_id。 */
   writeDoc(doc: DocV2, idempotencyKey: string): Promise<string>;
@@ -414,16 +429,38 @@ export async function runGenerate(
 
   // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
   // ⛔ 崩溃与真实 0% 核验率要可区分：崩溃时头部标 unavailable（评审 minor），而非伪装成 0。
+  // ⛔ 核验率 = current_verified_hit / total（分母必须是 total，不得用 current_parsed）。
+  // ⛔ total === 0 ⇒ unavailable（非「全部核验通过」）。
+  // ⛔ sums_ok === false ⇒ unavailable 且点名 sums_ok=false（须与崩溃可区分）。
   let anchorRate: number | null = null;
+  let anchorSumsOkFalse = false;
+  let anchorCheckJson: string | null = null;
   try {
-    const ac = await deps.spawnAnchorCheck(cfg.anchorCheckRoute);
-    anchorRate = ac.verificationRate;
+    const ac = await deps.spawnAnchorCheck();
+    anchorCheckJson = JSON.stringify(ac);
+    if (ac.total === 0) {
+      // total === 0 ⇒ unavailable (V3)
+    } else if (!ac.sums_ok) {
+      // sums_ok === false ⇒ unavailable + name it (V4)
+      anchorSumsOkFalse = true;
+    } else {
+      anchorRate = (ac.current_verified_hit / ac.total) * 100;
+    }
   } catch {
     // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
   }
 
+  // anchor-check JSON 落盘（软闸门：失败不阻断导出）
+  if (anchorCheckJson !== null && deps.writeAnchorCheckJson) {
+    try {
+      await deps.writeAnchorCheckJson(anchorCheckJson);
+    } catch {
+      // 落盘失败不阻断导出
+    }
+  }
+
   // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
-  const reportBody = renderReportHead(marker, anchorRate) + synthBody;
+  const reportBody = renderReportHead(marker, anchorRate, anchorSumsOkFalse) + synthBody;
 
   // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
   const synthDocMessageId = await deps.writeDoc(

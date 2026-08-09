@@ -28,16 +28,30 @@ import {
   runChannelWrite,
   parseRunCliArgs,
   DEFAULT_MAX_WRITES,
-  AnchorCheckNotWiredError,
   MissingExportRootError,
   MissingDocChannelError,
   MissingOriginError,
   assembleGenerateDeps,
 } from "../src/tick-run";
-import { runGenerate, DEFAULT_GENERATE_CONFIG, type GenerateDeps } from "../src/generate";
+import { runGenerate, DEFAULT_GENERATE_CONFIG, type GenerateDeps, type AnchorCheckResult } from "../src/generate";
 import { deriveExportPath } from "../src/export";
 import type { InspectMessage } from "../src/tick-inspect";
 import type { TerminationState, BoardState } from "../src/tick";
+
+function anchorResult(over: Partial<AnchorCheckResult> = {}): AnchorCheckResult {
+  return {
+    total: 10,
+    current_parsed: 10,
+    current_verified_hit: 10,
+    current_failed: 0,
+    old_format: 0,
+    unparseable: 0,
+    discarded: 0,
+    sums_ok: true,
+    loud_failures: [],
+    ...over,
+  };
+}
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TICK_MD = join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md");
@@ -135,7 +149,7 @@ describe("G4c U1: reachability — runGenerate is called when termination non-nu
         generateCalled = true;
         return { body: "output" };
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async () => "msg-1"),
       lockSynthesizer: async () => async () => {},
@@ -175,7 +189,7 @@ describe("G4c U1: reachability — runGenerate is called when termination non-nu
         generateCalled = true;
         return { body: "output" };
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async () => "msg-1"),
       lockSynthesizer: async () => async () => {},
@@ -215,7 +229,7 @@ describe("G4c U1: reachability — runGenerate is called when termination non-nu
         generateCalled = true;
         return { body: "output" };
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async () => "msg-1"),
       lockSynthesizer: async () => async () => {},
@@ -286,7 +300,7 @@ describe("G4c U2: one-shot — same origin twice ⇒ generate only runs once", (
         readOrigin: async () => "test-origin",
         readEvidences: async () => [],
         spawnRole: vi.fn(async () => ({ body: "output" })),
-        spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+        spawnAnchorCheck: vi.fn(async () => anchorResult()),
         spawnExport: vi.fn(async () => {
           generateCount += 1;
         }),
@@ -339,7 +353,7 @@ describe("G4c U2: one-shot — same origin twice ⇒ generate only runs once", (
         readOrigin: async () => "test-origin",
         readEvidences: async () => [],
         spawnRole: vi.fn(async () => ({ body: "output" })),
-        spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+        spawnAnchorCheck: vi.fn(async () => anchorResult()),
         spawnExport: vi.fn(async () => {
           generateCount += 1;
         }),
@@ -398,7 +412,7 @@ describe("G4c U3: failure does not leave marker — runGenerate throws ⇒ marke
       spawnRole: vi.fn(async () => {
         throw new Error("simulated generate failure");
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async () => "msg-1"),
       lockSynthesizer: async () => async () => {},
@@ -430,7 +444,7 @@ describe("G4c U3: failure does not leave marker — runGenerate throws ⇒ marke
       readOrigin: async () => "test-origin",
       readEvidences: async () => [],
       spawnRole: vi.fn(async () => ({ body: "output" })),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {
         generateCount += 1;
       }),
@@ -475,7 +489,7 @@ describe("G4c U4: export carries source_message_id equal to writeDoc's message_i
         if (role === "dr-synthesizer") return { body: "synthesizer output" };
         return { body: "debater output" };
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async (body: string, sourceMessageId: string) => {
         capturedExportBody = body;
         capturedSourceMessageId = sourceMessageId;
@@ -610,16 +624,46 @@ describe("G4c U5: export path + EXPORT_ROOT check", () => {
   });
 });
 
-describe("G4c U6: createdAt from bus created_at, no new Date() fallback", () => {
-  it("export reads createdAt from bus message, not system clock", () => {
-    const exportCode = readFileSync(join(ROOT, "src", "export.ts"), "utf8");
-    expect(exportCode).not.toMatch(/new Date\(\)/);
-    expect(exportCode).not.toMatch(/\?\?.*new Date/);
+describe("G4c U6: createdAt from bus message; missing sourceMessageId ⇒ loud failure", () => {
+  it("discriminative: production spawnExport throws when doc channel does not contain sourceMessageId", async () => {
+    const card = clueMsg("c1", { status: "explored" }, 1);
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse([card]);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const exportRoot = join(tmpdir(), `g4c-u6-export-${Math.random().toString(36).slice(2)}`);
+    process.env.EXPORT_ROOT = exportRoot;
+    const oneShotDir = uniqueOneShotDir("u6");
+    const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
+    const deps = assembleGenerateDeps(
+      {
+        channelId: CHANNEL,
+        origin: "test-origin",
+        docChannelId: "research:doc",
+        question: "test question",
+        oneShotDir,
+      },
+      term(),
+      postWriteState,
+    );
+
+    try {
+      await expect(deps.spawnExport("test body", "msg-nonexistent")).rejects.toThrow(
+        /cannot find doc message/,
+      );
+    } finally {
+      delete process.env.EXPORT_ROOT;
+      if (existsSync(exportRoot)) rmSync(exportRoot, { recursive: true, force: true });
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
   });
 });
 
 describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production default deps)", () => {
-  it("production assembleGenerateDeps throws AnchorCheckNotWiredError", async () => {
+  it("anchor-check throwing ⇒ head shows unavailable, export still happens", async () => {
     const cards = [clueMsg("c1", { status: "explored" }, 1)];
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -628,7 +672,6 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
       return emptyMessagesResponse();
     });
 
-    let anchorError: Error | null = null;
     const oneShotDir = uniqueOneShotDir("u7");
     const generateDeps: GenerateDeps = {
       readTermination: async () => term(),
@@ -640,8 +683,7 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
         return { body: "output" };
       }),
       spawnAnchorCheck: vi.fn(async () => {
-        anchorError = new AnchorCheckNotWiredError();
-        throw anchorError;
+        throw new Error("anchor-check boom");
       }),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async (doc: { body: string; doc_kind: string }) => {
@@ -659,10 +701,7 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
       generateDeps,
     });
 
-    // anchor-check threw (not wired), but export still happened
-    expect(anchorError).toBeInstanceOf(AnchorCheckNotWiredError);
     expect(generateDeps.spawnExport).toHaveBeenCalledTimes(1);
-    // The report body should have "unavailable" in the anchor-rate header
     const writeDocCalls = (generateDeps.writeDoc as ReturnType<typeof vi.fn>).mock.calls;
     const reportDoc = writeDocCalls.find((c: unknown[]) => {
       const d = c[0] as { doc_kind?: string };
@@ -674,13 +713,9 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
     rmSync(oneShotDir, { recursive: true, force: true });
   });
 
-  it("discriminative: if production deps return 0% rate, that would be distinguishable from unavailable", () => {
-    const err = new AnchorCheckNotWiredError();
-    expect(err.name).toBe("AnchorCheckNotWiredError");
-    expect(err.message).toContain("anchor-check is not wired");
-  });
-
-  it("discriminative T5: production assembleGenerateDeps spawnAnchorCheck throws AnchorCheckNotWiredError", async () => {
+  it("discriminative: production assembleGenerateDeps spawnAnchorCheck throws when ANCHOR_CHECK_BIN is not set", async () => {
+    const prevAnchor = process.env.ANCHOR_CHECK_BIN;
+    delete process.env.ANCHOR_CHECK_BIN;
     const oneShotDir = uniqueOneShotDir("u7-t5");
     const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
     const deps = assembleGenerateDeps(
@@ -694,8 +729,12 @@ describe("G4c U7: anchor-check unwired ⇒ head shows unavailable (production de
       term(),
       postWriteState,
     );
-    await expect(deps.spawnAnchorCheck("anchor-check")).rejects.toThrow(AnchorCheckNotWiredError);
-    rmSync(oneShotDir, { recursive: true, force: true });
+    try {
+      await expect(deps.spawnAnchorCheck()).rejects.toThrow(/ANCHOR_CHECK_BIN/);
+    } finally {
+      if (prevAnchor) process.env.ANCHOR_CHECK_BIN = prevAnchor;
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -864,7 +903,7 @@ describe("G4c U11: synthesizer concurrency = 1, never skipped; export last; doc_
         }
         return { body: "output" };
       }),
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult()),
       spawnExport: vi.fn(async () => {}),
       writeDoc: vi.fn(async () => "msg-1"),
       lockSynthesizer: vi.fn(async () => {
@@ -928,7 +967,7 @@ describe("G4c U11: synthesizer concurrency = 1, never skipped; export last; doc_
       }),
       spawnAnchorCheck: vi.fn(async () => {
         seq.push("anchor-check");
-        return { defects: 0, verificationRate: 100 };
+        return anchorResult();
       }),
       spawnExport: vi.fn(async () => {
         seq.push("export");

@@ -54,8 +54,9 @@ import {
   type EvidenceView,
   type GenerateDeps,
   type GenerateSpawnRuntime,
+  type AnchorCheckResult,
 } from "./generate";
-import { runExport, type ExportInput } from "./export";
+import { runExport, slugify, type ExportInput } from "./export";
 
 /**
  * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
@@ -333,16 +334,6 @@ export class TriggerBodyTerminationError extends Error {
       `G4b: trigger_body is missing or malformed termination counters (${reason}). Refusing to silently fall back to 0/0 — that would silently reset zeroGrowthRounds and re-introduce the very defect this package fixes. Pass valid {coverage, zeroGrowthRounds} (first tick legitimately uses 0/0, via a {"seed":true} body).`,
     );
     this.name = "TriggerBodyTerminationError";
-  }
-}
-
-/** G4c —— anchor-check 未接线 ⇒ 响亮失败（不得编造核验率、不得静默返回 0）。 */
-export class AnchorCheckNotWiredError extends Error {
-  constructor() {
-    super(
-      "G4c: anchor-check is not wired (reserved for G4d). Refusing to fabricate a verification rate or silently return 0 — 0% and 'unavailable' are distinct.",
-    );
-    this.name = "AnchorCheckNotWiredError";
   }
 }
 
@@ -1319,8 +1310,59 @@ export function assembleGenerateDeps(
         );
       },
     },
-    spawnAnchorCheck: async () => {
-      throw new AnchorCheckNotWiredError();
+    spawnAnchorCheck: async (): Promise<AnchorCheckResult> => {
+      const anchorCheckBin = process.env.ANCHOR_CHECK_BIN;
+      if (!anchorCheckBin) {
+        throw new Error(
+          "G4d: ANCHOR_CHECK_BIN is not configured — anchor-check is unavailable",
+        );
+      }
+      const allowedRoot = opts.allowedRoot;
+      if (!allowedRoot) {
+        throw new Error(
+          "G4d: ALLOWED_ROOT is not configured — anchor-check requires --repo-root",
+        );
+      }
+      const corpusFile = join(tmpdir(), `anchor-check-corpus-${randomUUID()}.json`);
+      try {
+        const evidences = await (async (): Promise<EvidenceView[]> => {
+          if (!opts.evidenceChannelId) return [];
+          const msgs = await readChannelMessages(opts.evidenceChannelId);
+          return msgs
+            .filter((m) => m.kind === "research.evidence.v2")
+            .map((m) => {
+              const p = (m.payload ?? {}) as Record<string, unknown>;
+              return {
+                clue_id: String(p.clue_id ?? ""),
+                anchor: String(p.anchor ?? ""),
+                quote: String(p.quote ?? ""),
+                claim: String(p.claim ?? ""),
+              };
+            });
+        })();
+        writeFileSync(corpusFile, JSON.stringify(evidences), "utf8");
+        const stdout = execFileSync(anchorCheckBin, [
+          "--corpus", corpusFile,
+          "--repo-root", allowedRoot,
+          "--json",
+        ], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 30000,
+        });
+        return JSON.parse(stdout) as AnchorCheckResult;
+      } finally {
+        rmSync(corpusFile, { force: true });
+      }
+    },
+    writeAnchorCheckJson: async (json: string) => {
+      const exportRoot = process.env.EXPORT_ROOT;
+      if (!exportRoot) return;
+      const topic = opts.question ?? "untitled";
+      const slug = slugify(topic);
+      const dir = join(exportRoot, "DeepThought", slug);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "anchor-check.json"), json, "utf8");
     },
     spawnExport: async (reportBody: string, sourceMessageId: string) => {
       const exportRoot = process.env.EXPORT_ROOT;

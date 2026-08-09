@@ -36,7 +36,7 @@ export interface ExportDeps {
  * 纯函数：由 topic 确定性派生 slug（spec §2/§4）。
  * 不含时钟/随机，同一 topic ⇒ 同一 slug。
  */
-function slugify(topic: string): string {
+export function slugify(topic: string): string {
   const slug = topic
     .trim()
     .toLowerCase()

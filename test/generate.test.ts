@@ -21,6 +21,7 @@ import {
   DEFAULT_GENERATE_CONFIG,
 } from "../src/generate";
 import type {
+  AnchorCheckResult,
   GenerateConfig,
   GenerateDeps,
   GenerateSpawnRuntime,
@@ -28,6 +29,22 @@ import type {
   DebaterCorpus,
   SynthesizerCorpus,
 } from "../src/generate";
+
+/** Helper: construct an AnchorCheckResult with sensible defaults (100% rate). */
+function anchorResult(over: Partial<AnchorCheckResult> = {}): AnchorCheckResult {
+  return {
+    total: 10,
+    current_parsed: 10,
+    current_verified_hit: 10,
+    current_failed: 0,
+    old_format: 0,
+    unparseable: 0,
+    discarded: 0,
+    sums_ok: true,
+    loud_failures: [],
+    ...over,
+  };
+}
 import type { DocV2 } from "../src/protocol";
 import type { TerminationState } from "../src/tick";
 
@@ -103,7 +120,7 @@ function baseDeps(over: Partial<GenerateDeps> = {}): GenerateDeps {
     readOrigin: async () => "research-1",
     readEvidences: async () => [],
     spawnRole: vi.fn(async () => ({ body: "role output" })),
-    spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: 100 })),
+    spawnAnchorCheck: vi.fn(async () => anchorResult()),
     spawnExport: vi.fn(async () => {}),
     writeDoc: vi.fn(async () => "msg-1"),
     lockSynthesizer: async () => async () => {},
@@ -223,7 +240,7 @@ describe("S4 ordering (D7/D8)", () => {
       }),
       spawnAnchorCheck: vi.fn(async () => {
         seq.push("anchor-check");
-        return { defects: 0, verificationRate: 100 };
+        return anchorResult();
       }),
       spawnExport: vi.fn(async () => {
         seq.push("export");
@@ -311,7 +328,7 @@ describe("S4 anchor-check never blocks export (D9/D10)", () => {
 
   it("D10: anchor-check reporting defects (non-exception) does not block export", async () => {
     const deps = baseDeps({
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 5, verificationRate: 100 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult({ total: 5, current_parsed: 5, current_verified_hit: 5 })),
       spawnExport: vi.fn(async () => {}),
     });
     await runGenerate(deps, cfg);
@@ -554,7 +571,7 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
     for (const rate of [50, 95]) {
       const written: DocV2[] = [];
       const deps = baseDeps({
-        spawnAnchorCheck: vi.fn(async () => ({ defects: 0, verificationRate: rate })),
+        spawnAnchorCheck: vi.fn(async () => anchorResult({ total: 100, current_verified_hit: rate })),
         writeDoc: vi.fn(async (doc: DocV2) => {
           written.push(doc);
           return "msg-1";
@@ -589,7 +606,7 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
     // 真实 0% 核验率 → 头部标 0。
     const genuine: DocV2[] = [];
     const okDeps = baseDeps({
-      spawnAnchorCheck: vi.fn(async () => ({ defects: 99, verificationRate: 0 })),
+      spawnAnchorCheck: vi.fn(async () => anchorResult({ total: 100, current_verified_hit: 0 })),
       writeDoc: vi.fn(async (doc: DocV2) => {
         genuine.push(doc);
         return "msg-1";

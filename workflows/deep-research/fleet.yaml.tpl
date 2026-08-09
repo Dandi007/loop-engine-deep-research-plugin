@@ -10,6 +10,8 @@ pipelines:
       # A10c —— 写入预算（--max-writes）一路注入到 tick.md：由 bin 导出 MAX_WRITES（缺省 64），
       # 显式覆盖语义保留。缺省必须足以收割一张真实卡（spec §1.1）。
       max_writes: ${MAX_WRITES}
+      # G4a —— 研究主问题（--question）一路注入到 tick.md：由 bin 导出 RESEARCH_QUESTION（无缺省）。
+      research_question: ${RESEARCH_QUESTION}
       # A9 —— 触发存储一路注入到 tick.md：tick 依 hasPendingWork 决定是否续投下一条触发。
       trigger_store_dir: ${TRIGGER_STORE_DIR}
       loop_store_cli: ${LOOP_STORE_CLI}

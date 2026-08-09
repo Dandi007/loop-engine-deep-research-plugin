@@ -21,6 +21,8 @@ seed:
       allowed_root: "{{allowed_root?}}"
       # A10c —— 写入预算（--max-writes）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
       max_writes: "{{max_writes}}"
+      # G4a —— 研究主问题（--question）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
+      research_question: "{{research_question}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

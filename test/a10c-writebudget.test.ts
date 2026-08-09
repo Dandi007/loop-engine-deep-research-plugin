@@ -41,7 +41,9 @@ function renderedDefaultMaxWrites(): number {
   const childEnv = { ...process.env };
   delete childEnv.MAX_WRITES;
   // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
+  // G4a —— 渲染同样需要 RESEARCH_QUESTION（无缺省 ⇒ 响亮失败）；显式提供。
   childEnv.TICK_CHANNEL = "research:v1-test.index";
+  childEnv.RESEARCH_QUESTION = "test research question";
   const out = execFileSync("bash", [BIN, "--dry-run"], {
     cwd: ROOT,
     encoding: "utf8",
@@ -72,17 +74,17 @@ describe("A10c D3: --max-writes plumbed from bin → fleet → workflow → tick
     expect(wf).toMatch(/max_writes:\s*"\{\{max_writes\}\}"/);
   });
 
-  it("tick.md passes --max-writes to tick-entry --run (all four branches)", () => {
+  it("tick.md assembles argv incrementally and always appends --max-writes", () => {
     const md = readFileSync(TICK_MD, "utf8");
     expect(md).toMatch(/max_writes="\{\{max_writes\}\}"/);
-    // 每条 `--run` 分支都必须带上 --max-writes。
+    // G4a —— 分支组合树已重构为增量拼 argv；--max-writes 作为固定项始终追加（不再逐分支重复）。
+    expect(md).toMatch(/tick_args=\("\$tick_entry" --run "\$tick_channel"\)/);
+    expect(md).toMatch(/tick_args\+=\(--max-writes "\$max_writes"\)/);
+    // 只有一个 `"$tick_entry" --run` 调用点（不再是 4 分支组合树）。
     const runLines = md
       .split("\n")
       .filter((l) => l.includes('"$tick_entry" --run'));
-    expect(runLines.length).toBeGreaterThanOrEqual(4);
-    for (const line of runLines) {
-      expect(line).toMatch(/--max-writes\s+"\$max_writes"/);
-    }
+    expect(runLines.length).toBe(1);
   });
 });
 
@@ -122,7 +124,7 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,
       encoding: "utf8",
-      env: { ...process.env, MAX_WRITES: "64", TICK_CHANNEL: "research:v1-test.index" },
+      env: { ...process.env, MAX_WRITES: "64", TICK_CHANNEL: "research:v1-test.index", RESEARCH_QUESTION: "test research question" },
     });
     const doc = parse(out);
     const input = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;
@@ -202,6 +204,8 @@ describe("G1 D1: default budget is a finite positive integer >= MIN_VIABLE_BUDGE
     expect(childEnv).not.toHaveProperty("MAX_WRITES");
     // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；显式提供。
     childEnv.TICK_CHANNEL = "research:v1-test.index";
+    // G4a —— 渲染同样需要 RESEARCH_QUESTION（无缺省 ⇒ 响亮失败）；显式提供。
+    childEnv.RESEARCH_QUESTION = "test research question";
 
     const out = execFileSync("bash", [BIN, "--dry-run"], {
       cwd: ROOT,

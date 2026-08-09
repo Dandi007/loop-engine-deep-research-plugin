@@ -8,6 +8,8 @@ set -euo pipefail
 #    （spec §1.2 / F5），其余 role 不因它缺失被阻断。
 # ⛔ A10c——`--max-writes` 也随装配系统一路注入（bin 导出 MAX_WRITES，缺省足以收割一张真实卡）；
 #    不再让生产链路上 `--run` 静默吃 CLI 默认值 5（那会让 ≥5 条 evidence 的卡永远收割不了，恒死锁）。
+# ⛔ G4a——研究主问题 `--question` 也随装配系统一路注入（bin 导出 RESEARCH_QUESTION，无缺省）；
+#    CLI 支持它、引擎在 triage 决策上依赖它，唯独生产从不传它 ⇒ 收集段首个 triage 决策即响亮失败。
 # ⛔ A9——trigger 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 随装配系统一路注入；
 #    tick 完成后当且仅当板面仍有非终态 clue（hasPendingWork=true）才投下一条触发（spec §1.3 / F9）。
 # ⛔ --selfcheck 仍保留（A7 G6/G7 需要它做无副作用自检）：未注入 tick_channel 时退化为 --selfcheck。
@@ -16,21 +18,22 @@ tick_channel="{{tick_channel}}"
 evidence_channel="{{evidence_channel}}"
 allowed_root="{{allowed_root}}"
 max_writes="{{max_writes}}"
+research_question="{{research_question}}"
 trigger_store_dir="{{trigger_store_dir}}"
 loop_store_cli="{{loop_store_cli}}"
 loop_engine_runner="{{loop_engine_runner}}"
 
 run_output=""
 if [ -n "$tick_channel" ]; then
-  if [ -n "$evidence_channel" ] && [ -n "$allowed_root" ]; then
-    run_output="$("$tick_entry" --run "$tick_channel" --evidence-channel "$evidence_channel" --allowed-root "$allowed_root" --max-writes "$max_writes")"
-  elif [ -n "$evidence_channel" ]; then
-    run_output="$("$tick_entry" --run "$tick_channel" --evidence-channel "$evidence_channel" --max-writes "$max_writes")"
-  elif [ -n "$allowed_root" ]; then
-    run_output="$("$tick_entry" --run "$tick_channel" --allowed-root "$allowed_root" --max-writes "$max_writes")"
-  else
-    run_output="$("$tick_entry" --run "$tick_channel" --max-writes "$max_writes")"
-  fi
+  # G4a —— ⛔ 不再把 evidence/allowed_root 的可选性翻倍成 4 分支组合树（每加一个可选参数就 ×2）。
+  # 改为增量拼 argv（数组累加后一次调用）；`set -euo pipefail` 下 `[ … ] && …` 作为语句在条件为假时
+  # 会以非零退出终止脚本，因此用 `if` 块逐项累加。run_output 的捕获与后续 hasPendingWork 判定逐字不变。
+  tick_args=("$tick_entry" --run "$tick_channel")
+  if [ -n "$evidence_channel" ]; then tick_args+=(--evidence-channel "$evidence_channel"); fi
+  if [ -n "$allowed_root" ]; then tick_args+=(--allowed-root "$allowed_root"); fi
+  tick_args+=(--max-writes "$max_writes")
+  if [ -n "$research_question" ]; then tick_args+=(--question "$research_question"); fi
+  run_output="$("${tick_args[@]}")"
   printf '%s\n' "$run_output"
   # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
   #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。

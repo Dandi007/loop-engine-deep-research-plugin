@@ -23,10 +23,13 @@ function run(argv: string[], env: NodeJS.ProcessEnv = {}): string {
 
 // D1 —— 渲染需要 TICK_CHANNEL（无 profile 且无显式 env ⇒ 响亮失败）；测试统一显式提供。
 const TEST_TICK_CHANNEL = "research:v1-test.index";
+// G4a —— 渲染同样需要 RESEARCH_QUESTION（无缺省 ⇒ 响亮失败）；测试统一显式提供。
+const TEST_RESEARCH_QUESTION = "test research question";
 
 function dryRun(): string {
   return run([join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"], {
     TICK_CHANNEL: TEST_TICK_CHANNEL,
+    RESEARCH_QUESTION: TEST_RESEARCH_QUESTION,
   });
 }
 
@@ -258,8 +261,10 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     //    A9 评审修复：可选占位符 `{{evidence_channel?}}` —— EVIDENCE_CHANNEL 缺省为空（null）
     //    ⇒ 必填 `{{evidence_channel}}` 填充即抛「模板填充缺值」⇒ tick 节点无法起跑；`?` 渲成空串。
     expect(workflowText).toMatch(/evidence_channel:\s*"\{\{evidence_channel\?\}\}"/);
-    // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run。
-    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"\s+\-\-evidence-channel\s+"\$evidence_channel"/);
+    // 4) tick.md 在非空 evidence_channel 时确实把 --evidence-channel 传给 --run
+    //    （G4a 已重构为增量拼 argv：--run 在数组初始化，可选参数逐项 if 累加）。
+    expect(tickMd).toMatch(/\-\-run\s+"\$tick_channel"/);
+    expect(tickMd).toMatch(/tick_args\+=\(--evidence-channel "\$evidence_channel"\)/);
     // 5) 渲染产物：pipeline input 里 evidence_channel 有非空值（真实 wiring 成立）。
     //    ⛔ 装配脚本**无派生默认值**（spec §1.4 / H15：证据 channel 不得由板 channel 推导），
     //    部署方必须显式配置。这里显式注入一个非派生值以证明「fleet → workflow → template」
@@ -267,7 +272,7 @@ describe("A8e evidence channel wired end-to-end through the assembly", () => {
     const explicit = "research:p02-smoke-1dce60.evidence";
     const rendered = run(
       [join(ROOT, "bin", "deep-research-loop.sh"), "--dry-run"],
-      { EVIDENCE_CHANNEL: explicit, TICK_CHANNEL: TEST_TICK_CHANNEL },
+      { EVIDENCE_CHANNEL: explicit, TICK_CHANNEL: TEST_TICK_CHANNEL, RESEARCH_QUESTION: TEST_RESEARCH_QUESTION },
     );
     const doc = parse(rendered);
     const tickInput = doc.pipelines.find((p: { label?: string }) => p.label === "tick")?.input;

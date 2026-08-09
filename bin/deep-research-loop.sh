@@ -80,6 +80,17 @@ if [ -z "$TICK_CHANNEL" ]; then
   echo "[deep-research-loop] TICK_CHANNEL is not set. Refusing to start: the bus is append-only with no DELETE, so a default that writes to a real channel is irreversible. Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set TICK_CHANNEL explicitly." >&2
   exit 3
 fi
+# G4a —— 研究主问题：从部署配置一路贯通到 tick-entry --run --question。
+# CLI 支持 --question、usage 记录它、引擎在 triage 决策上依赖它（缺失 ⇒ MissingTriageQuestionError），
+# 但生产从不传它 ⇒ 收集段会在第一个 triage 决策上响亮失败。本包把它接上同一条贯通链
+# （bin → fleet → workflow → tick.md → `--run --question`）。
+# ⛔ 无内置缺省：编造或推导的问题字符串会让整场研究跑偏，且 bus 写入 append-only 不可回退。
+#    未受 profile 或显式 env 指定 ⇒ 响亮失败拒绝启动（exit 3，点名 RESEARCH_QUESTION）。
+export RESEARCH_QUESTION="${RESEARCH_QUESTION:-}"
+if [ -z "$RESEARCH_QUESTION" ]; then
+  echo "[deep-research-loop] RESEARCH_QUESTION is not set. Refusing to start: an invented or derived default question would send the whole research astray, and bus writes are append-only (irreversible). Provide a deploy profile (--profile <name> or DEPLOY_PROFILE=<name>) or set RESEARCH_QUESTION explicitly." >&2
+  exit 3
+fi
 # A8e——收割的 evidence channel：`--run` 收割步必须显式传入（无默认、无字符串推导，spec §1.4）。
 # 从 pipeline input namespace 注入 tick.md 供 `--run --evidence-channel` 使用；可用 EVIDENCE_CHANNEL 覆盖。
 # ⛔ **无默认值**：实测真实证据 channel 并不由板 channel 名推导而来（spec §1.4 表：

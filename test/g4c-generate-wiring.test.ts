@@ -636,10 +636,10 @@ describe("G4c CLI: --origin parsing", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-// Assembly chain: --origin flows through production assembly (bin → fleet → workflow → tick.md)
+// Assembly chain: --origin and --doc-channel flow through production assembly (bin → fleet → workflow → tick.md)
 // ════════════════════════════════════════════════════════════════════
-describe("G4c assembly: --origin flows through production chain", () => {
-  it("tick.md contains --origin wiring in tick_args", async () => {
+describe("G4c assembly: --origin and --doc-channel reach tick-entry argv", () => {
+  it("tick.md declares research_origin and doc_channel and passes them into tick_args", async () => {
     const { readFileSync } = await import("node:fs");
     const { fileURLToPath } = await import("node:url");
     const tmplPath = fileURLToPath(
@@ -647,29 +647,73 @@ describe("G4c assembly: --origin flows through production chain", () => {
     );
     const source = readFileSync(tmplPath, "utf-8");
     expect(source).toContain("research_origin");
-    expect(source).toContain("--origin");
-    expect(source).toContain("$research_origin");
+    expect(source).toMatch(/tick_args\+=\(--origin\s+"\$research_origin"\)/);
+    expect(source).toContain("doc_channel");
+    expect(source).toMatch(/tick_args\+=\(--doc-channel\s+"\$doc_channel"\)/);
   });
 
-  it("fleet.yaml.tpl contains research_origin input", async () => {
+  it("fleet.yaml.tpl declares research_origin and doc_channel inputs", async () => {
     const { readFileSync } = await import("node:fs");
     const { fileURLToPath } = await import("node:url");
     const fleetPath = fileURLToPath(
       new URL("../workflows/deep-research/fleet.yaml.tpl", import.meta.url),
     );
     const source = readFileSync(fleetPath, "utf-8");
-    expect(source).toContain("research_origin");
-    expect(source).toContain("RESEARCH_ORIGIN");
+    expect(source).toMatch(/research_origin:\s*\$\{RESEARCH_ORIGIN\}/);
+    expect(source).toMatch(/doc_channel:\s*\$\{DOC_CHANNEL\}/);
   });
 
-  it("workflow.yaml seed payload contains research_origin", async () => {
+  it("workflow.yaml seed payload carries research_origin and doc_channel", async () => {
     const { readFileSync } = await import("node:fs");
     const { fileURLToPath } = await import("node:url");
     const wfPath = fileURLToPath(
       new URL("../workflows/deep-research/tick/workflow.yaml", import.meta.url),
     );
     const source = readFileSync(wfPath, "utf-8");
-    expect(source).toContain("research_origin");
-    expect(source).toContain("{{research_origin}}");
+    expect(source).toMatch(/research_origin:\s*"\{\{research_origin\}\}"/);
+    expect(source).toMatch(/doc_channel:\s*"\{\{doc_channel\}\}"/);
+  });
+
+  it("rendered tick.md passes --origin and --doc-channel with their values into tick-entry argv", async () => {
+    const { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+    const { execFileSync } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { tmpdir } = await import("node:os");
+    const { dirname, join, resolve } = await import("node:path");
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const tickMdPath = join(root, "workflows", "deep-research", "tick", "templates", "tick.md");
+    const dir = mkdtempSync(join(tmpdir(), "g4c-asm-"));
+    const argvLog = join(dir, "tick-entry.argv.log");
+    const tickEntry = join(dir, "tick-entry");
+    writeFileSync(
+      tickEntry,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "generateTriggered": false, "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    );
+    chmodSync(tickEntry, 0o755);
+    const testOrigin = "dr-abc123def456";
+    const testDocChannel = "research:content";
+    const values: Record<string, string> = {
+      tick_entry: tickEntry,
+      tick_channel: "research:v1-deep-research.index",
+      evidence_channel: "research:v1.evidence",
+      allowed_root: "/data/code/self/agent-runtime",
+      max_writes: "64",
+      research_question: "test question",
+      prev_coverage: "0",
+      prev_zero_growth: "0",
+      research_origin: testOrigin,
+      doc_channel: testDocChannel,
+    };
+    const script = readFileSync(tickMdPath, "utf8").replace(/\{\{([a-z_]+)\}\}/g, (_m: string, key: string) => values[key] ?? "");
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+    execFileSync("bash", [outShell], { cwd: root, encoding: "utf8" });
+    const argv = readFileSync(argvLog, "utf8").trim().split("\n").filter((l: string) => l.length > 0);
+    expect(argv).toContain("--origin");
+    expect(argv[argv.indexOf("--origin") + 1]).toBe(testOrigin);
+    expect(argv).toContain("--doc-channel");
+    expect(argv[argv.indexOf("--doc-channel") + 1]).toBe(testDocChannel);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

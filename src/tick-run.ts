@@ -36,6 +36,7 @@ import {
   findWorkerResult,
   readChannelMessages,
   readWorkerResult,
+  readGenerateResult,
   type InspectMessage,
 } from "./tick-inspect";
 import {
@@ -1484,10 +1485,14 @@ export async function runChannelWrite(
               return {};
             },
             readBody: async (runId) => {
-              const result = await readWorkerResult(runId);
-              if (result) {
-                const body = (result as Record<string, unknown>).body;
-                if (typeof body === "string") return body;
+              const maxRetries = 30;
+              const retryDelayMs = 1000;
+              for (let attempt = 0; attempt < maxRetries; attempt++) {
+                const result = await readGenerateResult(runId);
+                if (result && typeof result.body === "string") return result.body;
+                if (attempt < maxRetries - 1) {
+                  await new Promise((r) => setTimeout(r, retryDelayMs));
+                }
               }
               throw new Error(`generate role ${role} result not found for run ${runId}`);
             },
@@ -1504,7 +1509,12 @@ export async function runChannelWrite(
           const docChannelId = opts.docChannelId ?? opts.channelId;
           const messages = await readChannelMessages(docChannelId);
           const reportMsg = messages.find((m) => m.message_id === sourceMessageId);
-          const createdAt = reportMsg?.created_at ?? new Date().toISOString();
+          if (!reportMsg?.created_at) {
+            throw new Error(
+              "G4c: export requires the report message's created_at for deterministic path derivation. The report message was not found in the doc channel — it may not have been persisted yet.",
+            );
+          }
+          const createdAt = reportMsg.created_at;
           const input: ExportInput = {
             report: { doc_kind: "report", digest: "", body, origin },
             sourceMessageId,
@@ -1529,16 +1539,30 @@ export async function runChannelWrite(
         }),
       lockSynthesizer: opts.generateDeps?.lockSynthesizer ??
         (async () => {
-          const lockDir = join(tmpdir(), "g4c-synthesizer-lock");
+          const safeOrigin = origin.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const safeChannel = opts.channelId.replace(/[^a-zA-Z0-9_:]/g, "_");
+          const lockDir = join(tmpdir(), `g4c-synthesizer-lock-${safeChannel}-${safeOrigin}`);
           const maxRetries = 30;
           const retryDelayMs = 1000;
+          const staleLockMs = 300_000;
           for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
               mkdirSync(lockDir);
+              const lockFile = join(lockDir, "lock");
+              writeFileSync(lockFile, String(process.pid), "utf8");
               return async () => {
                 try { rmSync(lockDir, { recursive: true }); } catch { /* already released */ }
               };
             } catch {
+              try {
+                const stat = await (async () => {
+                  const { statSync } = await import("node:fs");
+                  return statSync(lockDir);
+                })().catch(() => null);
+                if (stat && Date.now() - stat.mtimeMs > staleLockMs) {
+                  try { rmSync(lockDir, { recursive: true }); } catch { /* contested */ }
+                }
+              } catch { /* stale check best-effort */ }
               if (attempt < maxRetries - 1) {
                 await new Promise((r) => setTimeout(r, retryDelayMs));
               }
@@ -1671,7 +1695,7 @@ export interface RunCliOptions {
   prevZeroGrowthRounds?: number;
   /** G4c——本次研究 id（--origin）；生成段产物回写的 origin。 */
   origin?: string;
-  /** G4c——doc 发布目标 channel（--doc-channel）；缺省与 clue board channel 相同。 */
+  /** G4c——doc 发布目标 channel（--doc-channel）；生产必须显式传入，缺省偶遇生成阶段即响亮失败。 */
   docChannelId?: string;
 }
 

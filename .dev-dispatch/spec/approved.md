@@ -1,88 +1,82 @@
-# D1 —— 部署固化：把「靠手工 env 搀扶」变成受版本管理的部署配置
+# G4a(v2) —— `--question` 生产贯通：第五次「组件支持、生产不传」
 
-> 上游依据：`wf-dc0c15` `spec.md`(rev7) §5.5、`wf-ecf9fc` `plan.md` §7、`golden-order.md`「2026-08-09 02:10」拍板（导出落点）。
-> 前置已合入 main `1e6708a`（G1 / G2a / G2b 全部完成；G3 由 A8f 覆盖）。
-> **本包是 Phase 6 端到端验收的最后一块前置**：plan §0 的 DoD 里写着「全程无人工介入、**零手工 env 搀扶**（部署配置受版本管理）」。
+> 派发方：`line-deep-research`（deep-research V2 收尾线）。**这是一个已核实的生产接线缺陷，不是加功能。**
+> 前置已合入 main `501db99`。
+>
+> ⚠️ **这是重开包。上一个 development（`dev_ledr_g4a_question_wiring_01`，PR #33）被派发方主动取消，
+> 原因是我在 spec 里写了一条自指、逻辑上不可满足的要求，导致无限 rework。功能实现当时已被评审判定正确。
+> 详见 §6 —— 那一节写明了「上一轮已被验证正确的做法」，请照它做，别重新发明。**
 
 ---
 
-## 0　现状：三处「能跑但靠手工搀扶」
+## 0　已核实的现状（全部 grep 到行号，不是推断）
 
-`bin/deep-research-loop.sh` 实测（本包基线 `1e6708a`）：
+| 位置 | 事实 |
+|---|---|
+| `src/tick-run.ts:1279` | `parseRunCliArgs` **确实解析** `--question` |
+| `src/tick-entry.ts:41,50` | usage 里**确实写了** `--question <研究主问题>` |
+| `src/tick-run.ts:674-678` | triage 分支：`deps.readQuestion` 不存在 ⇒ **抛 `MissingTriageQuestionError`** |
+| `workflows/deep-research/tick/templates/tick.md:26,28,30,32` | **四个分支一个都没带 `--question`** |
+| `bin/deep-research-loop.sh` | `grep -n question` **零命中** |
+| `workflows/deep-research/fleet.yaml.tpl` | `grep -n question` **零命中** |
 
-| 行 | 现状 | 问题 |
-|---|---|---|
-| `:32` | `export TICK_CHANNEL="${TICK_CHANNEL:-research:p02-smoke-1dce60}"` | ⛔ **缺省仍是 smoke channel**。生产不显式设它就会往冒烟板写——而 **bus append-only 无 DELETE，写错不可回退** |
-| `:41` | `export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"` | 无默认值（**设计如此**：真实 channel 名不可由板名推导，静默推导会错写进 append-only bus）。但**生产配置必须有一个受管的显式值**，不能靠人记得 export |
-| `:46` | `export ALLOWED_ROOT="${ALLOWED_ROOT:-}"` | 同上：`code-local` worker 没有它会响亮失败（A8f 的 `MissingAllowedRootError`），但生产得有受管值 |
+⇒ **CLI 支持它、引擎依赖它、生产从不传它。**
 
-⇒ **「部署」目前等于「有人记得把三个 env 敲对」。** 本包把它变成受版本管理的配置文件。
+### 后果：收集段会在第一个 triage 决策上响亮失败
 
-## 0.1 ⛔ 另一处已实测的部署面缺口：**依赖装没装，不在部署步骤里**
+`tick-run.ts:242` 的错误消息原文：
+> `G2b: triage decision present but no question source wired (provide readQuestion / --question). Refusing to dispatch a triage with an empty question.`
 
-G1 期实测（本 session 亲历）：生产 checkout 里 `yaml` 在 `devDependencies` 声明了但**没装**，
-而 **5 个接线回归文件都 import 它** ⇒ `npx vitest run` 报
-`Error: Failed to load url yaml`、**`0 test` collected**。
-
-> ⛔ **「0 test collected」与「测试全绿」在摘要上极像，语义完全相反。**
-> 而这个 checkout **就是生产运行位** ⇒ **「部署完成」与「回归可执行」是两件事**，当时它们不相等。
-
-⇒ 部署步骤必须包含依赖安装，且必须有一条**验证回归确实可执行**的检查（不是只看 `exit 0`，要看**收集到的用例数 > 0**）。
+⚠️ **G2b 把响亮失败做对了**（不静默用空 question 派发），但它意味着
+**V2 端到端一旦跑到 triage 就停**。本包是 Phase 6 的必要前置。
 
 ---
 
 ## 1　要做什么
 
-### 1.1 受版本管理的部署配置（profile 形式，进 repo）
+**把「研究主问题」从部署配置一路贯通到 `tick-entry --run --question`。**
 
-新增 `profiles/deploy/<name>.env`（或等价形式，**实现方可选形状，但必须进 git、可 diff、可 review**），
-至少覆盖：`TICK_CHANNEL` / `EVIDENCE_CHANNEL` / `ALLOWED_ROOT` / `MAX_WRITES` / 导出落点根。
+```
+bin/deep-research-loop.sh  (export)
+  → workflows/deep-research/fleet.yaml.tpl  (pipeline input 占位符)
+    → workflows/deep-research/tick/workflow.yaml  (payload)
+      → workflows/deep-research/tick/templates/tick.md  ({{…}} 变量)
+        → "$tick_entry" --run <channel> … --question "<研究主问题>"
+```
 
-`bin/deep-research-loop.sh` 增加一个**显式的 profile 选择入口**（如 `--profile <name>` 或 `DEPLOY_PROFILE`），
-加载顺序必须是：**显式 env > profile 文件 > 内置缺省**，且**加载了哪个 profile 要打印出来**（可观测）。
+`MAX_WRITES` 已经走通同一条链（`bin:101`、`fleet.yaml.tpl:12`、`tick.md:19`、`tick.md:26/28/30/32`）——**读它们，照它们的形状接。**
 
-### 1.2 ⛔ 把 smoke channel 缺省改成「响亮失败」
+### 1.1 ⛔ 无内置缺省，未配置即响亮失败
 
-`TICK_CHANNEL` 的**内置缺省不得再是 `research:p02-smoke-1dce60`**。
-未经 profile 或显式 env 指定时 ⇒ **响亮失败并拒绝启动**，理由写进错误消息。
+与 `TICK_CHANNEL`（D1 已确立）、`EVIDENCE_CHANNEL`（设计如此）对齐：
+**研究主问题不得有内置缺省值**，未由 profile 或显式 env 提供 ⇒ **响亮失败拒绝启动**，理由写进错误消息。
 
-> **判据**：bus 是 append-only 无 DELETE 的。**一个「默认写到某个真实 channel」的缺省值，其代价是不可回退的**。
-> 与 `EVIDENCE_CHANNEL` 无默认值同一条道理——那条**设计如此**是对的，本条要向它对齐。
-> ⚠️ 但**不得反过来给 `EVIDENCE_CHANNEL` 编一个缺省**：它保持「无默认 + 响亮失败」。
+> **判据**：一个编出来的缺省问题会让整场研究跑偏，而 bus 写入 append-only 不可回退。
+> ⛔ **尤其不得**从 channel 名、topic slug 或任何其它字段**推导**出问题字符串。
 
-### 1.3 导出落点写死 `DeepThought/<主题>/`
+### 1.2 ⛔ 不得把 `tick.md` 的分支数再翻一倍
 
-按 2026-08-09 用户拍板：导出件落 `DeepThought/<主题>/`，带 `source_message_id` + 终态标记以与旧产物区分。
-`src/export.ts` 已有 `deriveExportPath` / `renderExportContent` / `source_message_id` 注释，**读它、按它的既有形状接，不要重写**。
-落点根走 §1.1 的配置，**不得硬编码到源码里**。
-
-### 1.4 部署步骤文档化 + 可执行验证
-
-`docs/deploy.md`（或等价）写明生产部署步骤，且**每一步都要有对应的验证命令**：
-1. 各仓 `git pull`
-2. **依赖安装**（`npm ci`）
-3. ⛔ **回归可执行性验证**：跑一次测试并断言**收集到的用例数 > 0 且全绿**（§0.1 的教训）
-4. `--dry-run` 冒烟：**零手工 env**，只靠 profile，渲染出的 fleet input 里 `tick_channel` / `evidence_channel` / `allowed_root` / `max_writes` 全部非空且等于 profile 值
+`tick.md:25-33` 现在是 `evidence_channel × allowed_root` 的 **4 分支组合树**，再加一个可选参数会变 8，下一个变 16。
+⇒ **改成增量拼 argv**（数组累加后一次调用）。
+⚠️ `set -euo pipefail` 下注意数组展开与空值；**`run_output` 的捕获与后续 `hasPendingWork` 判定逐字不变**（A9 续投逻辑，本包不碰）。
 
 ---
 
-## 2　硬验收
+## 2　硬验收（缺一不可）
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **E1** | ⛔ **不设任何相关 env 时，`TICK_CHANNEL` 不再回落到 smoke channel** —— 无 profile 且无显式 env ⇒ **响亮失败拒绝启动** | 正反两例：无 profile ⇒ 非零退出且错误消息点名；有 profile ⇒ 正常渲染 |
-| **E2** | ⛔ **`grep -rn "research:p02-smoke-1dce60" bin/ src/` 零命中**（smoke channel 字面从生产路径消失） | grep |
-| **E3** | **从 profile 出发的端到端渲染断言**：`--dry-run` 在**只设 `DEPLOY_PROFILE`、不设其它 env** 的子环境下跑，渲染出的 tick input 里 `tick_channel`/`evidence_channel`/`allowed_root`/`max_writes` **全部等于 profile 里的值** | ⛔ 用例必须**自证子环境里没有那些 env**（照 G1 的 D1b 写法：`expect(childEnv).not.toHaveProperty(...)`） |
-| **E4** | 加载优先级：**显式 env > profile > 内置缺省**，三层各一例 | 三条断言 |
-| **E5** | ⛔ **`EVIDENCE_CHANNEL` 仍保持「无默认 + 响亮失败」**，本包不得给它编缺省 | 反例：profile 里不给它 ⇒ 仍响亮失败 |
-| **E6** | 导出落点走配置、**源码里不硬编码 vault 路径**；导出件含 `source_message_id` 与终态标记 | grep + 用例 |
-| **E7** | `docs/deploy.md` 四步齐全，且**第 3 步是「用例数 > 0 且全绿」而不是只看 exit 0** | 读文档到行号 |
-| **E8** | 全量 `npx vitest run` **连跑 3 次全绿**，且文件数/用例数不少于基线 **18 / 333** | 贴三次输出 |
-| **E9** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **E10** | `src/`、`test/` 的每一处删除给出必要性说明 | — |
+| **Q1** | 从生产入口渲染：只设 profile/env、跑 `--dry-run`，fleet 的 tick pipeline input 里**有 question 字段且等于配置值** | 解析渲染出的 YAML |
+| **Q2** | ⛔ **真正的贯通断言**：渲染出的 `tick.md` + **假 `tick-entry` 记录 argv**，断言 `--question` **及其值**真的出现在 argv 里 | 照 `test/a10c-writebudget.test.ts` 里 `--max-writes` 那条的做法。⛔ 只断言「fleet input 里有 question」**不算数**——那是 Q1，两者必须都有 |
+| **Q3** | ⛔ **无内置缺省**：不设任何相关 env 且无 profile ⇒ **非零退出且错误消息点名该变量**；且**不得**出现被推导/编造的问题字符串 | 正反两例 |
+| **Q4** | ⛔ **组合矩阵**：`evidence_channel` / `allowed_root` / `question` 三者「有/无」的**全部 8 种组合**下，argv 都只含该有的参数、不含不该有的 | 参数化用例；同时证明 §1.2 的重构没漏分支 |
+| **Q5** | ⭐ **可达性判据说明**（不是额外用例）：证据必须是「从生产入口到达 `tick-entry`」，**「模块支持」「渲染里有值」都不构成可达性证据** | 见 Q2 |
+| **Q6** | 全量 `npx vitest run` 全绿，文件数/用例数**不少于基线 19 / 348** | 贴输出 |
+| **Q7** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **Q8** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明（本包要重写 `tick.md` 的分支树，属必要） | — |
 
-> ⚠️ **E8 要求连跑 3 次**，理由：派发方在 G2a 合入后于生产 checkout 观察到**一次未能复现的失败**（1 failed / 318 passed），随后 9 次全绿，**未留下失败用例名**。
-> 故本包用「连跑 3 次」作为最低观察量，**若期间复现，请把失败用例名与完整输出贴进 dev-note**（这比修好它更重要——目前它连症状都没被记录）。
+> ⭐ **本包的存在理由是 Q2**：`--question` 已被 CLI 解析、被 usage 记录、被引擎依赖，**唯独没有人传它**。
+> ⛔ 任何只验「CLI 支持」「input 里有值」的检查都复现不了这个缺陷。
 
 ---
 
@@ -90,9 +84,9 @@ G1 期实测（本 session 亲历）：生产 checkout 里 `yaml` 在 `devDepend
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **Q1** | 把 `TICK_CHANNEL` 的内置缺省改回 `research:p02-smoke-1dce60` | **E1 的失败侧 + E2 必须挂** |
-| **Q2** | 让 profile 加载覆盖显式 env（把优先级颠倒） | **E4 必须挂** |
-| **Q3** | 给 `EVIDENCE_CHANNEL` 编一个缺省值 | **E5 必须挂** |
+| **P1** | 生产 `tick.md` 里去掉 `--question` 传参（其余不动） | **Q2 必须挂**；⛔ **Q1 应当仍绿** —— 这正是本包要证明的：Q1 单独存在时是零功率的 |
+| **P2** | 给研究主问题编一个内置缺省值 | **Q3 的失败侧必须挂** |
+| **P3** | 只在 `evidence_channel` 与 `allowed_root` 都有的那一支传 `--question`，其余支不传 | **Q4 必须挂**（「组合分支漏一支」的真实形态） |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
@@ -103,19 +97,71 @@ G1 期实测（本 session 亲历）：生产 checkout 里 `yaml` 在 `devDepend
 
 | 不做 | 理由 |
 |---|---|
-| 注册任何 bus 协议 | 不可逆，走公示流程，由派发方在异议窗口后执行 |
-| 端到端真跑真研究 | 归 Phase 6；本包只做 `--dry-run` 层的配置贯通 |
+| 终态贯通（生产 `--run` 计算 `decideTermination`、跨 tick 计数器） | 归 **G4b** |
+| 接生成段（`decideGenerate` → `runGenerate`） | 归 **G4c** |
+| 接导出 / anchor-check | 归 **G4d** |
+| 播种入口 | 归 **G4e** |
+| 改 `profiles/deploy/*.env` 的 channel 取值 | 归 **D2**（那两个 channel 当前在 bus 上不存在，由派发方处置）。本包**只加该变量的键** |
+| 注册任何 bus 协议 | 不可逆，走公示流程 |
 | 改 `agent-runtime` | 不同仓 |
-| 改生成段/收集段的编排逻辑 | 归 G2a/G2b，已合入 |
-| 修那个未复现的 flake | **本包只要求「连跑 3 次并如实记录」**；没有症状就动手修，等于凭猜改代码 |
+| 动 A9 续投逻辑 / `hasPendingWork` 判定 | 本包只加一个参数的贯通，不碰控制流 |
+| 端到端真跑真 bus | 归 Phase 6 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 5　交付物落点
+## 5　⛔ 关于 dev-note 的要求（**上一轮我把这条写错了，以本节为准**）
 
-- 实现：`profiles/deploy/*.env`（新增）、`bin/deep-research-loop.sh`（profile 加载 + 缺省改响亮失败）、
-  `src/export.ts`（落点走配置，若需要）
-- 文档：`docs/deploy.md`
-- 测试：`test/d1-deploy-config.test.ts`（E1–E7）
-- 证据：`docs/dev-notes/dev_ledr_d1_deploy_config_01.md`（E1–E10 逐条 + §3 变异矩阵三行 + 三次连跑输出）
+**上一轮 spec 的原话**是「dev-note 的 `input_commit` 必须等于最终交付 commit」。
+**这条要求是自指的、逻辑上不可满足**：note 本身就是交付 commit 的一部分，
+note 里不可能记录包含它自己的那个 commit 的 hash。每更新一次 note 就产生一个新 commit，note 又「过期」。
+上一轮 continuous review 据此连续 REJECT，而它自己的评语写着
+「The functional wiring is correct and complete against §1/§2」。**这是我的 spec 缺陷，不是实现方的问题。**
+
+**更正后的唯一判据**：
+
+1. dev-note 的 `input_commit` 字段记录**本次 implement attempt 的 input_commit**（dd 交给你的那个）——
+   这本来就是该字段的语义，**不要去追交付 commit**。
+2. 真正要保证的是：**note 的正文描述交付物本身** —— 测试文件数/用例数、变异矩阵各行的实测结果、
+   最终代码的行为，必须与最终交付一致。**若中途 rework 改了实现，note 正文的数字与结论必须同步更新。**
+3. ⛔ **不要为对齐 commit hash 做任何额外提交。**
+
+> 这条的来历：派发方在 D1 上实测到「note 停在 attempt 1，写 347 tests 而实际 348、变异按 14 用例测而实际 15、
+> rework 修的四件事一个字没记」。**真正的病是「证据文档描述的不是交付物」，不是 hash 对不上。**
+
+---
+
+## 6　上一轮已被评审判定正确的做法（照做，别重新发明）
+
+上一个 development 的实现被 continuous review 逐条确认「correct and complete against §1/§2」。
+以下是它的形状，**请照此实现**（代码不在本 H0 里，需要你自己写）：
+
+- **`bin/deep-research-loop.sh`**：在 `TICK_CHANNEL` 响亮失败块之后，加
+  `export RESEARCH_QUESTION="${RESEARCH_QUESTION:-}"` + 空值响亮失败（exit 3，错误消息点名 `RESEARCH_QUESTION`
+  并说明「编造或推导的缺省会让整场研究跑偏，且 bus 写入不可回退」）。
+- **`fleet.yaml.tpl`**：pipeline input 加 `research_question: ${RESEARCH_QUESTION}`（与 `max_writes` 同级）。
+- **`tick/workflow.yaml`**：把该字段接进 payload。
+- **`tick.md`**：加 `research_question="{{research_question}}"`；把 4 分支组合树换成
+  ```bash
+  tick_args=("$tick_entry" --run "$tick_channel")
+  [ -n "$evidence_channel" ] && tick_args+=(--evidence-channel "$evidence_channel")
+  [ -n "$allowed_root" ]     && tick_args+=(--allowed-root "$allowed_root")
+  tick_args+=(--max-writes "$max_writes")
+  [ -n "$research_question" ] && tick_args+=(--question "$research_question")
+  run_output="$("${tick_args[@]}")"
+  ```
+  ⚠️ 注意 `set -e` 下 `[ … ] && …` 作为**语句**在条件为假时返回非零会终止脚本 —— 上一轮用的是 `if` 块，**照 `if` 块写**。
+- **`profiles/deploy/{production,local}.env`**：**只加该变量的键**，channel 取值一字不改。
+- **`test/g4a-question-wiring.test.ts`**：Q1–Q4，其中 **Q2 用假 `tick-entry` 记 argv** 做可达性断言，
+  并含 8 种组合的参数化矩阵。
+
+---
+
+## 7　交付物落点
+
+- 实现：`bin/deep-research-loop.sh`、`workflows/deep-research/fleet.yaml.tpl`、
+  `workflows/deep-research/tick/workflow.yaml`、`workflows/deep-research/tick/templates/tick.md`
+- 配置：`profiles/deploy/*.env`（只加键）
+- 测试：`test/g4a-question-wiring.test.ts`（Q1–Q4）
+- 证据：`docs/dev-notes/dev_ledr_g4a2_question_wiring_01.md`（Q1–Q8 逐条 + §3 变异矩阵三行 + 还原证据），
+  **按 §5 的更正后要求写**。

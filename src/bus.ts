@@ -22,7 +22,7 @@ function token(): string {
 }
 
 /** agent-bus HTTP 错误，携带数值状态码（用于 D1 的错误分类）。 */
-class BusError extends Error {
+export class BusError extends Error {
   status: number;
   constructor(method: string, path: string, status: number, body: string) {
     super(`bus ${method} ${path}: ${status} ${body.slice(0, 200)}`);

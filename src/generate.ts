@@ -474,6 +474,10 @@ export async function runGenerate(
     }
   }
 
+  if (!anchorJsonWritten) {
+    anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
+  }
+
   // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
   const reportHead = renderReportHead(marker, anchorRate, anchorTail);
   const reportBody = reportHead + synthBody;

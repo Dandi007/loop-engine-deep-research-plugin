@@ -469,22 +469,6 @@ describe("G4d V9: no self-written anchor-check in repo", () => {
   });
 });
 
-describe("G4d V10: createdAt discriminative test exists (covered by g4c-generate-wiring.test.ts U6)", () => {
-  it("V10: the discriminative createdAt test is in g4c-generate-wiring.test.ts U6 (not verified by source-string matching)", async () => {
-    // The discriminative test at g4c-generate-wiring.test.ts:628-662 drives production
-    // spawnExport with a non-existent sourceMessageId and asserts loud failure.
-    // V10 verification: confirm the test file exists and the discriminative test is present.
-    const g4cTestPath = join(ROOT, "test", "g4c-generate-wiring.test.ts");
-    expect(existsSync(g4cTestPath)).toBe(true);
-    const g4cTest = readFileSync(g4cTestPath, "utf8");
-    // The discriminative test must exist (not zero-power source-string matching)
-    expect(g4cTest).toContain("msg-nonexistent");
-    expect(g4cTest).toContain("cannot find doc message");
-    // The old zero-power test (new Date() matching) must be absent
-    expect(g4cTest).not.toMatch(/expect\(g4cTest\)\.toMatch\(/);
-  });
-});
-
 describe("G4d V11: verification rate unit unambiguous (percentage)", () => {
   it("renderReportHead with 100 produces dr-anchor-rate 100", () => {
     const head = renderReportHead(

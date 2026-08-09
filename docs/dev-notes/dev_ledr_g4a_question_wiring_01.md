@@ -1,8 +1,8 @@
 # G4a —— `--question` 生产贯通：第五次「组件支持、生产不传」
 
 development_id: `dev_ledr_g4a_question_wiring_01`
-attempt: `implement`（initial）
-input_commit: `d375b8fa2501fa82098ea2a46c830dd5bf0325eb`
+attempt: `implement`（rework，继承前次实现提交；修复 Q8 证据完整性的 input_commit 同步）
+input_commit: `fd9299fd5b0efbb6dbf6db1f35203243924f66c1`
 
 ## 根因（spec §0，逐条 grep 到行号）
 

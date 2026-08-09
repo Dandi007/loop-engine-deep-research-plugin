@@ -100,7 +100,7 @@ function runSelfCheck(): SelfCheckOutput {
   return { ok: true, decisions, termination };
 }
 
-async function main(argv: string[]): Promise<number> {
+export async function main(argv: string[]): Promise<number> {
   const arg = argv[0];
   if (arg === "--help" || arg === "-h" || arg === undefined) {
     process.stdout.write(USAGE);

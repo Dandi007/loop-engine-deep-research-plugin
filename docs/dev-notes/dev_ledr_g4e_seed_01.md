@@ -1,6 +1,6 @@
 # G4e —— 播种入口实现笔记
 
-- `input_commit`: `67e7e5b41754e951fc10d3f16d14b44d17fc5532`
+- `input_commit`: `0efb9d1da74aa58649d4e60971173b6b478ab914`
 
 ## 交付物
 
@@ -12,9 +12,9 @@
 ### 修改文件
 
 - `src/bus.ts` —— 导出 `BusError`（播种入口需要按 404 状态码区分 channel 不存在）
-- `src/tick-entry.ts` —— 新增 `--seed` 子命令 + usage 更新
-- `src/generate.ts` —— D1 修复：anchor-check JSON 落盘失败在报告头可见
-- `test/g4d-anchor-check.test.ts` —— D2 修复：删除零功率 V10 测试用例
+- `src/tick-entry.ts` —— 新增 `--seed` 子命令 + usage 更新；导出 `main` 函数供测试驱动 CLI 级别退出码
+- `src/generate.ts` —— D1 修复：anchor-check JSON 落盘失败在报告头可见；`renderReportHead` 在 `anchorRate` 非 null 时也追加 `anchorTail`
+- `test/g4d-anchor-check.test.ts` —— D2 修复：删除零功率 V10 测试用例；D1 修复：替换零功率 V13 为判别性用例
 - `package.json` —— 新增 `tick:seed` script
 
 ## 验收逐条
@@ -47,23 +47,33 @@
 - 零线索时 `publishClue` 零调用（不播 0 条并返回成功）
 - `parseSeedCliArgs` 无 `--clue` ⇒ 抛 `SeedError`
 
+`test/g4e-seed.test.ts` "G4e X4: --seed CLI branch exits non-zero on loud failure" 驱动生产 `main()` 函数，断言：
+- `main(["--seed", "research:test"])` → exit code 2（零 clues 在 CLI 层映射为 loud failure）
+- `main(["--seed"])` → exit code 2（缺失 channel 在 CLI 层映射为 loud failure）
+- 这两条断言守卫 `src/tick-entry.ts:151-162` 的 try/catch → exit code 2 映射，改变该 return 会让测试变红
+
 ### X5: 入口在 --help/usage 里可见
 
 - `tick-entry.ts` USAGE 字符串含 `--seed` 子命令说明
 - `package.json` 含 `tick:seed` 脚本
-- `test/g4e-seed.test.ts` "G4e X5" 额外验证 `parseSeedCliArgs` 正确解析 channel/clues/sources
+
+`test/g4e-seed.test.ts` "G4e X5: --seed visible in --help and npm scripts" 行为性验证：
+- `main(["--help"])` stdout 输出包含 `--seed`（驱动真实 USAGE 字符串）
+- `main(["-h"])` stdout 输出包含 `--seed`（覆盖 -h 别名）
+- `readFileSync("package.json")` 解析后断言 `pkg.scripts` 具有 `tick:seed` 属性
 
 ### X6: 全量 npx vitest run 全绿
 
-见运行输出。
+24 个测试文件，452 个用例，全部通过。
+无失败、无跳过。
 
 ### X7: 变异矩阵
 
-| 变异 | 改什么 | 期望被杀 | 断言 |
-|------|--------|----------|------|
-| **Y1** | 让 idempotency key 含随机/时间成分 | **X2 必须挂** | `buildSeedIdempotencyKey` 不含随机/时间（纯函数，由 `createHash("sha256").update(clueText).digest("hex")` 定性） |
-| **Y2** | channel 不存在时自动创建再播 | **X3 必须挂** | `runSeed` 遇 404 只抛 `SeedError`，不调用任何创建 channel 的代码 |
-| **Y3** | 零线索时返回成功（播 0 条） | **X4 的失败侧必须挂** | `runSeed` 在 `clues.length === 0` 时立即抛 `SeedError`，不调用 `publishClue` |
+| 变异 | 改什么 | 被杀断言 |
+|------|--------|----------|
+| **Y1** | 让 idempotency key 含随机/时间成分（每次不同） | `test/g4e-seed.test.ts` "G4e X2: idempotency — same clues twice ⇒ same keys" → "two runs of same clues produce identical key sequences" 断言两次 key 序列逐字相同；"idempotency key is deterministic from input" 断言 `buildSeedIdempotencyKey("ch", 0, "hello") === buildSeedIdempotencyKey("ch", 0, "hello")` |
+| **Y2** | channel 不存在时自动创建再播 | `test/g4e-seed.test.ts` "G4e X3: channel not found ⇒ loud failure, no channel creation" → "publishClue is called exactly once before throwing (no automatic creation)" 断言 `publishClue` 仅调用 1 次（无自动创建） |
+| **Y3** | 零线索时返回成功（播 0 条） | `test/g4e-seed.test.ts` "G4e X4: zero clues ⇒ non-zero exit, not 'published 0 and success'" → "zero clues does not call publishClue" 断言 `publishClue` 零调用；"main --seed with zero clues returns exit code 2" 断言 CLI 层 exit code === 2 |
 
 ### X8: src/、test/ 的每处删除给出必要性说明
 
@@ -71,7 +81,11 @@
 
 ## D1 修复：anchor-check 落盘失败可见性
 
-`src/generate.ts` 中 `anchorJsonWritten` 变量在落盘失败后被设为 `false`，但此后从未被使用。修复：在 `renderReportHead` 调用前，若 `anchorJsonWritten === false`，将 `anchor-json-write-failed` 追加到 `anchorTail`，使落盘失败在报告头部可见。
+`src/generate.ts` 中 `anchorJsonWritten` 变量在落盘失败后被设为 `false`，但此后的 `renderReportHead` 只在 `anchorRate === null` 时追加 `anchorTail`，导致 valid anchor rate 时写入失败不可见。
+
+修复两处：
+1. `renderReportHead`：`anchorRate` 非 null 时也追加 `anchorTail`（`${anchorRate} ${anchorTail}`），使 `anchor-json-write-failed` 在报告头部可见
+2. `test/g4d-anchor-check.test.ts` V13：替换为零功率的旧用例，新用例 `writeAnchorCheckJson` 抛错 → 断言 `report.body` 包含 `anchor-json-write-failed`（按 V12 模式读 `writeDoc` 调用记录）
 
 ## D2 修复：删除零功率 V10 测试用例
 

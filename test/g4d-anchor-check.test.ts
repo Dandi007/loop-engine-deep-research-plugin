@@ -515,15 +515,20 @@ describe("G4d V12: no-repo-root is distinguishable from bare unavailable", () =>
   });
 });
 
-describe("G4d V13: writeAnchorCheckJson visibility — EXPORT_ROOT unset visible in report head", () => {
-  it("when writeAnchorCheckJson throws, runGenerate still completes export", async () => {
+describe("G4d V13: writeAnchorCheckJson failure is visible in report head", () => {
+  it("when writeAnchorCheckJson throws, report body contains anchor-json-write-failed", async () => {
+    const written: Array<{ body: string; doc_kind: string }> = [];
     const deps = baseDeps({
       writeAnchorCheckJson: async () => {
-        throw new MissingExportRootError();
+        throw new Error("write failed");
       },
-      spawnExport: vi.fn(async () => {}),
+      writeDoc: vi.fn(async (doc: { body: string; doc_kind: string }) => {
+        written.push(doc);
+        return "msg-1";
+      }),
     });
     await runGenerate(deps, DEFAULT_GENERATE_CONFIG);
-    expect(deps.spawnExport).toHaveBeenCalledTimes(1);
+    const report = written.find((d) => d.doc_kind === "report");
+    expect(report!.body).toContain("anchor-json-write-failed");
   });
 });

@@ -114,7 +114,7 @@ export function parseReportMarker(body: string): ReportMarker | null {
 export function renderReportHead(marker: ReportMarker, anchorRate: number | null, anchorTail?: string): string {
   const rate = anchorRate === null
     ? (anchorTail ? `unavailable ${anchorTail}` : "unavailable")
-    : String(anchorRate);
+    : (anchorTail ? `${anchorRate} ${anchorTail}` : String(anchorRate));
   return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
 }
 

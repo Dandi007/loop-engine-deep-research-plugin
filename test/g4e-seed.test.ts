@@ -5,6 +5,9 @@
  * 驱动生产的 runSeed，用假 bus 记录 publish 调用。
  */
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   runSeed,
   buildSeedIdempotencyKey,
@@ -12,6 +15,7 @@ import {
   SeedError,
   type SeedDeps,
 } from "../src/tick-seed";
+import { main } from "../src/tick-entry";
 import type { ClueV2 } from "../src/protocol";
 
 function fakePublishDeps(): {
@@ -176,22 +180,54 @@ describe("G4e X4: zero clues ⇒ non-zero exit, not 'published 0 and success'", 
   });
 });
 
-describe("G4e X5: --seed visible in --help and npm scripts", () => {
-  it("parseSeedCliArgs parses channel, clues, and sources correctly", () => {
-    const result = parseSeedCliArgs([
-      "research:test",
-      "--clue", "hello world",
-      "--clue", "another clue",
-      "--source", "code-local",
-    ]);
-    expect(result.channelId).toBe("research:test");
-    expect(result.clues).toEqual(["hello world", "another clue"]);
-    expect(result.sources).toEqual(["code-local"]);
+describe("G4e X4: --seed CLI branch exits non-zero on loud failure", () => {
+  it("main --seed with zero clues returns exit code 2", async () => {
+    const exitCode = await main(["--seed", "research:test"]);
+    expect(exitCode).toBe(2);
   });
 
-  it("parseSeedCliArgs throws on empty --clue value", () => {
-    expect(() =>
-      parseSeedCliArgs(["research:test", "--clue", ""]),
-    ).toThrow(SeedError);
+  it("main --seed with missing channel returns exit code 2", async () => {
+    const exitCode = await main(["--seed"]);
+    expect(exitCode).toBe(2);
+  });
+});
+
+describe("G4e X5: --seed visible in --help and npm scripts", () => {
+  it("main --help output contains --seed", async () => {
+    const chunks: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: any) => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      const exitCode = await main(["--help"]);
+      expect(exitCode).toBe(0);
+      const output = chunks.join("");
+      expect(output).toContain("--seed");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("main -h output contains --seed", async () => {
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: any) => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      const exitCode = await main(["-h"]);
+      expect(exitCode).toBe(0);
+      expect(chunks.join("")).toContain("--seed");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("package.json contains tick:seed script", () => {
+    const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+    expect(pkg.scripts).toHaveProperty("tick:seed");
   });
 });

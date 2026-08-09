@@ -1326,6 +1326,11 @@ export function assembleGenerateDeps(
       const exportRoot = process.env.EXPORT_ROOT;
       if (!exportRoot) throw new MissingExportRootError();
       if (!opts.docChannelId) throw new MissingDocChannelError();
+      if (!opts.question) {
+        throw new Error(
+          "G4c: no question configured for the export topic — refusing to fabricate a stand-in topic",
+        );
+      }
       const docMessages = await readChannelMessages(opts.docChannelId);
       const docMsg = docMessages.find((m) => m.message_id === sourceMessageId);
       if (!docMsg) {
@@ -1343,7 +1348,7 @@ export function assembleGenerateDeps(
         report,
         sourceMessageId,
         createdAt: docMsg.created_at,
-        topic: opts.question ?? "untitled",
+        topic: opts.question,
       };
       await runExport(
         {

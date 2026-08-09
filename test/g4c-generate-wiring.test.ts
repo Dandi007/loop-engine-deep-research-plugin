@@ -232,6 +232,36 @@ describe("G4c U1: reachability — runGenerate is called when termination non-nu
     expect(generateCalled).toBe(false);
     rmSync(oneShotDir, { recursive: true, force: true });
   });
+
+  it("discriminative T1: production runChannelWrite without injected generateDeps reaches runGenerate", async () => {
+    const cards = [clueMsg("c1", { status: "explored" }, 1)];
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse(cards);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const oneShotDir = uniqueOneShotDir("u1-t1");
+    const generateModule = await import("../src/generate");
+    const generateSpy = vi.spyOn(generateModule, "runGenerate").mockResolvedValue(undefined);
+
+    try {
+      await runChannelWrite({
+        channelId: CHANNEL,
+        origin: "test-origin",
+        docChannelId: "research:doc",
+        question: "test question",
+        prevZeroGrowthRounds: 2,
+        oneShotDir,
+      });
+
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      generateSpy.mockRestore();
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("G4c U2: one-shot — same origin twice ⇒ generate only runs once", () => {
@@ -538,6 +568,64 @@ describe("G4c U5: export path + EXPORT_ROOT check", () => {
     // ⛔ no hardcoded vault path in source
     const src = readFileSync(join(ROOT, "src", "export.ts"), "utf8");
     expect(src).not.toMatch(/\/data\/vault/);
+  });
+
+  it("positive: production assembleGenerateDeps spawnExport creates parent directory and writes file", async () => {
+    const card = clueMsg("c1", { status: "explored" }, 1);
+    const docMsg: InspectMessage = {
+      message_id: "msg-export-42",
+      channel_id: "research:doc",
+      channel_seq: 1,
+      kind: "research.doc.v2",
+      payload: { doc_kind: "report", body: "test", digest: "abc", origin: "test-origin" },
+      entity_id: "doc-1",
+      supersedes: null,
+      created_at: "2026-08-01T00:00:00Z",
+    };
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse([card, docMsg]);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const exportRoot = join(tmpdir(), `g4c-u5-export-${Math.random().toString(36).slice(2)}`);
+    process.env.EXPORT_ROOT = exportRoot;
+    const oneShotDir = uniqueOneShotDir("u5-prod");
+
+    const postWriteState: BoardState = { cards: [], runs: {}, triageInFlight: false };
+    const deps = assembleGenerateDeps(
+      {
+        channelId: CHANNEL,
+        origin: "test-origin",
+        docChannelId: "research:doc",
+        question: "测试研究主题",
+        oneShotDir,
+      },
+      term(),
+      postWriteState,
+    );
+
+    try {
+      await deps.spawnExport(
+        "<!-- dr-terminal stop=converged blocked=0 capHit=false -->\nreport content",
+        "msg-export-42",
+      );
+
+      const slug = "测试研究主题"
+        .trim().toLowerCase()
+        .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      const expectedPath = join(exportRoot, "DeepThought", slug, "2026-08-01-测试研究主题.md");
+      expect(existsSync(expectedPath)).toBe(true);
+      const content = readFileSync(expectedPath, "utf8");
+      expect(content).toContain("source_message_id: msg-export-42");
+      expect(content).toContain("report content");
+    } finally {
+      delete process.env.EXPORT_ROOT;
+      if (existsSync(exportRoot)) rmSync(exportRoot, { recursive: true, force: true });
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
   });
 });
 

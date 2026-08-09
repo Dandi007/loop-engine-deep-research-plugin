@@ -259,16 +259,55 @@ describe("P2: retry exhausted ⇒ loud failure naming runId", () => {
     ).rejects.toThrow(/G5: timed out waiting for triage result for run p2-run-001/);
   });
 
-  it("P2 discriminant: returning [] instead of throwing would silently pass", async () => {
-    const runtime: TriageSpawnRuntime = {
-      agentRunBin: "/fake/agent-run",
-      runId: "p2-discriminant",
-      writeInputFile: () => "/tmp/g5-input.json",
-      spawnProcess: async () => ({}),
-      readResult: async () => [],
-    };
-    const result = await runtime.readResult("p2-discriminant");
-    expect(result).toEqual([]);
+  it("P2 discriminant: production-assembly readResult throws when no triage result ever appears on channel", async () => {
+    capturedTriageRunId = "";
+    vi.useFakeTimers();
+    try {
+      const cards = [
+        clueMsg("c1", { status: "proposed" }, 1),
+        clueMsg("c2", { status: "proposed" }, 2),
+        clueMsg("c3", { status: "proposed" }, 3),
+      ];
+
+      vi.stubGlobal("fetch", async (input: RequestInfo) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("board:agent-runs")) return emptyMessagesResponse();
+        if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+        if (url.includes("/v1/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "head_001",
+              channel_id: CHANNEL,
+              channel_seq: 1,
+              kind: "research.clue.v2",
+              payload: { status: "proposed", text: "clue" },
+              entity_id: "c1",
+              supersedes: null,
+              created_at: "2026-08-01T00:00:00Z",
+            },
+          });
+        }
+        if (url.includes("/messages")) return messagesResponse(cards);
+        return emptyMessagesResponse();
+      });
+
+      const promise = runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 10,
+      });
+
+      const rejectionCheck = expect(promise).rejects.toThrow(
+        /G5: timed out waiting for triage result for run/,
+      );
+
+      await vi.advanceTimersByTimeAsync(35000);
+
+      await rejectionCheck;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -310,16 +349,53 @@ describe("P3: empty decisions is NOT treated as read-failure", () => {
     expect(result.triageReports[0].budgetSkipped).toBe(false);
   });
 
-  it("P3 discriminant: if empty decisions were treated as read-failure, it would throw", async () => {
-    const triageMsg = triageResultMsg("p3-discriminant", []);
-    const readResult = async (runId: string): Promise<TriageResultDecision[]> => {
-      const result = findTriageResult(runId, [triageMsg]);
-      if (result === null || result.length === 0) {
-        throw new Error(`G5: no triage result for ${runId}`);
+  it("P3 discriminant: production-assembly readResult returns [] when agent returns empty decisions", async () => {
+    capturedTriageRunId = "";
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        if (capturedTriageRunId) {
+          return messagesResponse([triageResultMsg(capturedTriageRunId, [])]);
+        }
+        return emptyMessagesResponse();
       }
-      return result;
-    };
-    await expect(readResult("p3-discriminant")).rejects.toThrow(/G5: no triage result/);
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+
+    expect(result.triageReports[0].casCount).toBe(0);
+    expect(result.triageReports[0].budgetSkipped).toBe(false);
+    expect(result.triageReports[0].runId).toBe(capturedTriageRunId);
+    expect(result.triageReports[0].runId).not.toBe("");
   });
 });
 
@@ -362,16 +438,57 @@ describe("P4: triageReport.runId equals the actual spawn runId", () => {
     expect(result.triageReports[0].runId).not.toBe("");
   });
 
-  it("P4 discriminant: runId hardcoded to empty string would fail", () => {
-    const report = {
-      runId: "",
-      budgetSkipped: false,
-      invalidActions: 0,
-      outOfScopeDropped: 0,
-      casCount: 0,
-      casResults: [],
-    };
-    expect(report.runId).toBe("");
+  it("P4 discriminant: runId is set to the actual spawn runId in production assembly", async () => {
+    capturedTriageRunId = "";
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        if (capturedTriageRunId) {
+          return messagesResponse([
+            triageResultMsg(capturedTriageRunId, [
+              { clue_id: "c1", action: "keep", rationale: "k" },
+            ]),
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+
+    expect(result.triageReports[0].runId).toBe(capturedTriageRunId);
+    expect(result.triageReports[0].runId).not.toBe("");
+    expect(typeof result.triageReports[0].runId).toBe("string");
+    expect(result.triageReports[0].runId.length).toBeGreaterThan(0);
   });
 });
 

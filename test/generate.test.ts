@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { parse } from "yaml";
 import {
   runGenerate,
   decideGenerate,
@@ -13,7 +15,7 @@ import {
   assertDocBodyWithinLimit,
   buildDoc,
   serializeCorpusToPositional,
-  buildGenerateRoleArgv,
+  spawnGenerateRole,
   assertDistinctDebaterRoutes,
   MAX_DOC_BODY_BYTES,
   DEFAULT_GENERATE_CONFIG,
@@ -21,6 +23,7 @@ import {
 import type {
   GenerateConfig,
   GenerateDeps,
+  GenerateSpawnRuntime,
   ReportMarker,
   DebaterCorpus,
 } from "../src/generate";
@@ -34,6 +37,19 @@ const DEBATER_ROLES = new Set([
   "dr-debater-opponent",
   "dr-debater-judge",
 ]);
+
+/** agent-runtime（前置合入 commit efa7579）的 profiles 根目录；测试读真实 role/route 值（spec §2.1）。 */
+const AGENT_RUNTIME_PROFILES =
+  process.env.AGENT_RUNTIME_PROFILES ?? "/data/code/self/agent-runtime/profiles";
+
+/** 从 agent-runtime profiles/roles/<role>.yaml 读出该 role 的 route（spec §2.1：别照本文猜）。 */
+function agentRoleRoute(role: string): string {
+  const p = join(AGENT_RUNTIME_PROFILES, "roles", `${role}.yaml`);
+  if (!existsSync(p)) throw new Error(`missing agent-runtime role file: ${p}`);
+  const doc = parse(readFileSync(p, "utf-8")) as { route?: string };
+  if (!doc.route) throw new Error(`role file ${p} has no route`);
+  return doc.route;
+}
 
 function debaterSpawns(deps: GenerateDeps): unknown[][] {
   const spawnRole = deps.spawnRole as ReturnType<typeof vi.fn>;
@@ -142,9 +158,9 @@ describe("S4 debaters (D4/D5/D16)", () => {
     const custom: GenerateConfig = {
       ...cfg,
       debaters: [
-        { role: "r1", route: "custom.one" },
-        { role: "r2", route: "custom.two" },
-        { role: "r3", route: "custom.three" },
+        { role: "dr-debater-advocate", route: "custom.one" },
+        { role: "dr-debater-opponent", route: "custom.two" },
+        { role: "dr-debater-judge", route: "custom.three" },
       ],
     };
     const deps = baseDeps({
@@ -280,8 +296,9 @@ describe("S4 anchor-check never blocks export (D9/D10)", () => {
   });
 });
 
-describe("G2a D1: corpus reaches the role prompt via POSITIONAL args", () => {
-  it("D1: serialized evidence text appears in the positional args (not just --input)", () => {
+describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production entry + fake agent-run)", () => {
+  it("D1: spawnGenerateRole (production entry) places serialized evidence text in the positional args of the recorded argv", async () => {
+    const recorded: string[][] = [];
     const corpus: DebaterCorpus = {
       question: "research question?",
       evidences: [
@@ -293,14 +310,20 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args", () => {
         },
       ],
     };
-    const argv = buildGenerateRoleArgv({
+    const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      role: "dr-debater-advocate",
-      route: "opus-4-8/ccs",
       runId: "run-1",
-      inputPath: "/tmp/payload.json",
-      corpus,
-    });
+      writeInputFile: () => "/tmp/payload.json",
+      spawnProcess: async (argv) => {
+        recorded.push(argv);
+        return {};
+      },
+      readBody: async () => "out",
+    };
+    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+
+    expect(recorded).toHaveLength(1);
+    const argv = recorded[0];
     const dd = argv.indexOf("--");
     expect(dd).toBeGreaterThanOrEqual(0);
     const positional = argv.slice(dd + 1).join(" ");
@@ -312,7 +335,7 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args", () => {
     expect(argv[argv.indexOf("--input") + 1]).toBe("/tmp/payload.json");
   });
 
-  it("D1: the assembled debater corpus flows from readEvidences into the serialized positional slot", async () => {
+  it("D1: runGenerate's default spawnRole turns readEvidences corpus into argv, anchor in positional", async () => {
     const evidences = [
       {
         clue_id: "c1",
@@ -321,19 +344,35 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args", () => {
         claim: "one-sentence claim",
       },
     ];
-    const captured: DebaterCorpus[] = [];
+    const recorded: string[][] = [];
+    const runtime: GenerateSpawnRuntime = {
+      agentRunBin: "/fake/agent-run",
+      runId: "run-1",
+      writeInputFile: () => "/tmp/payload.json",
+      spawnProcess: async (argv) => {
+        recorded.push(argv);
+        return {};
+      },
+      readBody: async () => "out",
+    };
+    // ⛔ 不注入 spawnRole —— runGenerate 走生产默认 spawnGenerateRole（语料→argv→spawn）。
     const deps = baseDeps({
       readEvidences: async () => evidences,
-      spawnRole: vi.fn(async (_role: string, _route: string, corpus: DebaterCorpus) => {
-        captured.push(corpus);
-        return { body: "out" };
-      }),
+      spawnRole: undefined,
+      spawnRuntime: runtime,
     });
     await runGenerate(deps, cfg);
-    expect(captured.length).toBeGreaterThan(0);
-    const serialized = serializeCorpusToPositional(captured[0]);
-    expect(serialized).toContain("code://repo@abc123:src/foo.ts#L42");
-    expect(serialized).toContain("exact quoted text");
+
+    const advArgv = recorded.find((a) => a.includes("dr-debater-advocate"));
+    expect(advArgv).toBeDefined();
+    const dd = advArgv!.indexOf("--");
+    const positional = advArgv!.slice(dd + 1).join(" ");
+    expect(positional).toContain("code://repo@abc123:src/foo.ts#L42");
+    expect(positional).toContain("exact quoted text");
+    // 位置参数里带的语料就是序列化的 evidence（§1.1：只靠 --input 不算数）。
+    expect(serializeCorpusToPositional({ question: "research question?", evidences })).toContain(
+      "code://repo@abc123:src/foo.ts#L42",
+    );
   });
 });
 
@@ -372,16 +411,26 @@ describe("G2a D2: doc_kind is derived from role, never from payload", () => {
 });
 
 describe("G2a D3: role/route wiring matches the real agent-runtime values", () => {
-  it("D3: the four roles' role/route pairs equal the actual values", () => {
-    expect(DEFAULT_GENERATE_CONFIG.debaters).toEqual([
-      { role: "dr-debater-advocate", route: "opus-4-8/ccs" },
-      { role: "dr-debater-opponent", route: "gpt-5.6-sol/ccs" },
-      { role: "dr-debater-judge", route: "ds-v4-pro/ccs" },
-    ]);
-    expect(DEFAULT_GENERATE_CONFIG.synthesizer).toEqual({
-      role: "dr-synthesizer",
-      route: "opus-5/ccs",
-    });
+  it("D3: the four roles' role/route pairs equal the values read from agent-runtime role files (not guessed)", () => {
+    // 每条 debater route 必须互不相同（spec §2.1 ⛔ / §2.1 表格）。
+    const routes = cfg.debaters.map((d) => d.route);
+    expect(routes).toHaveLength(3);
+    expect(new Set(routes).size).toBe(3);
+
+    // 从 agent-runtime profiles/roles/<role>.yaml 实际读出 route，逐一核对（spec §2.1：别照本文猜）。
+    for (const d of cfg.debaters) {
+      expect(agentRoleRoute(d.role)).toBe(d.route);
+    }
+    expect(agentRoleRoute(cfg.synthesizer.role)).toBe(cfg.synthesizer.route);
+  });
+
+  it("D3: every configured route exists in agent-runtime profiles/routes.yaml", () => {
+    const routesPath = join(AGENT_RUNTIME_PROFILES, "routes.yaml");
+    const doc = parse(readFileSync(routesPath, "utf-8")) as { routes?: Record<string, unknown> };
+    const known = new Set(Object.keys(doc.routes ?? {}));
+    for (const r of [...cfg.debaters.map((d) => d.route), cfg.synthesizer.route]) {
+      expect(known).toContain(r);
+    }
   });
 });
 
@@ -430,6 +479,36 @@ describe("G2a D6: report body head carries terminal marker + anchor-check rate (
       blocked: 0,
       capHit: false,
     });
+  });
+
+  it("D6: a genuine 0% rate renders as 0, but a crashed anchor-check renders 'unavailable' (distinguishable)", async () => {
+    // 真实 0% 核验率 → 头部标 0。
+    const genuine: DocV2[] = [];
+    const okDeps = baseDeps({
+      spawnAnchorCheck: vi.fn(async () => ({ defects: 99, verificationRate: 0 })),
+      writeDoc: vi.fn(async (doc: DocV2) => {
+        genuine.push(doc);
+      }),
+    });
+    await runGenerate(okDeps, cfg);
+    expect(genuine.find((d) => d.doc_kind === "report")!.body).toContain("dr-anchor-rate 0");
+
+    // anchor-check 崩溃 → 头部标 unavailable（评审 minor：不得伪装成 0%）。
+    const crashed: DocV2[] = [];
+    const crashDeps = baseDeps({
+      spawnAnchorCheck: vi.fn(async () => {
+        throw new Error("anchor-check boom");
+      }),
+      writeDoc: vi.fn(async (doc: DocV2) => {
+        crashed.push(doc);
+      }),
+    });
+    await runGenerate(crashDeps, cfg);
+    expect(crashed.find((d) => d.doc_kind === "report")!.body).toContain(
+      "dr-anchor-rate unavailable",
+    );
+    // 崩溃仍不阻断导出（D9）。
+    expect(crashDeps.spawnExport).toHaveBeenCalledTimes(1);
   });
 });
 

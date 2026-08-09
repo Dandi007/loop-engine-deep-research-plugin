@@ -15,7 +15,10 @@
  * 结构沿用 S2/S3：编排决策是纯函数，副作用只在执行壳（runGenerate）里。
  * 本模块不 import ./bus；读 / spawn / lock / 回写全部经 deps 注入。
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
 
@@ -110,13 +113,27 @@ export function parseReportMarker(body: string): ReportMarker | null {
  * 保留 renderReportBody 的终态标记行格式（parseReportMarker / export 依赖它），
  * 核验率作为**紧随其后的独立行**标注（软闸门：<90% 不阻断导出，但必须标在头部）。
  */
-export function renderReportHead(marker: ReportMarker, anchorRate: number): string {
-  return `${renderReportBody(marker)}<!-- dr-anchor-rate ${anchorRate} -->\n`;
+export function renderReportHead(marker: ReportMarker, anchorRate: number | null): string {
+  const rate = anchorRate === null ? "unavailable" : String(anchorRate);
+  return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
 }
 
-/** G2a §1.2 —— doc_kind 由「派的是哪个 role」推出，⛔ 绝不读 payload。 */
+/**
+ * G2a §1.2 —— doc_kind 由「派的是哪个 role」推出，⛔ 绝不读 payload。
+ * ⚠️ 未知 role 立即响亮抛错（评审 minor）：改名/拼错的 synthesizer role 不得静默降级为 argument，
+ * 而是让派发在产物回写前就失败。
+ */
 export function deriveDocKind(role: string): "report" | "argument" {
-  return role === "dr-synthesizer" ? "report" : "argument";
+  switch (role) {
+    case "dr-synthesizer":
+      return "report";
+    case "dr-debater-advocate":
+    case "dr-debater-opponent":
+    case "dr-debater-judge":
+      return "argument";
+    default:
+      throw new Error(`unknown generation role "${role}"; cannot derive doc_kind`);
+  }
 }
 
 /** G2a §2.3 —— digest 缺省由引擎按 body 计算（sha256）。 */
@@ -219,6 +236,56 @@ export function buildGenerateRoleArgv(opts: {
   ];
 }
 
+/**
+ * G2a §1.1 —— 把语料写成 `--input` 载荷文件。
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须走位置参数。
+ */
+export function writeGenerateInputFile(corpus: DebaterCorpus | SynthesizerCorpus): string {
+  const file = join(tmpdir(), `g2a-generate-input-${randomUUID()}.json`);
+  writeFileSync(file, JSON.stringify(corpus));
+  return file;
+}
+
+/** 生产默认 agent-run 派发所需的运行时（agent-run 定位 / spawn / body 回填）。 */
+export interface GenerateSpawnRuntime {
+  agentRunBin: string;
+  runId: string;
+  /** 写 `--input` 载荷文件；缺省 `writeGenerateInputFile`。 */
+  writeInputFile?: (corpus: DebaterCorpus | SynthesizerCorpus) => string;
+  /** 真实 spawn；测试注入假 agent-run 记录 argv。 */
+  spawnProcess?: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
+  /** 从 worker 结果读回 role 的 body。 */
+  readBody: (runId: string) => Promise<string>;
+}
+
+/**
+ * G2a §1.1 —— 生产默认 agent-run 派发（类比 tick-run 的 `spawnAgentRunWorker`）：
+ * 语料 → `--input` 载荷文件 → `buildGenerateRoleArgv` 把序列化语料放进位置参数 → spawn agent-run。
+ * 这是 `buildGenerateRoleArgv` 的**唯一生产调用点**，杜绝「语料→argv」成为死代码（评审 blocker）。
+ */
+export async function spawnGenerateRole(
+  role: string,
+  route: string,
+  corpus: DebaterCorpus | SynthesizerCorpus,
+  runtime: GenerateSpawnRuntime,
+): Promise<{ body: string }> {
+  const inputPath = runtime.writeInputFile
+    ? runtime.writeInputFile(corpus)
+    : writeGenerateInputFile(corpus);
+  const argv = buildGenerateRoleArgv({
+    agentRunBin: runtime.agentRunBin,
+    role,
+    route,
+    runId: runtime.runId,
+    inputPath,
+    corpus,
+  });
+  if (runtime.spawnProcess) {
+    await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+  }
+  return { body: await runtime.readBody(runtime.runId) };
+}
+
 /** 执行壳的依赖注入面：所有副作用（读 / spawn / lock / 回写）都从这里走。 */
 export interface GenerateDeps {
   readTermination(): Promise<TerminationState>;
@@ -232,12 +299,15 @@ export interface GenerateDeps {
   /**
    * 按 role+route 派发一个生成角色，喂入引擎侧组装好的语料，回收 { body }。
    * ⛔ 语料必须由引擎序列化后放进位置参数（§1.1），不得只靠 `--input`。
+   * 缺省（不注入）走生产路径 `spawnGenerateRole`（语料→argv→spawn），经 `spawnRuntime` 提供运行时。
    */
-  spawnRole(
+  spawnRole?(
     role: string,
     route: string,
     corpus: DebaterCorpus | SynthesizerCorpus,
   ): Promise<{ body: string }>;
+  /** 缺省 spawnRole 的生产运行时（不注入 spawnRole 时使用）。 */
+  spawnRuntime?: GenerateSpawnRuntime;
   /** anchor-check：返回缺陷数与核验率（核验率用于报告头部标注，软闸门 <90% 不阻断导出）。 */
   spawnAnchorCheck(route: string): Promise<{ defects: number; verificationRate: number }>;
   spawnExport(body: string): Promise<void>;
@@ -264,6 +334,18 @@ export async function runGenerate(
 ): Promise<void> {
   assertDistinctDebaterRoutes(cfg);
 
+  // 缺省 spawnRole = 生产 agent-run 派发（语料→argv→spawn，经 spawnGenerateRole）。
+  const spawnRole: NonNullable<GenerateDeps["spawnRole"]> =
+    deps.spawnRole ??
+    ((role, route, corpus) => {
+      if (!deps.spawnRuntime) {
+        throw new Error(
+          "GenerateDeps.spawnRole has no default: provide spawnRole or a spawnRuntime",
+        );
+      }
+      return spawnGenerateRole(role, route, corpus, deps.spawnRuntime);
+    });
+
   const term = await deps.readTermination();
   if (!decideGenerate(term)) return;
 
@@ -277,10 +359,10 @@ export async function runGenerate(
   // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
   const [advocate, opponent, judge] = cfg.debaters;
   const [advOut, oppOut] = await Promise.all([
-    deps.spawnRole(advocate.role, advocate.route, { question, evidences }),
-    deps.spawnRole(opponent.role, opponent.route, { question, evidences }),
+    spawnRole(advocate.role, advocate.route, { question, evidences }),
+    spawnRole(opponent.role, opponent.route, { question, evidences }),
   ]);
-  const judgeOut = await deps.spawnRole(judge.role, judge.route, {
+  const judgeOut = await spawnRole(judge.role, judge.route, {
     question,
     evidences,
     prior_arguments: [advOut.body, oppOut.body],
@@ -306,20 +388,19 @@ export async function runGenerate(
   const release = await deps.lockSynthesizer();
   let synthBody: string;
   try {
-    synthBody = (
-      await deps.spawnRole(cfg.synthesizer.role, cfg.synthesizer.route, synthCorpus)
-    ).body;
+    synthBody = (await spawnRole(cfg.synthesizer.role, cfg.synthesizer.route, synthCorpus)).body;
   } finally {
     await release();
   }
 
   // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
-  let anchorRate = 0;
+  // ⛔ 崩溃与真实 0% 核验率要可区分：崩溃时头部标 unavailable（评审 minor），而非伪装成 0。
+  let anchorRate: number | null = null;
   try {
     const ac = await deps.spawnAnchorCheck(cfg.anchorCheckRoute);
     anchorRate = ac.verificationRate;
   } catch {
-    // 失败不得阻断导出
+    // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
   }
 
   // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。

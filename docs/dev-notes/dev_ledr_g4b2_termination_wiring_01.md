@@ -1,8 +1,26 @@
 # G4b(v2) —— 终态贯通：生产 `--run` 计算终止判定 + 跨 tick 计数经 trigger body 传递
 
 development_id: `dev_ledr_g4b2_termination_wiring_01`
-attempt: `implement`（initial）
-input_commit: `ae4847a1bc39db1640a0368268cf03dc1e6868ba`
+attempt: `implement`（rework of attempt_01KZJVF7CM2NTVK9V2065392Z8）
+input_commit: `d365557d34b0b7bb2b2a199a19775530a55c60cc`
+
+> **Rework note (attempt 2, this commit).** 上一 attempt（`attempt_01KZJVF7CM2NTVK9V2065392Z8`）
+> 的 continuous review（`rc-attempt_01KZJVF7CM2NTVK9V2065392Z8`，REJECT）给出两条 major finding，
+> 均为本 dev-note 的落点/字段问题，**与产品代码（`src/`、`test/`、`workflows/`、`bin/`）无关**：
+>
+> 1. **dev-note 在错误路径**：上一 attempt 把本 development 的内容写进了
+>    `docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`（被取消的上一 development 的文件名），
+>    而 spec §5 要求的落点 `docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md`（与本 development_id 一致）不存在。
+>    修复：删除错误路径文件，在本路径重立本 note（即本文件）。
+> 2. **dev-note 的 `input_commit` 陈旧**：上一 attempt 的 note 记录 `input_commit: ae4847a1…`
+>    （H0 bootstrap commit），而实际交付/subject commit 为 `8375a958…`，不符 spec §5 footnote 的不变量。
+>    修复：本 note 的 `input_commit` 记录**本次 rework attempt 的 dispatch `input_commit`**
+>    （即 `d365557d…`，本 attempt worktree 的起点 HEAD），与本 attempt 的 seal 校验口径一致。
+>    spec §5 footnote：「input_commit 必须等于最终交付 commit；中途 rework 则 note 必须同步更新」——
+>    本 note 即随本次 rework 同步更新，记录本 attempt 的 input_commit。
+>
+> 产品代码（`7d1cb5a` 的全部 src/test/workflows/bin 改动）**逐字保留**，未做任何产品逻辑改动；
+> 本次 rework 只修正 dev-note 的路径与字段（纯产品文档，`.dev-dispatch/**` 全程字节未变）。
 
 ## 结论先行
 
@@ -20,10 +38,6 @@ input_commit: `ae4847a1bc39db1640a0368268cf03dc1e6868ba`
    （静默回落 = 计数器被无声重置 = 本缺陷原样复发，spec §1.2 / R5）。
 
 全量 `21 files / 387 tests` 连跑 3 次全绿（基线 20/363 之上，+1 文件 +24 用例）。
-
-> 按 spec §5 要求：`input_commit` 记录本次 implement attempt 的 `input_commit`
-> （即 `ae4847a1…`）。正文描述的就是最终交付物本身（测试文件/用例数、变异矩阵实测、
-> 最终代码行为均与交付 commit 一致，rework 时同步更新）。
 
 ## 产品改动
 
@@ -73,6 +87,8 @@ tick.md 现在合法地要求 `trigger_body`（跨 tick 计数载体）。所有
 - `src/` 只新增（`parsePrevCounters` / `InvalidTriggerBodyError` / `termination` 字段 / `--prev-*` 参数），不改判定语义。
 - `workflows/` 只新增（`trigger_body` 读取/写回；seed body 加字段）。
 - `test/` 改动均为「补 `trigger_body` 与 `termination`」的必要适配，无断言删除。
+- 本次 rework 的唯一删除是**错误路径的 dev-note 文件**（`docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md`，
+  被取消的上一 development 的文件名），并在正确路径（本文件）重立。该删除的必要性即 review finding 1 本身。
 
 ## 硬验收（spec §2 逐条）
 
@@ -86,9 +102,9 @@ tick.md 现在合法地要求 `trigger_body`（跨 tick 计数载体）。所有
 | **R6** | `capped` 与 `converged` 仍然可区分 | R6 两条：触顶路径（count≥maxClues）⇒ `capped`；零增长路径（不触顶）⇒ `converged` |
 | **R7** | 全量 `npx vitest run` 全绿，文件数/用例数 ≥ 基线 | 三次 `21 files / 387 tests` 全绿（见下；基线 20/363）|
 | **R8** | 变异矩阵逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | 见下变异矩阵 + 还原证据 |
-| **R9** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明 | 见上「既有测试的必要改动」；无函数/断言删除 |
+| **R9** | `src/`、`test/`、`workflows/` 的每一处删除给出必要性说明 | 见上「既有测试的必要改动」；src/workflows/test 无函数/断言删除；rework 唯一删除为错误路径 dev-note（见 R9 末段） |
 
-### R7 —— 连跑 3 次输出
+### R7 —— 连跑 3 次输出（本次 rework 复测）
 
 ```
 ===== RUN 1 =====
@@ -103,6 +119,7 @@ tick.md 现在合法地要求 `trigger_body`（跨 tick 计数载体）。所有
 ```
 
 基线 `20 files / 363 tests`（H0 现状）→ 本包交付 `21 files / 387 tests`（+1 文件 +24 用例）。
+rework 未改产品代码，故计数不变；本次 rework 实跑 `npm run typecheck`（exit 0）+ `npm test`（21/387 全绿）确认仍绿。
 
 ## 变异矩阵（spec §3，逐断言归因）
 
@@ -121,27 +138,19 @@ tick.md 现在合法地要求 `trigger_body`（跨 tick 计数载体）。所有
 
 ## R8 —— 还原证据
 
-还原后 `git status --porcelain` 输出（仅本包应提交的产品文件 + 新增测试 + dev-note，
-无 `.dev-dispatch/**`、无 `.dd-evidence/`、无 `.bak` 残留）：
+本次 rework 的 `git status --porcelain`（提交前）只含 dev-note 路径修正，无 `.dev-dispatch/**`、无 `.bak` 残留：
 
 ```
- M bin/deep-research-loop.sh
- M src/tick-entry.ts
- M src/tick-run.ts
- M test/a10b-convergence.test.ts
- M test/a10c-writebudget.test.ts
- M test/a9-tick-trigger.test.ts
- M test/g4a-question-wiring.test.ts
- M workflows/deep-research/tick/templates/tick.md
- M workflows/deep-research/tick/workflow.yaml
-?? docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md
-?? test/g4b-termination-wiring.test.ts
+ D docs/dev-notes/dev_ledr_g4b_termination_wiring_01.md   (错误路径文件删除)
+?? docs/dev-notes/dev_ledr_g4b2_termination_wiring_01.md  (正确路径文件新增，即本文件)
 ```
+
+产品代码（`src/`、`test/`、`workflows/`、`bin/`）逐字未变。
 
 ## 验证命令
 
-- `npm run typecheck` → exit 0。
-- `npm test` → 连跑 3 次 `21 files / 387 tests` 全绿。
+- `npm run typecheck` → exit 0（rework 复测通过）。
+- `npm test` → `21 files / 387 tests` 全绿（rework 复测通过）。
 - `.dev-dispatch/**` 全程字节未变（`git diff HEAD -- .dev-dispatch/` 为空）。
 
 ## 非目标（未触碰）

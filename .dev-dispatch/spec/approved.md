@@ -1,108 +1,98 @@
-# D2 —— 把部署 profile 换成**真实且已核验**的一组，并修掉一句不实注释
+# G5 —— triage 的结果读回查的是 spawn **之前**的快照：33 次真实裁定被全部丢弃
 
-> 派发方：`line-deep-research`。前置：G4e 已合入 main `e5a628b`。
-
----
-
-## ⛔ 先读：前几包实付的学费
-
-- **A. 测试必须驱动生产**：`assembleGenerateDeps` 是导出函数，用例可直接调它拿生产 deps。
-  ⛔ **源码字符串匹配（`expect(source).toContain(...)` / `readFileSync(测试文件)`）一律不构成证据。**
-- **B. `workflow.yaml` 新增的可选 pipeline input 必须带 `?`**（既有写法 `"{{evidence_channel?}}"`）；
-  缺 `?` 会让值为空时按必填渲染、tick 节点报错，**而 loop 照报 `drained` 且 exit 0**。
-- **C. 验收须在相关 env 均未设置的干净环境下跑全量**，并**贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段）。
-- **D. dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（dd 交给你的那个，**不是 H0 提交**）。
-  ⛔ 不要为对齐 hash 做额外提交。
-> **这是 Phase 6 开跑前的最后一块前置**：当前 `--profile production` 会**在不存在的 channel 上跑一个错的研究**。
+> 派发方：`line-deep-research`。前置：D2 已合入 main `4312cae`。
+> **这是 Phase 6 真跑当场抓到的生产缺陷，不是推断。** 证据在 §0，全部取自生产 bus。
 
 ---
 
-## 0　现状：production profile 三处都不对
+## 0　生产实况（2026-08-09 19:35Z–20:35Z，真跑一小时）
 
-`profiles/deploy/production.env` 当前内容与实测对照：
+研究「agent harness」在生产 bus 上跑了约一小时，**板面在第一次 triage 之后就永久停滞**：
 
-| 行 | 现值 | 实测 |
-|---|---|---|
-| `TICK_CHANNEL` | `research:v1-deep-research.index` | ⛔ **bus 上不存在**（派发方实测 `GET /v1/channels/research:v1-deep-research.index/messages` ⇒ **404 NOT_FOUND**） |
-| `EVIDENCE_CHANNEL` | `research:v1-deep-research.evidence` | ⛔ **同样不存在** |
-| `RESEARCH_QUESTION` | `光伏并网系统的谐波特性与治理策略研究` | ⛔ **不是拍板的题目**。golden-order 2026-08-09 02:20 拍板题目是 **「agent harness」**。这是 G4a(v2) 按 spec 允许填的**占位值** |
-
-而该文件**自己的注释**写着：
-
-> `# ⛔ 以下 bus channel 必须是**已核实存在**的真实 channel（bus append-only 无 DELETE，写错不可回退）。`
-
-⇒ **这句「已核实存在」是一句未兑现的断言** —— 核验没有发生过。
-
-> ### ⛔ 判据：**配置文件里的一句「已核实」，会让后来者停止核验。**
-> 这与本线记过的「报告一个检查的结论时，措辞的强度必须等于检查的强度」是同一条，
-> 只是发生在配置注释里 —— 而配置正是最容易被照单全收的地方。
-
----
-
-## 1　派发方已完成的核验（**你无法自己复核，这是事实输入**）
-
-⚠️ **dd workspace 的 `env_allowlist` 只有 `PATH` / `HOME`，没有 bus token** ⇒
-**你连不上 agent-bus，无法自己验证 channel 是否存在。**
-
-派发方于 **2026-08-09 07:51Z** 在生产 bus 上**显式创建并复核**了这一对 channel：
-
-```
-POST /v1/channels {"channel_id":"research:agent-harness.index",    …}  → 200   （2026-08-09 07:51Z）
-POST /v1/channels {"channel_id":"research:agent-harness.evidence", …}  → 200   （2026-08-09 07:51Z）
-POST /v1/channels {"channel_id":"research:agent-harness.docs",     …}  → 200   （2026-08-09 18:31Z）
-复核（2026-08-09 18:31Z，三条同时）：
-  GET /v1/channels/research:agent-harness.index/messages     → 200 head_seq=0 msgs=0
-  GET /v1/channels/research:agent-harness.evidence/messages  → 200 head_seq=0 msgs=0
-  GET /v1/channels/research:agent-harness.docs/messages      → 200 head_seq=0 msgs=0
-```
-
-⇒ **这两个名字是已核验的事实输入，照抄即可。**
-⛔ **不得自己发明 channel 名**；⛔ **不得尝试联网核验**（连不上，会白耗一轮）；
-⛔ **不得在注释里写任何你没有亲自做过的核验**（见 §0 判据）。
-
----
-
-## 2　要做什么
-
-### 2.1 `production.env` → `agent-harness.env`（**用 `git mv` 保历史**）
-
-「**每研究一对 channel**」（plan §7-1 拍板）意味着**不存在一个通用的 `production` profile** ——
-profile 是**按研究**的。⇒ 把 `production.env` 重命名为 `agent-harness.env` 并改成真实值：
-
-| 键 | 值 |
+| 观察 | 数值 |
 |---|---|
-| `TICK_CHANNEL` | `research:agent-harness.index` |
-| `EVIDENCE_CHANNEL` | `research:agent-harness.evidence` |
-| `RESEARCH_QUESTION` | `agent harness`（**拍板题目，逐字**） |
-| `ALLOWED_ROOT` | 保持现值 `/data/code/self/agent-runtime` |
-| `MAX_WRITES` | 保持现值 `96` |
-| `EXPORT_ROOT` | 保持现值 `/data/vault`（⛔ 必须是 vault 根、不含 `DeepThought` 段，否则双重嵌套 —— 该注释保留） |
-| **`DOC_CHANNEL`**（G4c 新增，本包首次赋真值） | `research:agent-harness.docs`（**已核验存在**，见 §1） |
-| **`ANCHOR_CHECK_BIN`**（G4d 新增，本包首次赋真值） | `/data/code/self/katana/plugins/deep-research/skills/deep-research/loop-orchestration/tools/anchor-check.py`（⛔ 绝对路径；派发方 2026-08-09 实测该文件存在、240 行、可执行位已置） |
+| `research:agent-harness.index` | 32 条消息 / 22 个线索实体：**5 explored、17 proposed** |
+| `research:agent-harness.evidence` | 65 条真实证据（收集段工作正常） |
+| 板面停滞时长 | ≥ 25 分钟内 `head_seq` **一动不动**（32 / 65 两次采样完全相同） |
+| 驱动轮次 | 19+ 轮，每轮 `loop-events.jsonl` 均 **`errors: 0`**、`drain.json` 均 `reason: drained`、脚本 **exit 0** |
 
-> ⚠️ **`RESEARCH_ORIGIN` 不要在 profile 里写死**：`bin/deep-research-loop.sh` 已由 `RESEARCH_QUESTION` 确定性派生
-> （`dr-$(sha256sum | cut -c1-16)`）。写死会让同题目的两次研究撞上同一 origin。
+**手工单跑一次 tick 的输出（逐字）**：
 
-### 2.2 ⛔ 修掉那句不实注释
+```json
+"triageReports": [ { "runId": "", "budgetSkipped": false, "invalidActions": 0,
+                     "outOfScopeDropped": 0, "casCount": 0, "casResults": [] } ],
+"writes": 0, "spawns": [],
+"termination": { "state": null, "coverage": 5, "zeroGrowthRounds": 0, "capHit": false }
+```
 
-把「以下 bus channel 必须是**已核实存在**的真实 channel」改成**与事实相符**的表述：
-写明这一对 channel 由派发方于 2026-08-09 07:51Z 创建并复核（head_seq=0），
-以及**后续换研究时必须重新核验**（不是「一次核验、永远为真」）。
+**而 `board:agent-runs` 上（`after_seq=7500`，⚠️ 不带 `after_seq` 只会返回最早 100 条）**：
 
-### 2.3 `local.env` 一并对齐
+```
+kind 分布: {'dr-triage.result.v1': 33, 'worker.result.v1': 5,
+            'agent.run.started.v2': 41, 'agent.run.exited.v2': 38, …}
+dr-triage.result.v1 样本: run_id=db677302-… decisions=17
+                          run_id=f8fbcdc0-… decisions=17
+                          run_id=df6d7781-… decisions=17
+```
 
-`local.env` 的 `TICK_CHANNEL=research:v1-deep-research.local.index` 同样**未经核验**。
-⇒ 要么改成一个明确标注「本地/未核验、真跑前须先建」的值，要么去掉该键让它响亮失败。
-**实现方二选一，但⛔ 不得留下一个「看起来像已配置好」的未核验值。**
+⇒ **triage agent 一直在正确工作**：被派出、读板、对那 17 条 proposed 逐条做出 keep/drop 裁定、发布到板上。
+⇒ **引擎从不读取它们。33 次真实裁定全部被丢弃。** 17 条线索永远停在 `proposed`，永不可被 worker 认领。
 
-### 2.4 旧名字必须从仓里消失
+> ### ⛔ 这是本仓反复出现的那个形态的最完整标本：
+> **工作发生了 → 结果发布了 → 消费方读了一份陈旧快照 → 零效果 → 全链路报告成功。**
+> `errors: 0`、`drained`、`exit 0`、`casCount: 0` —— **没有任何一处是红的。**
 
-`grep -rn "research:v1-deep-research" profiles/ bin/ src/ test/ docs/` ⇒ **零命中**。
+---
 
-### 2.5 `docs/deploy.md` 同步
+## 1　根因（已定位到行号，非推断）
 
-profile 名从 `production` 改为 `agent-harness`，示例命令一并更新；
-补一节「**换研究时怎么做**」：新建一对 channel（**由部署方在 bus 上显式创建**，⛔ 不由代码自动创建）→ 新增一个 `<topic>.env` → 用 `--profile <topic>` 起。
+`src/tick-run.ts`：
+
+```ts
+:1449   const runsMessages = await readChannelMessages(runsChannelId);   // ← spawn 之前读的快照
+...
+:1529             runId: randomUUID(),                                   // ← spawn 时才生成
+:1541   readResult: async (runId) => findTriageResult(runId, runsMessages) ?? [],
+```
+
+`runsMessages` 是**普通数组**，读取后不重读、不变更。而 `runId` 是 spawn 时新生成的
+⇒ `findTriageResult(runId, runsMessages)` **在数学上不可能命中**，恒返回 `null` ⇒ `?? []` ⇒ 零 CAS。
+
+### ⛔ 同一条缺陷已在生成段被修过，triage 没享受到
+
+G4c(v2) 的 final review 对**生成段**记过逐字相同的判定：
+「`runsMessages` 是 spawn **之前**读的快照…`runId` 是新生成的 `randomUUID()`…该 run id 不可能出现在那个 pre-spawn 数组里」。
+G4c(v2) 已用 **`readGenerateResult`** 修好（见 §2）。**triage 这条路径由更早的 G2b 交付，未随之更新。**
+
+---
+
+## 2　⛔ 照抄已验证正确的形状（不要重新发明）
+
+`src/tick-inspect.ts` 里 G4c(v2) 交付并已合入的正确形状：
+
+```ts
+export async function readGenerateResult(
+  runId: string, channelId = "board:agent-runs",
+): Promise<{ body: string } | null> {
+  const messages = await readChannelMessages(channelId);   // ⛔ 每次调用都重新读
+  return findGenerateResult(runId, messages);
+}
+```
+
+配套的调用侧（`tick-run.ts` 的生成段 `readBody`）带**重试等待**：spawn 是异步的，
+结果不会在 spawn 返回的瞬间就在 channel 上（上一包用 30 次 × 1s）。
+
+**本包要做的**：
+1. 加 `readTriageResult(runId, channelId = "board:agent-runs")` —— **每次调用重新分页读 channel**，
+   过滤 `kind === "dr-triage.result.v1"` 且 `payload.run_id` 匹配（复用既有 `findTriageResult` 做纯匹配）。
+2. 生产 `triageSpawnRuntime.readResult` 改用它，并加**重试等待**（与生成段同量级；实现方可调具体次数/间隔，
+   但必须在 dev-note 写明取值与理由）。
+3. ⛔ **等待耗尽仍无结果 ⇒ 必须响亮**：不得再返回 `[]` 当成「triage 判了 0 条」。
+   **空结果与「读不到结果」是两件事**，正是本缺陷得以静默一小时的原因。
+   响亮形态由实现方定（抛错或在 `triageReport` 里显式标记并使该 tick 非零退出），但**必须在日志/输出里点名 runId**。
+4. **`triageReport.runId` 必须是真实 runId**，不得是空串（实测为 `""`，使「结果被丢弃」在输出里不可诊断）。
+
+⛔ 不要改 `applyTriageBatch` 的校验/CAS 语义（值域校验、不做半批），本包只修**结果读回**这一环。
 
 ---
 
@@ -110,17 +100,15 @@ profile 名从 `production` 改为 `agent-harness`，示例命令一并更新；
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **Z1** | `profiles/deploy/agent-harness.env` 存在且六个键取值**逐字**等于 §2.1 的表 | 读文件到行号 |
-| **Z2** | ⛔ **`grep -rn "research:v1-deep-research" profiles/ bin/ src/ test/ docs/` 零命中** | grep |
-| **Z3** | ⛔ **`RESEARCH_QUESTION` 逐字等于 `agent harness`**（拍板题目），不得是占位或改写 | 断言字面相等 |
-| **Z4** | ⛔ **仓内任何 profile 都不再声称一个未做过的核验**：`grep -rn "已核实存在" profiles/` 若仍命中，其上下文必须是 §2.2 那种「谁、何时、怎么验的」具体表述 | 读到行号并逐句核 |
-| **Z5** | `--profile agent-harness --dry-run` 在**只设 `DEPLOY_PROFILE`** 的子环境下，渲染出的 tick input 五项（`tick_channel`/`evidence_channel`/`allowed_root`/`max_writes`/`research_question`）**全部等于 profile 值** | 用例须**自证子环境无那些 env**（照 D1 的 E3 写法） |
-| **Z6** | ⛔ **`local.env` 不留未核验的「看起来已配好」的值**（§2.3 二选一，并在 dev-note 说明选了哪个、为什么） | 读文件 + 说明 |
-| **Z7** | `git mv` 保历史：`git log --follow profiles/deploy/agent-harness.env` 能看到 `production.env` 时期的提交 | 贴输出 |
-| **Z8** | `docs/deploy.md` 的 profile 名与示例已更新，且有「换研究时怎么做」一节，其中**建 channel 是部署方的显式动作**（⛔ 不由代码自动创建） | 读到行号 |
-| **Z9** | 全量 `npx vitest run` 全绿，文件数/用例数不少于**基线（以 G4e 合入后的 main 实测为准，自己先跑一次记下来）**。⚠️ `test/d1-deploy-config.test.ts` 等用例硬编码了 `DEPLOY_PROFILE = "production"`，**必须随之更新**——这是本包在结构上迫使的改动，属必要 | 贴输出 + 逐处说明 |
-| **Z10** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **Z11** | 每处删除给出必要性说明 | — |
+| **P1** | ⭐ **判别性**：假 bus 在 spawn **之后**才出现该 runId 的 `dr-triage.result.v1` ⇒ `readResult` **仍能读到**并产生 CAS。⛔ 用 spawn 前的快照必然读不到 —— 这是本包的存在理由 | 驱动**生产组装**出的 triage runtime（见 P6），断言 `casCount === 决策条数` |
+| **P2** | ⛔ **读不到 ⇒ 响亮**：重试耗尽仍无结果 ⇒ 不得返回 `[]` 静默通过；错误/标记里**点名 runId** | 正反两例 |
+| **P3** | ⛔ **空决策 ≠ 读不到**：agent 真的返回 `{"decisions":[]}` ⇒ 走正常路径（0 条 CAS，不报错） | 判别性用例；与 P2 必须可区分 |
+| **P4** | `triageReport.runId` 等于实际 spawn 的 runId，非空串 | 断言相等 |
+| **P5** | `applyTriageBatch` 的既有语义未被削弱（非法 action 响亮拒绝、不做半批、越界丢弃计数） | 既有断言保留且仍有效（读到行号） |
+| **P6** | ⛔ **断言必须打在生产组装出的 deps 上**：`runChannelWrite` 在 `opts.spawnTriage` / `opts.triageSpawnRuntime` 存在时走注入分支、**跳过生产组装**。⛔ 自建 runtime 注入的用例不算数 | 照 G4c(v2)/G4d(v2) 的做法（`assembleGenerateDeps` 已导出的同款思路）；⛔ **源码字符串匹配一律不构成证据** |
+| **P7** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN`/`DOC_CHANNEL`/`RESEARCH_ORIGIN`/`EXPORT_ROOT` 均未设置）。基线：main `4312cae` 实测 **25 files / 458 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出**（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
+| **P8** | 变异矩阵（§4）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **P9** | 每处删除给出必要性说明 | — |
 
 ---
 
@@ -128,35 +116,42 @@ profile 名从 `production` 改为 `agent-harness`，示例命令一并更新；
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **V1** | 把 `RESEARCH_QUESTION` 改回占位题目 | **Z3 必须挂** |
-| **V2** | 把 `TICK_CHANNEL` 改回 `research:v1-deep-research.index` | **Z2 + Z5 必须挂** |
-| **V3** | 让 profile 加载不再把 `research_question` 送进渲染（只留在文件里） | **Z5 必须挂**（这条验的是「值到达渲染」，不是「文件里有」） |
+| **Q1** | `readResult` 改回 `findTriageResult(runId, runsMessages)`（= 回到改动前的 pre-spawn 快照） | **P1 必须挂**；⛔ 杀不掉即判 P1 零功率、必须重写 |
+| **Q2** | 重试耗尽时返回 `[]` 而非响亮失败 | **P2 的失败侧必须挂** |
+| **Q3** | 让真实的 `{"decisions":[]}` 也走响亮失败路径 | **P3 必须挂**（空结果被误判成读不到） |
+| **Q4** | `triageReport.runId` 写死空串 | **P4 必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
 
 ---
 
-## 5　显式不做
+## 5　⛔ 前几包实付的学费（直接照用）
+
+1. **测试必须驱动生产组装**：注入 deps 会跳过生产装配分支，这一形态已在 G4c/G4d 连挂五轮。
+2. ⛔ **源码字符串匹配（`expect(source).toContain(...)` / `readFileSync(测试文件)`）一律不构成证据。**
+3. **`workflow.yaml` 新增的可选 pipeline input 必须带 `?`**（本包大概率不涉及，涉及则遵守）。
+4. **dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit**，**不是 H0 提交**；
+   ⛔ 不要为对齐 hash 做额外提交；⛔ 不得用「基线计数方式差异」解释测试数缺口。
+5. **变异矩阵各行必须是实测**，不得写预测；若某行杀不掉，如实写「未被杀」并说明，⛔ 不得编造失败现象。
+
+---
+
+## 6　显式不做
 
 | 不做 | 理由 |
 |---|---|
-| **创建任何 bus channel** | ⛔ **不可回退的部署动作**，已由派发方完成（§1）。代码/测试**一律不得**创建 channel |
-| 向真实 bus 播种或真跑 | 归 Phase 6，由派发方做 |
-| 注册任何 bus 协议 | 不可逆，走公示流程 |
-| 改收集段/生成段/播种的任何逻辑 | 已合入；本包只动部署配置与文档 |
-| 改 `agent-runtime` / katana | 不同仓 |
+| 改 `applyTriageBatch` 的校验/CAS 语义 | 已交付且被断言保护；本包只修结果读回 |
+| 改生成段的 `readGenerateResult` | 已修好，本包照抄其形状即可 |
+| 改 worker 收割路径 | 生产实测正常（65 条证据、5 条 `worker.result.v1` 被正确收割） |
+| 改 `profiles/deploy/*.env` | 归部署方 |
+| 注册任何 bus 协议 | 已由派发方于 2026-08-09 19:00Z 完成（`dr-triage.result.v1` 已注册，生产实测可发布） |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
-## 6　交付物落点
+## 7　交付物落点
 
-- 配置：`profiles/deploy/agent-harness.env`（由 `production.env` `git mv` 而来）、`profiles/deploy/local.env`
-- 文档：`docs/deploy.md`
-- 测试：`test/d1-deploy-config.test.ts` 等的 profile 名更新 + 新增 Z1–Z6 的用例（可新建 `test/d2-profile.test.ts`）
-- 证据：`docs/dev-notes/dev_ledr_d2_profile_01.md`（Z1–Z11 逐条 + §4 变异三行 + 还原证据 + §2.3 的选择说明）
-
-> **dev-note 的 `input_commit` 记本次 implement attempt 的 input_commit**（该字段本来的语义）。
-> 真正的要求是**正文描述交付物本身**；若中途 rework 改了实现，正文数字与结论同步更新。
-> ⛔ **不要为对齐 commit hash 做额外提交。**
+- 实现：`src/tick-inspect.ts`（`readTriageResult`）、`src/tick-run.ts`（生产 `readResult` + 重试 + 响亮失败 + 真实 runId）
+- 测试：`test/g5-triage-read.test.ts`（P1–P6）
+- 证据：`docs/dev-notes/dev_ledr_g5_triage_read_01.md`（P1–P9 逐条 + §4 变异四行**实测** + 还原证据 + 你采用的重试次数/间隔与理由）

@@ -44,7 +44,7 @@ if [ -n "$PROFILE" ]; then
     echo "[deep-research-loop] unknown deploy profile '$PROFILE': $PROFILE_FILE not found. Available: $(ls "$PLUGIN_ROOT/profiles/deploy" 2>/dev/null | sed 's/\.env$//' | tr '\n' ' ')" >&2
     exit 3
   fi
-  while IFS= read -r _line; do
+  while IFS= read -r _line || [ -n "$_line" ]; do
     case "$_line" in
       ''|\#*) continue ;;
       *=*)

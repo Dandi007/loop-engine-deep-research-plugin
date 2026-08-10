@@ -133,7 +133,7 @@ describe("G13 W2: anchor-check in reuse branch runs normally", () => {
 
     expect(deps.spawnAnchorCheck).toHaveBeenCalledTimes(1);
     expect(writeAnchorCheckJson).toHaveBeenCalledTimes(1);
-    const json = writeAnchorCheckJson.mock.calls[0][0] as string;
+    const json = (writeAnchorCheckJson as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     const parsed = JSON.parse(json);
     expect(parsed.total).toBe(100);
     expect(parsed.current_verified_hit).toBe(85);
@@ -221,12 +221,11 @@ describe("G13 W4: no docs for origin → normal behavior", () => {
 });
 
 describe("G13 W5: only filter by origin — different origin's report is not reused", () => {
-  it("other origin's report does not prevent normal spawns", async () => {
+  it("other origin's report in readDocs response does not prevent normal spawns", async () => {
     const deps = baseDeps({
-      readDocs: async (origin: string) => {
-        if (origin === "test-origin") return [];
-        return [makeExistingReport("other report body", "other-origin", "other-msg-99")];
-      },
+      readDocs: async () => [
+        makeExistingReport("other report body", "other-origin", "other-msg-99"),
+      ],
     });
 
     await runGenerate(deps, DEFAULT_GENERATE_CONFIG);

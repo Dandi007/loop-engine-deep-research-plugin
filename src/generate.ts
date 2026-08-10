@@ -415,8 +415,8 @@ export async function runGenerate(
 
   if (deps.readDocs) {
     const existingDocs = await deps.readDocs(origin);
-    const existingArgs = existingDocs.filter((d) => d.doc.doc_kind === "argument");
-    const existingReport = existingDocs.find((d) => d.doc.doc_kind === "report");
+    const existingArgs = existingDocs.filter((d) => d.doc.doc_kind === "argument" && d.doc.origin === origin);
+    const existingReport = existingDocs.find((d) => d.doc.doc_kind === "report" && d.doc.origin === origin);
 
     if (existingReport) {
       isReuse = true;
@@ -476,27 +476,16 @@ export async function runGenerate(
   // ⛔ ALLOWED_ROOT 未配置 ⇒ unavailable 且点名 no-repo-root（须与崩溃可区分）。
   let anchorRate: number | null = null;
   let anchorTail: string | undefined;
-  let anchorJsonWritten = true;
   let anchorCheckJson: string | null = null;
+  let anchorCheckError: unknown = null;
   try {
     const ac = await deps.spawnAnchorCheck();
     anchorCheckJson = JSON.stringify(ac);
-    if (ac.total === 0) {
-      // total === 0 ⇒ unavailable (V3)
-    } else if (!ac.sums_ok) {
-      // sums_ok === false ⇒ unavailable + name it (V4)
-      anchorTail = "sums_ok=false";
-    } else {
-      anchorRate = (ac.current_verified_hit / ac.total) * 100;
-    }
   } catch (e) {
-    if (e instanceof MissingAnchorCheckRepoRootError) {
-      anchorTail = "no-repo-root";
-    }
-    // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
+    anchorCheckError = e;
   }
 
-  // anchor-check JSON 落盘（软闸门：失败不阻断导出）
+  let anchorJsonWritten = true;
   if (anchorCheckJson !== null && deps.writeAnchorCheckJson) {
     try {
       await deps.writeAnchorCheckJson(anchorCheckJson);
@@ -505,11 +494,23 @@ export async function runGenerate(
     }
   }
 
-  if (!anchorJsonWritten) {
-    anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
-  }
-
   if (!isReuse) {
+    if (anchorCheckJson !== null) {
+      const ac = JSON.parse(anchorCheckJson) as AnchorCheckResult;
+      if (ac.total === 0) {
+      } else if (!ac.sums_ok) {
+        anchorTail = "sums_ok=false";
+      } else {
+        anchorRate = (ac.current_verified_hit / ac.total) * 100;
+      }
+    } else if (anchorCheckError instanceof MissingAnchorCheckRepoRootError) {
+      anchorTail = "no-repo-root";
+    }
+
+    if (!anchorJsonWritten) {
+      anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
+    }
+
     // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
     const reportHead = renderReportHead(marker, anchorRate, anchorTail);
     reportBody = reportHead + synthBody;

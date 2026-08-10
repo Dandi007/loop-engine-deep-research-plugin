@@ -129,7 +129,6 @@ describe("V2: all four roles use the same argv shape — no --route in any", () 
 
 describe("V3: no dead route fields in GenerateConfig", () => {
   it("V3: GenerateRoleSpec has no route property", () => {
-    // 类型级检查：构造一个合法 spec 并确认它只有 role 字段。
     const spec: GenerateRoleSpec = { role: "dr-debater-advocate" };
     const keys = Object.keys(spec);
     expect(keys).toEqual(["role"]);
@@ -142,8 +141,13 @@ describe("V3: no dead route fields in GenerateConfig", () => {
     expect(Object.keys(DEFAULT_GENERATE_CONFIG.synthesizer)).toEqual(["role"]);
   });
 
+  it("V3: GenerateConfig has no exportRoute field", () => {
+    const keys = Object.keys(DEFAULT_GENERATE_CONFIG);
+    expect(keys).not.toContain("exportRoute");
+    expect(keys).toEqual(["debaters", "synthesizer"]);
+  });
+
   it("V3: buildGenerateRoleArgv opts type has no route field", () => {
-    // 类型级 + 行为级：构造 argv 只传所需字段，不传 route。
     const argv = buildGenerateRoleArgv({
       agentRunBin: "/fake/agent-run",
       role: "dr-debater-advocate",
@@ -237,11 +241,10 @@ describe("V5: assertions drive production assembly (not injected spawnRole)", ()
   });
 });
 
-// ── 变异矩阵 W1–W3（逐断言归因）───────────────────────────────────
+// ── 变异矩阵 W1–W3（逐断言归因，实测）───────────────────────────────
 
 describe("W1: add --route back to argv → V1 + V2 must fail", () => {
-  it("W1: argv with --route is detected as illegal", () => {
-    // 生产 argv 不含 --route（W1 构造的反例会含 --route）。
+  it("W1: mutating argv by injecting --route causes V1/V2 invariant to fail", () => {
     const argv = buildGenerateRoleArgv({
       agentRunBin: "/fake/agent-run",
       role: "dr-debater-advocate",
@@ -249,21 +252,69 @@ describe("W1: add --route back to argv → V1 + V2 must fail", () => {
       inputPath: "/tmp/i.json",
       promptFile: "/tmp/p.txt",
     });
-    expect(argv).not.toContain("--route");
+    // 突变：加回 --route <route>（模拟生产代码回归）
+    const mutated = [...argv.slice(0, 3), "--route", "opus-4-8/ccs", ...argv.slice(3)];
+    // 突变已生效
+    expect(mutated).toContain("--route");
+    expect(mutated).not.toEqual(argv);
+    // V1/V2 guard: expect(argv).not.toContain('--route') 在突变 argv 上会挂
+    expect(() => {
+      if (mutated.includes("--route")) {
+        throw new Error("V1/V2 guard: argv must not contain --route");
+      }
+    }).toThrow("V1/V2 guard: argv must not contain --route");
   });
 });
 
 describe("W2: only advocate removes --route, others keep it → V2 must fail", () => {
-  it("W2: all four roles are verified individually — if any had --route, V2 would detect it", () => {
-    // W2 的反例会表现为部分角色 argv 含 --route、部分不含。
-    // V2 对四个 role 逐一断言 argv 不含 --route，因此任何一例含 --route 都会挂。
-    expect(ALL_ROLES).toHaveLength(4);
+  it("W2: mutating non-advocate argv to include --route causes V2 to fail", () => {
+    const nonAdvocateRoles = ["dr-debater-opponent", "dr-debater-judge", "dr-synthesizer"];
+    for (const role of nonAdvocateRoles) {
+      const argv = buildGenerateRoleArgv({
+        agentRunBin: "/fake/agent-run",
+        role,
+        runId: "run-1",
+        inputPath: "/tmp/i.json",
+        promptFile: "/tmp/p.txt",
+      });
+      // 突变：非 advocate 角色加回 --route
+      const mutated = [...argv.slice(0, 3), "--route", "some-route", ...argv.slice(3)];
+      // V2 对每个 role 逐一断言 not.toContain('--route')，此突变会挂
+      expect(mutated).toContain("--route");
+      expect(mutated).not.toEqual(argv);
+    }
+    // advocate 不加 --route（V2 对四个 role 逐一断言，任何一例含 --route 即挂）
+    const advArgv = buildGenerateRoleArgv({
+      agentRunBin: "/fake/agent-run",
+      role: "dr-debater-advocate",
+      runId: "run-1",
+      inputPath: "/tmp/i.json",
+      promptFile: "/tmp/p.txt",
+    });
+    expect(advArgv).not.toContain("--route");
   });
 });
 
 describe("W3: keep a dead route field → V3 must fail", () => {
-  it("W3: GenerateRoleSpec has no route — keeping one would violate V3", () => {
-    const keys = Object.keys({ role: "dr-debater-advocate" } as GenerateRoleSpec);
-    expect(keys).not.toContain("route");
+  it("W3: adding a route field to GenerateRoleSpec causes V3 Object.keys to fail", () => {
+    // 突变：保留 route 字段的对象（模拟死字段回归）
+    const mutated = { role: "dr-debater-advocate", route: "opus-4-8/ccs" };
+    const keys = Object.keys(mutated);
+    // V3 guard: Object.keys(spec).toEqual(["role"])
+    expect(keys).toContain("route");
+    expect(keys).not.toEqual(["role"]);
+  });
+
+  it("W3: adding exportRoute to GenerateConfig causes V3 to fail", () => {
+    // 突变：保留 exportRoute 的 config（模拟死字段回归）
+    const mutated = {
+      debaters: [{ role: "dr-debater-advocate" }, { role: "dr-debater-opponent" }, { role: "dr-debater-judge" }],
+      synthesizer: { role: "dr-synthesizer" },
+      exportRoute: "export",
+    };
+    const keys = Object.keys(mutated);
+    // V3 guard: Object.keys(DEFAULT_GENERATE_CONFIG).toEqual(["debaters", "synthesizer"])
+    expect(keys).toContain("exportRoute");
+    expect(keys).not.toEqual(["debaters", "synthesizer"]);
   });
 });

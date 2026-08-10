@@ -2,7 +2,7 @@
  * S4 —— 生成阶段编排 + 单例 lock + 终态标记（G2a 接线版 / G7 --prompt-file 投递版）
  *
  * 终止判定（decideTermination）给出非空终态之后，编排生成阶段（spec §1）：
- *   debater（立论 / 反方 / 裁判，不同 route，advocate/opponent 并行 → judge 带 prior_arguments）
+ *   debater（立论 / 反方 / 裁判，advocate/opponent 并行 → judge 带 prior_arguments）
  *     → synthesizer（⛔ 单例 lock，任一时刻并发 = 1，绝不跳过）
  *       → anchor-check（确定性节点，跑但不阻断导出）
  *         → 导出（确定性节点，最后）
@@ -33,12 +33,10 @@ export interface GenerateRoleSpec {
   role: string;
 }
 
-/** 生成阶段参数（spec §6）：三条 debater route 必须互不相同，不得硬编码。 */
+/** 生成阶段参数。档位真相已移交 role YAML（见 GenerateRoleSpec 的 JSDoc 表）。 */
 export interface GenerateConfig {
-  /** debater 三立场（立论 / 反方 / 裁判）的 role+route，route 互不相同。 */
   debaters: readonly [GenerateRoleSpec, GenerateRoleSpec, GenerateRoleSpec];
   synthesizer: GenerateRoleSpec;
-  exportRoute: string;
 }
 
 export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
@@ -48,7 +46,6 @@ export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
     { role: "dr-debater-judge" },
   ],
   synthesizer: { role: "dr-synthesizer" },
-  exportRoute: "export",
 };
 
 /** 终态标记：两个正交事实（spec §5.1），由报告 body 头部承载。 */

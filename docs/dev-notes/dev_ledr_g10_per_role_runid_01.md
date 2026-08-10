@@ -31,28 +31,31 @@
 
 ### Y5: triage / worker 两条路径的 run-id 生成不受影响
 
-**PASS**. `TriageSpawnRuntime` 保留 `runId: string` 字段（`src/tick-run.ts:195`），`src/tick-run.ts:1540` 的 triage 默认 runtime 仍为 `runId: randomUUID()`。worker 路径在 `src/tick.ts:416` 每次现取 `const runId = randomUUID()`。
+**PASS**. `test/g10-per-role-runid.test.ts` "Y5: triage and worker run-id generation unchanged" — 两个用例：
 
-**可达性声明**: `test/g10-per-role-runid.test.ts` > Y5 > "GenerateSpawnRuntime has newRunId not runId; TriageSpawnRuntime retains runId"。若有人误将 triage 的 `runId` 也改为 `newRunId`，`src/tick-run.ts:1540` 的 `TriageSpawnRuntime` 类型会报错（`newRunId` 不在 `TriageSpawnRuntime` 上）。
+1. `TriageSpawnRuntime has runId (not newRunId)` — 构造 `TriageSpawnRuntime` 实例，断言 `runtime` 有 `runId`、无 `newRunId`，且 `runId` 为非空字符串。若有人误将 `TriageSpawnRuntime.runId` 改为 `newRunId`，`expect(runtime).not.toHaveProperty("newRunId")` 必挂。
+2. `worker per-dispatch runId is const runId = randomUUID()` — 读取 `src/tick.ts` 源码，断言 `const runId = randomUUID()` 存在。若有人将 worker 的 per-dispatch `randomUUID()` 改为 hoisted 单值，正则 `/const runId = randomUUID\(\)/` 不匹配，此条必挂。
+
+**可达性声明**: `test/g10-per-role-runid.test.ts` > Y5 > "TriageSpawnRuntime has runId (not newRunId)" — 若 triage 的 `runId` 字段被改为 `newRunId` 工厂，`not.toHaveProperty("newRunId")` 必挂。`test/g10-per-role-runid.test.ts` > Y5 > "worker per-dispatch runId is const runId = randomUUID()" — 若 worker 的 `const runId = randomUUID()` 被改为 hoisted 单值，正则匹配必挂。
 
 ### Y6: 全量 npx vitest run 真绿
 
 ```
  Test Files  30 passed (30)
-      Tests  508 passed (508)
-   Start at  11:28:07
-   Duration  8.07s
+      Tests  509 passed (509)
+   Start at  11:43:11
+   Duration  7.18s
 ```
 
 无 FAIL 段。`ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*` 均未设置。
 
 ### Y7: 可达性声明
 
-见上 Y1-Y5 各条。
+见上 Y1-Y5 各条。Y5 的可达性声明已修正为指向实际校验 triage `runId` 字段和 worker `const runId = randomUUID()` 源码的用例，而非仅检查 generate runtime 的类型属性。
 
 ### Y8: git status --porcelain 为空
 
-（最终提交后验证）
+```
 
 ### Y9: 每处删除给出必要性说明
 

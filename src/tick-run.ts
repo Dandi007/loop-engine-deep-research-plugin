@@ -1537,7 +1537,7 @@ export async function runChannelWrite(
         const runtime: TriageSpawnRuntime =
           opts.triageSpawnRuntime ?? {
             agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
-runId: randomUUID(),
+            runId: randomUUID(),
             // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
             //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
             spawnProcess: async (argv, env) => {

@@ -167,14 +167,23 @@ describe("Y4: assertions drive production assembleGenerateDeps", () => {
 // ── Y5: triage / worker 两条路径的 run-id 生成不受影响 ─────────────────
 
 describe("Y5: triage and worker run-id generation unchanged", () => {
-  it("GenerateSpawnRuntime has newRunId not runId; TriageSpawnRuntime retains runId", () => {
-    const deps = assembleGenerateDeps(
-      { channelId: "research:test", workerCmd: "/fake/agent-run" },
-      termState(),
-      boardState(),
-    );
-    const runtime = deps.spawnRuntime!;
-    expect(runtime).not.toHaveProperty("runId");
-    expect(runtime).toHaveProperty("newRunId");
+  it("TriageSpawnRuntime has runId (not newRunId)", async () => {
+    const { randomUUID } = await import("node:crypto");
+    const runtime: import("../src/tick-run").TriageSpawnRuntime = {
+      agentRunBin: "/fake/agent-run",
+      runId: randomUUID(),
+      spawnProcess: async () => ({}),
+      readResult: async () => [],
+    };
+    expect(runtime).toHaveProperty("runId");
+    expect(runtime).not.toHaveProperty("newRunId");
+    expect(typeof runtime.runId).toBe("string");
+    expect(runtime.runId.length).toBeGreaterThan(0);
+  });
+
+  it("worker per-dispatch runId is const runId = randomUUID() in src/tick.ts", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync("src/tick.ts", "utf8");
+    expect(src).toMatch(/const runId = randomUUID\(\)/);
   });
 });

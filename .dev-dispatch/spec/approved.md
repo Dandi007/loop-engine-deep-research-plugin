@@ -1,97 +1,116 @@
-# G13(v2) —— 生成段部分失败后该 origin 永久卡死：按 **report 是否已存在** 恢复
+# G14 —— anchor-check 用非零退出码表达**结果**，生产却当成崩溃：核验率与 `anchor-check.json` 双双丢失
 
-> 派发方：`line-deep-research`。仓库：`loop-engine-deep-research-plugin`。基线：main `a86b78f`（G12 已合入）。
->
-> ⚠️ **这是重开包。v1 的核心要求不可实现，是派发方（我）的缺陷，不是实现方的问题。**
-> v1 要求「按 **(role, origin)** 查已有 doc 并复用」，但 **`research.doc.v2` 的载荷里没有 role**。
-> 详见 §0.2。**v2 改用一个完全可从现有载荷推导的设计。**
+> 派发方：`line-deep-research`。仓库：`loop-engine-deep-research-plugin`。基线：main `4fe0eb5`。
+> **Phase 6 权威轮真跑抓到，证据全部实测逐字。**
 
 ---
 
-## 0.1　生产实况（真跑抓到，证据逐字）
+## 0　生产实况
 
-第一次成功的生成段真跑，四个 role 全部 `exit=0`，产出：
-
-```
-research:agent-harness.docs → 4 条 research.doc.v2（origin 均为 dr-agent-harness-20260810）
-  doc_kind=argument 11809 | argument 8253 | argument 13985 | report 42637
-```
-
-但该 tick 仍 `exit 2`（当时成因是 G12 致 `EXPORT_ROOT` 未加载）⇒ `runGenerate` 未返回
-⇒ one-shot 标记未写（`/tmp/deep-research-generated/` 实测空目录）。
-
-环境修好后重跑，得逐字：
+配置齐全的权威轮（`TICK_EXIT=0`，四个 role 全成功，导出件已落盘 51 081 字节）产出的报告头部：
 
 ```
-bus POST /v1/channels/research:agent-harness.docs/publish: 409
-{"code":"IDEMPOTENCY_CONFLICT","message":"Same idempotency_key with different intent"}
+<!-- dr-anchor-rate unavailable -->
 ```
 
-**根因（定位到行号）**：
+且 `<EXPORT_ROOT>/DeepThought/agent-harness/` 下**只有 `.md`，没有 `anchor-check.json`**。
 
-| 位置 | 事实 |
-|---|---|
-| `src/generate.ts:411-417` | doc 幂等键 = `dr-doc:${role}:${origin}`，**固定于 (role, origin)、与内容无关** |
-| `src/tick-run.ts:1628-1637` | one-shot 标记在 `runGenerate` **成功返回之后**才写 |
-
-⇒ 顺序是「**发布（不可逆、键固定）→ anchor-check → 导出 → 写标记**」。
-发布之后、写标记之前的**任何**失败都留下「键已占用 + 无标记」；
-重试必然重新 spawn（LLM 非确定性 ⇒ body 不同）⇒ 同键不同内容 ⇒ **409 ⇒ 永远走不完**。
-唯一逃生口是换 `origin`，但那会让同一场研究出现两个溯源标识、污染 provenance，且 bus append-only 不可回退。
-**等于没有恢复路径。**
-
-## 0.2　⛔ v1 错在哪（派发方已实测，别再往那个方向做）
-
-v1 要求「按 (role, origin) 查已有 doc 并复用」。**做不到**：
+### 派发方实测：anchor-check 本身完全正常
 
 ```
-DocV2 载荷字段（实测）: ['body', 'digest', 'doc_kind', 'origin']        ← 没有 role
-deriveDocKind: advocate / opponent / judge 三个 role 全部 → doc_kind = "argument"
+$ /data/.../anchor-check.py --corpus <424 条语料> --repo-root /data/code/self/agent-runtime --json
+{"total":424,"current_parsed":424,"current_verified_hit":408,"current_failed":16,
+ "old_format":0,"unparseable":0,"discarded":0,"sums_ok":true,"loud_failures":[]}
+$ echo $?
+1                                  ← ⭐ 退出码 1，但 stdout 是完全有效的 JSON（198 字节）
+wall=1.13s                         ← 远未触及 timeout: 30000
 ```
 
-⇒ 三条 argument 在载荷层面**互不可分**。
+**核验率 = 408 / 424 = 96.23%**（≥ 90%，软闸门本应通过）。
 
-评审建议的备选「按已有幂等键 `dr-doc:${role}:${origin}` 查」**同样不可行**——派发方实测 bus 消息信封字段为：
+### 退出码是**有意设计的结果语义**，不是崩溃信号
+
+`anchor-check.py:226-237` 自带注释：
 
 ```
-message_id, channel_id, channel_seq, sender_agent_id, kind, payload,
-entity_id, supersedes, reply_to_message_id, available_at, expires_at, created_at
+0  → 无响亮失败 且 无现行格式未命中
+1  → 有现行格式引文未命中（校验失败）
+2  → 有响亮失败（缺 repo-root / fetcher 取不到 / 形态不合理）
+3  → 三类计数之和与输入条数不符（静默丢弃）
 ```
 
-**不含 `idempotency_key`**，读不回发布时用的键。
+## 0.1　根因（定位到行号）
 
-给 `research.doc.v2` 加 role 字段属**协议变更（不可逆注册动作）**，与本包不相称。
+`src/tick-run.ts:1354-1362`：
 
-⛔ **不要**试图用 `channel_seq` 的先后顺序去反推是 advocate 还是 opponent —— 那是位置推断，脆弱且不可验证。
+```ts
+const stdout = execFileSync(anchorCheckBin, [...], { encoding:"utf8", stdio:["ignore","pipe","pipe"], timeout:30000 });
+return JSON.parse(stdout) as AnchorCheckResult;
+```
+
+`execFileSync` **对任何非零退出都抛错**。派发方直接复现：
+
+```
+THROW -> Command failed: … | status 1 | e.stdout 长度 198     ← 有效 JSON 就在 e.stdout 里，被丢弃
+```
+
+`src/generate.ts:458-463` 的 catch：
+
+```ts
+} catch (e) {
+    if (e instanceof MissingAnchorCheckRepoRootError) { anchorTail = "no-repo-root"; }
+    // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
+}
+```
+
+⇒ **除 `no-repo-root` 外，真实错误被整个吞掉**，`unavailable` 无法区分「崩溃 / 超时 / 退出码非零 / JSON 解析失败」。
+
+### ⛔ 后果（三条，权威轮全部实测到）
+
+1. `anchorRate` 恒 null ⇒ 报告头标 `unavailable` 而非 **96.23%** ⇒ **软闸门拿不到真实核验率**；
+2. `anchorCheckJson` 恒 null ⇒ `if (anchorCheckJson !== null …)` 不成立 ⇒ **`anchor-check.json` 永不写出**；
+3. catch 不留 tail ⇒ **不可诊断**。
+
+> ### ⛔ 触发条件是「**任何一条 anchor 未命中**」
+> 只有 100% 全命中的语料才能拿到退出码 0。**任何真实研究都会撞上。**
+
+### ⛔ 连带死码（同一根因）
+
+`src/generate.ts:452-454` 有分支：
+
+```ts
+} else if (!ac.sums_ok) { anchorTail = "sums_ok=false"; }
+```
+
+**该分支今天永远走不到** —— `sums_ok=false` ⇒ 工具 exit 3 ⇒ `execFileSync` 抛错 ⇒ 直接进 catch。
 
 ---
 
-## 1　要做什么（v2 设计：只用可推导的信息）
+## 1　要做什么
 
-在 `runGenerate` 开始派 role **之前**，读一次 doc channel，按 `origin` 过滤，然后：
+`spawnAnchorCheck` 改为**按「stdout 能否解析成合法 JSON」判定成败，而不是按退出码**：
 
-| 已有状态 | 行为 |
+| 情况 | 行为 |
 |---|---|
-| **存在 `doc_kind === "report"`（同 origin）** | ⭐ **跳过全部 spawn 与全部 publish**，复用该 report 的 `body`，直接走 **anchor-check + 导出** |
-| **无 report，但存在 ≥1 条 `doc_kind === "argument"`（同 origin）** | ⛔ **响亮失败**：点名 `origin` 与已有 argument 条数，说明该 origin 处于「部分发布、无法安全恢复」状态。⛔ 不猜、不重发（重发必 409） |
-| **该 origin 下无任何 doc** | 行为与今天**逐字一致**（四个 role 全 spawn 全 publish） |
+| 退出码 **0 或 1**，stdout 是合法 JSON | ⭐ **正常返回该结果**（1 = 有引文未命中，是**正常结果**，核验率照常计算） |
+| 退出码 **2 或 3**，stdout 是合法 JSON | **仍返回该结果**（交由 `generate.ts` 既有分支处理：`total===0` / `!sums_ok`），并让失败原因可见（见下） |
+| stdout **不是**合法 JSON（含超时、二进制缺失、真崩溃） | ⛔ **抛错**，且错误信息**点名退出码与 stderr 尾部** |
 
-### 为什么这样切
+实现要点：`execFileSync` 抛出的错误对象上带 **`e.stdout`**（派发方实测：`status 1`、`e.stdout` 长度 198）。
+捕获后优先尝试解析 `e.stdout`；解析成功即视为拿到结果。
 
-- **它解开真实死锁**：本次卡住的 origin **report 已存在**（42637 字节），复用即可走完导出与 anchor-check，
-  **不改 origin、不重烧四个强档 LLM**。
-- **report 由 `doc_kind` 唯一确定**，无需 role 判别 ⇒ 完全可从现有载荷推导，**不动协议**。
-- **部分-argument 是真的有歧义**（不知道缺哪个 role），把它变成**响亮可诊断的失败**，
-  比今天「撞 409 撞到天荒地老」严格更好。⛔ 不要为它编一个猜测式恢复。
+### 同时修掉静默吞异常（`src/generate.ts` 的 catch）
+
+⛔ **不得再无声吞掉**：非 `MissingAnchorCheckRepoRootError` 的失败也必须写进 `anchorTail`
+（例如 `anchor-check-failed:<原因简述>`），使 `unavailable` 的成因**在报告头上可诊断**。
+⛔ 仍保持软闸门语义：**anchor-check 失败不得阻断导出**。
 
 ### ⛔ 必须保住的既有语义
 
-- ⛔ **`doc_kind` 仍由 role 推出**，绝不读 payload 决定发什么（`src/generate.ts:119-132` 既有纪律）。
-- ⛔ **幂等键写法不变**（`dr-doc:${role}:${origin}`）。本包不改键。
-- ⛔ **anchor-check 仍是软闸门**：失败/报缺陷都不得阻断导出；崩溃与真实 0% 必须可区分。
-- ⛔ **不得吞 409**：复用是**发布前主动查**，不是**发布后吞异常**。
-- ⛔ 复用分支里**不要重复计算随后被丢弃的量**（v1 attempt 1 的 minor：在复用分支重算了 anchorRate/anchorTail 却从不使用——
-  已发布的 report body 自带其 head）。要么用上，要么不算。
+- ⛔ 软闸门：核验率 < 90% **仍导出**，只是标在头部（golden-order 拍死）。
+- ⛔ `total === 0` ⇒ `unavailable`，**不得**当成「全部核验通过」。
+- ⛔ 核验率分母必须是 `total`，⛔ 不得用 `current_parsed`。
+- ⛔ 崩溃与真实 0% 必须可区分。
 
 ---
 
@@ -99,37 +118,35 @@ entity_id, supersedes, reply_to_message_id, available_at, expires_at, created_at
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **W1** | ⭐ **判别性**：doc channel 上已有该 origin 的 `report` ⇒ **零 spawn、零 publish**，且**导出被调用**、导出内容取自该 report 的 body | 假 bus 预置一条 report，断言 spawn 次数 `=== 0`、publish 次数 `=== 0`、导出入参 body 逐字等于预置值 |
-| **W2** | ⛔ **anchor-check 在复用分支照常执行**（`anchor-check.json` 仍产出） | 断言其被调用 |
-| **W3** | ⛔ **无 report 但有 argument** ⇒ **响亮失败**，错误信息**点名 origin 与 argument 条数**；⛔ 不得 spawn、不得 publish | 判别性用例；断言抛错且 spawn/publish 计数为 0 |
-| **W4** | ⛔ **该 origin 下无任何 doc** ⇒ 行为与今天逐字一致（四个 role 全 spawn、四次 publish） | 回归断言 |
-| **W5** | ⛔ **只按 origin 过滤**：channel 上存在**别的 origin** 的 report ⇒ 不得被误当成本 origin 的可复用产物 | 判别性用例（预置一条 `origin: "other"` 的 report，断言仍走正常全量路径） |
-| **W6** | ⛔ **断言打在生产组装出的 deps 上**（`assembleGenerateDeps` 已导出）；⛔ 自建 runtime 注入的用例不算数；⛔ 源码字符串匹配不构成证据 | 照 G5/G6/G7/G10 已交付的做法；⚠️ v1 正是栽在「只有注入 mock 能满足、生产路径不能」 |
-| **W7** | 全量 `npx vitest run` 干净环境真绿。基线：main `a86b78f` **派发方实测 513 tests**，终值不得低于基线 | ⛔ 贴本次运行完整尾部（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
-| **W8** | **可达性声明**：W1–W5 每条指名唯一会失败的用例 + 一两句「为什么缺该行为就不可能通过」。⛔ 声明必须对**生产路径**成立，不能只对注入的 mock 成立（v1 的 major） | dev-note |
-| **W9** | 工作树干净 | ⛔ 贴 `git status --porcelain \| wc -l` 的输出（应为 `0`）。⛔ 不要贴 `git status --porcelain` 本身——干净时它无输出，空块与遗漏不可区分 |
+| **V1** | ⭐ **退出码 1 + 合法 JSON ⇒ 正常结果**：核验率按 `current_verified_hit/total` 算出具体数字，报告头**不是** `unavailable` | 用一个**假二进制**（shell 脚本：打印固定 JSON 后 `exit 1`）驱动生产 `spawnAnchorCheck`；⛔ 这是本包的存在理由 |
+| **V2** | ⭐ **`anchor-check.json` 被写出**，内容等于该 JSON | 断言写入路径与内容 |
+| **V3** | ⛔ **退出码 2/3 + 合法 JSON ⇒ 仍返回结果**，且 `sums_ok=false` 时头部带 `sums_ok=false`（今天不可达的分支必须变为可达） | 假二进制 exit 3 且 `sums_ok:false` |
+| **V4** | ⛔ **stdout 非合法 JSON ⇒ 响亮失败**，错误/tail **点名退出码**；且**导出仍照常发生**（软闸门不得被削弱） | 假二进制打印非 JSON 后非零退出；断言导出被调用 |
+| **V5** | ⛔ **退出码 0 的既有行为逐字不变** | 回归断言 |
+| **V6** | ⛔ **断言打在生产组装出的 deps 上**（`assembleGenerateDeps` 已导出）；⛔ 自建 runtime 注入不算数；⛔ 源码字符串匹配不构成证据 | 照 G5/G6/G7/G10 已交付做法 |
+| **V7** | 全量 `npx vitest run` 干净环境真绿。基线：main `4fe0eb5` **派发方实测 527 tests**，终值不得低于基线 | ⛔ 贴本次运行完整尾部（`Test Files` / `Tests` 两行 + 有无 FAIL 段） |
+| **V8** | **可达性声明**：V1–V5 每条指名唯一会失败的用例 + 一两句「为什么缺该行为就不可能通过」。⛔ 必须对**生产路径**成立 | dev-note |
+| **V9** | 工作树干净 | ⛔ 贴 `git status --porcelain \| wc -l` 的输出（应为 `0`）。⛔ 不要贴 `git status --porcelain` 本身——干净时它无输出，空块与遗漏不可区分 |
 
 ---
 
 ## 3　⛔ 关于变异自检：本包不要求你自报，也不要编造
 
-**实测变异由派发方在 gate 亲手施加。** 你只需给 W8 的**可达性声明**（可被评审读代码核实）。
+**实测变异由派发方在 gate 亲手施加。** 你只需给 V8 的**可达性声明**（可被评审读代码核实）。
 ⛔ 不要写「实测 / 被杀 ✓」，除非你真做了并能贴出被改行与失败输出。
 **写不出就如实写「未实测，理由：见可达性声明」——这不扣分。**
 
 ---
 
-## 4　⛔ 派发方已付的学费（本包直接相关）
+## 4　⛔ 派发方已付的学费
 
-**判据必须先被证明「可满足」才能写进硬验收。** 本线已为此付过**四次**代价：
+**判据必须先被证明「可满足」才能写进硬验收。** 本线已为此付过五次代价
+（不可观测的 EPIPE；成功时无输出的命令；依赖 bus 而沙箱无 bus 的路径；载荷里根本没有的 role 字段；
+以及本包的前身——把退出码当崩溃）。
 
-1. 要求为 bun 下**不可观测**的 EPIPE 写判别性用例；
-2. 要求贴一个**成功时无输出**的命令的输出；
-3. 要求某用例走一条**依赖 bus 而验收沙箱无 bus** 的路径；
-4. **本包 v1**：要求按 (role, origin) 复用，而**载荷里根本没有 role**。
-
-⇒ 本包 W1–W5 派发方已逐条确认可满足：`doc_kind` 与 `origin` 均在 `DocV2` 载荷内（实测字段
-`['body','digest','doc_kind','origin']`），假 bus 预置消息即可驱动，**不依赖真实网络**。
+⇒ 本包 V1–V5 派发方已确认可满足：用**一个几行的 shell 假二进制**（`echo '<json>'; exit N`）
+即可驱动生产 `spawnAnchorCheck` 的全部分支，**不依赖网络、不依赖真实语料**。
+派发方已用 `node -e` 实测 `execFileSync` 在 `status 1` 时抛错且 `e.stdout` 长度 198（有效 JSON）。
 
 其余：⛔ 源码字符串匹配不构成证据；⛔ 测试里重写一份被测逻辑再断言等于没测；
 dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit，不是 H0 提交。
@@ -140,19 +157,18 @@ dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit�
 
 | 不做 | 理由 |
 |---|---|
-| 给 `research.doc.v2` 加 role 字段 | 协议变更 = 不可逆注册动作，与本包不相称 |
-| 用 `channel_seq` 顺序反推 role | 位置推断，脆弱且不可验证（§0.2） |
-| 为「部分 argument」编猜测式恢复 | 真有歧义；响亮失败严格优于猜 |
-| 改 doc 幂等键写法 | 键没问题，问题是发布前不查 |
-| 吞掉 409 当成功 | 会让真冲突不可见 |
-| 改 anchor-check 软闸门语义 / 改 origin / 改 profile 值 | 已拍死或归部署方 |
-| 修 loop-engine 吞 tick 失败（G11） | 不同仓，独立发现 |
+| 改 `anchor-check.py` 的退出码 | 不同仓；且其退出码语义是**有意设计且自带文档**的，错的是消费方 |
+| 改软闸门阈值或「<90% 仍导出」 | golden-order 拍死 |
+| 改核验率公式（分母 `total`） | 既有纪律 |
+| 把 anchor-check 失败改成阻断导出 | 违反软闸门 |
+| 改 `timeout: 30000` | 实测 1.13 s，与本缺陷无关；⛔ 不要顺手动 |
+| 修 loop-engine 吞 tick 失败（G11）/ 生成段恢复（G13v2） | 独立发现，各自独立推进 |
 
 ---
 
 ## 6　交付物落点
 
-- 实现：`src/generate.ts`（开跑前查已有 doc 并按 §1 三分支处理）、必要时 `src/tick-run.ts`（deps 装配读 doc channel）
-- 测试：`test/g13-generate-resume.test.ts`（W1–W6）
-- 证据：`docs/dev-notes/dev_ledr_g13v2_generate_resume_01.md`（W1–W9 逐条 + §3 可达性声明 +
+- 实现：`src/tick-run.ts`（`spawnAnchorCheck` 按 stdout 可解析性判定）、`src/generate.ts`（catch 不再静默吞）
+- 测试：`test/g14-anchor-exit-code.test.ts`（V1–V6）
+- 证据：`docs/dev-notes/dev_ledr_g14_anchor_exit_code_01.md`（V1–V9 逐条 + §3 可达性声明 +
   本次运行的全量测试尾部 + `git status --porcelain | wc -l` 输出）

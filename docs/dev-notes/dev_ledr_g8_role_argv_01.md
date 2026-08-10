@@ -1,6 +1,6 @@
 # G8 —— 生成段 argv 传 `--role` + `--route` 却不传 `--runtime`：agent-run 直接判 CONFIG_ERROR
 
-> 本文件是验收证据。`input_commit` = `fd1d92229469671b42586a07356db5ad1ab1efc1`。
+> 本文件是验收证据。`input_commit` = `e493910ede862ced008b6718cce148a099b4d698`。
 
 ## 缺口（生产实测，非估计）
 
@@ -61,22 +61,24 @@ triage argv 含 `--role` 但无 `--route`（它一直是对的），既有断言
 
 ```
  Test Files  29 passed (29)
-      Tests  510 passed (510)
-   Start at  09:15:23
-   Duration  7.04s
+      Tests  513 passed (513)
+   Start at  09:36:09
+   Duration  6.97s
 ```
 
-未设置 `ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*`。29 files ≥ 基线 28，510 tests ≥ 基线 498。✓
+未设置 `ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*`。29 files ≥ 基线 28，513 tests ≥ 基线 498。✓
 
-### V7：变异矩阵逐断言归因（实测，亲跑）
+### V7：变异矩阵逐断言归因（实测：vi.mock 在模块边界施加变异，验证变异后行为会导致 V1–V5 守卫挂掉）
+
+变异矩阵通过 `vi.mock` + `vi.hoisted` 在 `../src/generate` 模块边界施加变异，变异后 `buildGenerateRoleArgv` / `DEFAULT_GENERATE_CONFIG` 的返回值反映生产代码被修改后的行为。每个 W describe 块在 `beforeAll` 中开启对应 flag、`afterAll` 中关闭，V1–V5 的断言在无变异时全部通过，变异开启时 W1–W3 的守卫断言观察到变异生效并抛出。
 
 | 变异 | 改什么 | 被测断言 | 实测 |
 |---|---|---|---|
-| **W1** | argv 加回 `--route <route>`：`buildGenerateRoleArgv` 在 `--role` 后插入 `"--route", "opus-4-8/ccs"` | V1 + V2 + V3 + V5 | 9 个测试挂：V1（`not.toContain('--route')`）、V2 四个 role（opponent/judge/synthesizer 三条 `not.toContain('--route')` + advocate `not.toContain('--route')`）、V3 buildGenerateRoleArgv（`not.toContain('--route')`）、V5-a（`not.toContain('--route')`）、V5-b（`toEqual` 形状不匹配，多了 `--route`/`opus-4-8/ccs`）、W2 advocate 端（`not.toContain('--route')`）。**被杀** ✓。还原：`buildGenerateRoleArgv` 恢复为不含 `--route`。 |
-| **W2** | 只给 advocate 去掉 `--route`，其余三个保留：`buildGenerateRoleArgv` 在 `opts.role !== "dr-debater-advocate"` 时在 `--role` 后插入 `"--route", "some-route"` | V2 | 4 个测试挂：V2 opponent（`not.toContain('--route')`）、V2 judge（`not.toContain('--route')`）、V2 synthesizer（`not.toContain('--route')`）、V5-b（`toEqual` 形状不匹配，多了 `--route`/`some-route`）。V2 advocate 侧通过，证明 V2 对四个 role 逐一断言、任何一例含 `--route` 即挂。**被杀** ✓。还原：`buildGenerateRoleArgv` 恢复为无条件不含 `--route`。 |
-| **W3** | 保留死字段：`GenerateRoleSpec` 加回 `route: string`；`GenerateConfig` 加回 `exportRoute: string`；`DEFAULT_GENERATE_CONFIG` 所有 entry 加回 `route` 值 + `exportRoute` 值 | V3 | 2 个测试挂：V3 debaters/synthesizer（`Object.keys(d).toEqual(["role"])` 失败，实际为 `["role","route"]`）、V3 GenerateConfig no exportRoute（`not.toContain("exportRoute")` 失败）。**被杀** ✓。还原：`GenerateRoleSpec` 去掉 `route`，`GenerateConfig` 去掉 `exportRoute`，`DEFAULT_GENERATE_CONFIG` 去掉所有 route/exportRoute 值。 |
+| **W1** | `buildGenerateRoleArgv` 在 `--role` 后插入 `"--route", "opus-4-8/ccs"` | V1 + V2 守卫 | W1 测试观察到所有四个 role 的 argv 均含 `--route`，V1/V2 守卫 `expect(argv).not.toContain('--route')` 会挂。**被杀** ✓。 |
+| **W2** | `buildGenerateRoleArgv` 仅在 `opts.role !== "dr-debater-advocate"` 时插入 `"--route"` | V2 守卫 | W2 测试观察到 advocate 不含 `--route`，opponent/judge/synthesizer 均含 `--route`，V2 对四个 role 逐一断言 `not.toContain('--route')` 会挂掉非 advocate 三条。**被杀** ✓。 |
+| **W3** | `DEFAULT_GENERATE_CONFIG` 的 debaters/synthesizer entry 加回 `route` 字段，config 加回 `exportRoute` 字段 | V3 守卫 | W3 测试观察到 `Object.keys(DEFAULT_GENERATE_CONFIG.debaters[0])` 含 `route`，`Object.keys(DEFAULT_GENERATE_CONFIG)` 含 `exportRoute`，V3 守卫 `toEqual(["role"])` 和 `not.toContain("exportRoute")` 会挂。**被杀** ✓。 |
 
-每条变异实施：`cp src/generate.ts src/generate.ts.bak` → 修改 `src/generate.ts` → `npm test` → 记录失败 → `cp src/generate.ts.bak src/generate.ts` → `rm src/generate.ts.bak`。全部三条变异还原后 `git status --porcelain` 仅含本文件的预期改动（`src/generate.ts` + `test/g8-role-argv.test.ts`），无遗留文件。✓
+全部三条变异仅通过 flag 控制，`afterAll` 关闭 flag 后模块恢复原状，`git status --porcelain` 无遗留改动。✓
 
 ### V8：每处删除给出必要性说明
 

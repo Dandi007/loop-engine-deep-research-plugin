@@ -1,56 +1,68 @@
-# G6 —— 结果等待预算 30 秒，而真实 agent 要 43–390 秒：两条生产路径都会超时失败
+# G7 —— 语料走位置参数，撞上 Linux 单参数 128 KB 上限：真实规模下生成段必 `spawn E2BIG`
 
-> 派发方：`line-deep-research`。前置：G5 已合入 main `0b619e8`。
-> **这是 Phase 6 真跑实测出的生产缺陷，数值全部取自生产 bus，非估计。**
-
----
-
-## 0　实测数据（生产 `board:agent-runs`，2026-08-09 19:35Z–22:05Z）
-
-把每条结果消息与同 `run_id` 的 `agent.run.started.*` 配对，得到**真实端到端耗时**：
-
-| agent 类 | 样本 | 最小 | 中位 | 最大 |
-|---|---|---|---|---|
-| **`dr-triage`**（`dr-triage.result.v1`） | **37** | **43s** | **175s** | **390s** |
-| **`dr-worker-code-local`**（`worker.result.v1`） | **5** | **160s** | **207s** | **258s** |
-
-**而现行等待预算是 30 次 × 1 秒 = 30 秒** —— **低于观测到的最小值（43s）。**
-
-生产实证（G5 合入后手工跑一次 tick，逐字）：
-
-```
-G5: timed out waiting for triage result for run 32ba1229-baa1-4614-870f-9b2f6f9da94f
-    — no dr-triage.result.v1 found on board:agent-runs after 30 retries
-```
-
-⇒ G5 的响亮失败**工作正常**（这是进步：此前是静默丢弃）。**但预算本身是错的，研究仍无法推进。**
-
-### ⛔ 同一预算也用在生成段，且生成段更慢
-
-`src/tick-run.ts` 的生成段 `readBody`（G4c(v2) 交付）用的是**同一形状的 30 × 1s**。
-debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
-⇒ **生成段会以完全相同的方式超时**，plan §0 的产物 1（report）与 2（导出件）仍然产不出。
-**本包必须同时修这两条路径**，只修 triage 等于把同一个坑留给下一次真跑。
+> 派发方：`line-deep-research`。前置：G6 已合入 main `5911882`。
+> **Phase 6 真跑当场抓到，证据全部实测。**
 
 ---
 
-## 1　要做什么
+## 0　生产实况
 
-把两处结果等待改成**按时间预算**（而非写死的重试次数），并可由部署方覆盖：
+研究「agent harness」跑到终态（**64 线索：53 explored / 11 dropped，`termination.state = "capped"`**，
+证据 channel **424 条**）后，生成段每次触发都失败：
 
-| 键 | 语义 | 缺省 |
-|---|---|---|
-| `AGENT_RESULT_TIMEOUT_MS` | 等待 `dr-triage.result.v1` / `dr-doc.result.v1` 出现在 `board:agent-runs` 的总预算 | **900000（15 分钟）** |
-| `AGENT_RESULT_POLL_MS` | 轮询间隔 | **3000（3 秒）** |
+```
+$ ./bin/tick-entry.sh --run research:agent-harness.index … --origin dr-agent-harness-20260810 …
+spawn E2BIG
+```
 
-**缺省取值的依据（必须在 dev-note 复述）**：观测最大值 390s；900s ≈ **2.3×** 最大值，
-且覆盖 triage 与 worker 两个分布的全部样本。轮询 1s 在 15 分钟预算下会产生 900 次无谓请求，3s 足够。
+### 实测数字（不是估计）
 
-⛔ **不得**把预算写死成另一个魔数就完事：**必须可由部署方覆盖**，因为不同档位的模型耗时差一个数量级
-（本线实测 pro 档 implement 墙钟 355–667s，flash 档曾因 429 风暴到 1896s）。
+| 量 | 实测 |
+|---|---|
+| 证据语料序列化后 | **262 001 字节（256 KB）** |
+| `getconf ARG_MAX` | **2 097 152（2 MB）** |
+| Linux **单个参数**上限 `MAX_ARG_STRLEN` | **131 072（128 KB）** = `PAGE_SIZE × 32` |
 
-⛔ **超时仍必须响亮失败并点名 runId**（G5 已交付的语义，不得削弱）。
-⛔ **「读不到」与「真的返回空结果」必须继续可区分**（G5 的 P3，不得回退）。
+⇒ **总量没超 `ARG_MAX`，撞的是「单参数 128 KB」这条**：语料作为**一个** positional 参数是它的 **2 倍**。
+
+> ⛔ **不要按 `ARG_MAX` 去推**（我第一反应也是它，被实测否掉了）：
+> 256 KB < 2 MB，看 `ARG_MAX` 会得出「没超」的错误结论。**真正的天花板是单参数 128 KB。**
+
+### ⛔ 这不是冗余代码，是设计约束
+
+`src/generate.ts:246-247` 逐字：
+
+> `--input` **只作 schema 守卫（校验完就扔、从不注入 prompt）**，⛔ **语料正文必须走位置参数**。
+
+⇒ 语料**只能**经 positional 到达 agent 的任务文本，`--input` 到不了 prompt。
+⇒ **128 KB 就是这条投递机制对语料体量的硬天花板**，而真实研究在 424 条证据处已是它的 2 倍。
+**删掉 positional 不是修复**——那样 agent 收不到语料。
+
+---
+
+## 1　修法：改用 `--prompt-file`（agent-run 已支持，派发方读过源码）
+
+`agent-runtime/src/cli.ts:122-123` 与 `src/dispatch.ts:1097-1098` 逐字：
+
+```
+--prompt-file <path>    Read prompt from file
+...
+if (args.promptFile) { prompt = readFileSync(args.promptFile, "utf-8").trim(); }
+```
+
+⇒ **`--prompt-file` 的内容直接成为 prompt**（与 `--input` 的「校验完就扔」根本不同）。
+⇒ 走文件投递**完全没有 argv 长度上限**。
+
+**要做的**：把 `buildGenerateRoleArgv` 与 `buildTriageArgv` 里那个装序列化语料的**位置参数**，
+换成 `--prompt-file <path>`，文件内容 = 原本要放进位置参数的**同一段序列化文本**（⛔ 逐字相同，不得趁机改格式）。
+
+- `--input` 的 schema 守卫语义**保留不变**（它有独立作用）。
+- 载荷文件寿命照既有做法：用后即删（`finally` 清理），⛔ 不得泄漏到 `/tmp`。
+- ⛔ **两条路径都要改**：triage 现在语料小、尚未撞限，但**机制完全相同**，
+  板面一大就会以同样方式失败。**只改生成段等于把同一个坑留给下一次真跑**（G6 刚付过这个学费）。
+
+⚠️ **不要用「多个位置参数分块」的方案**：`agent-runtime/src/cli.ts:70` 是
+`args.prompt = argv.slice(i + 1).join(" ")` —— **用空格拼接**，分块会在每个边界插入空格、破坏 JSON。
 
 ---
 
@@ -58,15 +70,15 @@ debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
 
 | # | 判据 | 怎么验 |
 |---|---|---|
-| **R1** | ⭐ **两条路径都用新预算**：triage 的 `readResult` **与** 生成段的 `readBody` 都按 `AGENT_RESULT_TIMEOUT_MS` / `AGENT_RESULT_POLL_MS` 等待 | 分别断言；⛔ 只改 triage 不算完成 |
-| **R2** | ⛔ **可覆盖**：设 `AGENT_RESULT_TIMEOUT_MS` 为一个极小值 ⇒ 等待很快超时；不设 ⇒ 用 900000 缺省 | 正反两例，**打在生产组装出的 deps 上** |
-| **R3** | ⛔ **超时仍响亮并点名 runId**（G5 语义保留） | 判别性用例 |
-| **R4** | ⛔ **空结果 ≠ 读不到**（G5 的 P3 保留且仍有效） | 判别性用例 |
-| **R5** | ⛔ **不得靠真实等待把用例拖慢**：用例必须注入可控时钟/间隔（或用极小的 `AGENT_RESULT_POLL_MS`），全量测试时长不得显著增加 | 贴测试总时长；基线约 17s |
-| **R6** | ⛔ **断言打在生产组装出的 deps 上**（`runChannelWrite` 在注入分支下跳过生产装配；⛔ 自建 runtime 注入的用例不算数；⛔ 源码字符串匹配一律不构成证据） | 照 G5 已交付的 P6 做法 |
-| **R7** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN`/`DOC_CHANNEL`/`RESEARCH_ORIGIN`/`EXPORT_ROOT`/`AGENT_RESULT_*` 均未设置）。基线：main `0b619e8` 实测 **26 files / 472 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出** |
-| **R8** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
-| **R9** | 每处删除给出必要性说明 | — |
+| **T1** | ⭐ **超限语料能跑通**：构造 **> 128 KB**（如 300 KB）的语料 ⇒ 生产 argv 中**没有任何单个参数 ≥ 131072 字节**，且语料**逐字**出现在 `--prompt-file` 指向的文件里 | 假 spawn 记 argv + 读文件比对；⛔ 这是本包的存在理由 |
+| **T2** | ⛔ **两条路径都改**：generate 与 triage 的 argv **都**用 `--prompt-file`，**都**无超限位置参数 | 分别断言；⛔ 只改一条不算完成 |
+| **T3** | ⛔ **语料内容逐字不变**：`--prompt-file` 文件内容 === 原 `serializeCorpusToPositional` 的输出 | 断言字符串相等 |
+| **T4** | `--input` 的 schema 守卫仍在（既有语义不得削弱） | 读到行号 + 既有断言仍有效 |
+| **T5** | ⛔ **载荷文件用后即删**：spawn 后（无论成功失败）临时文件不残留 | 正反两例（含 spawn 抛错的路径） |
+| **T6** | ⛔ **断言打在生产组装出的 deps 上**（注入分支会跳过生产装配；⛔ 自建 runtime 注入的用例不算数；⛔ 源码字符串匹配一律不构成证据） | 照 G5/G6 已交付的做法 |
+| **T7** | 全量 `npx vitest run` **在干净环境下真绿**（`ANCHOR_CHECK_BIN`/`DOC_CHANNEL`/`RESEARCH_ORIGIN`/`EXPORT_ROOT`/`AGENT_RESULT_*` 均未设置）。基线：main `5911882` 实测 **27 files / 487 tests**，终值两项均不得低于基线 | ⛔ **必须实跑并贴完整尾部输出** |
+| **T8** | 变异矩阵（§3）逐断言归因、回显被改行、全部还原后 `git status --porcelain` 为空 | — |
+| **T9** | 每处删除给出必要性说明（本包要删「语料进位置参数」那一处，属必要——它正是缺陷本身） | — |
 
 ---
 
@@ -74,10 +86,10 @@ debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
 
 | 变异 | 改什么 | 期望被杀 |
 |---|---|---|
-| **S1** | 生成段 `readBody` 保留 30×1s（只改 triage） | **R1 的生成段那条必须挂** |
-| **S2** | 忽略 `AGENT_RESULT_TIMEOUT_MS`，恒用缺省 | **R2 必须挂** |
-| **S3** | 超时返回 `[]`/`null` 而非抛错 | **R3 必须挂** |
-| **S4** | 把「结果为空数组」也当成读不到继续等 | **R4 必须挂** |
+| **U1** | generate argv 改回「语料进位置参数」 | **T1 + T2 的 generate 侧必须挂**；⛔ 杀不掉即判 T1 零功率 |
+| **U2** | triage argv 改回「语料进位置参数」 | **T2 的 triage 侧必须挂** |
+| **U3** | 写进 `--prompt-file` 的内容做任意改写（如 `JSON.stringify(JSON.parse(x))`） | **T3 必须挂** |
+| **U4** | spawn 抛错路径不删临时文件 | **T5 的失败侧必须挂** |
 
 **纪律**（`wf-dc0c15/plan.md` §6）：逐断言归因 / 破坏后回显被改行 / 零功率检查比没有更坏 /
 永远红绿等于没检查 / gate 校 spec 读 `.dev-dispatch/spec/approved.md` / 纯文档包不编造变异自检。
@@ -87,11 +99,12 @@ debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
 ## 4　⛔ 前几包实付的学费（直接照用）
 
 1. **测试必须驱动生产组装**；⛔ **源码字符串匹配一律不构成证据**。
-2. **变异矩阵各行必须是实测**：若某行杀不掉，如实写「未被杀」并说明，⛔ **不得编造失败现象**
+2. **变异矩阵各行必须是实测**：某行杀不掉就如实写「未被杀」并说明，⛔ **不得编造失败现象**
    （本线已两次出现 dev-note 报告结构上不可能发生的击杀，均被评审逐条推翻）。
 3. **dev-note 的 `input_commit` 记 dd 交给你的那个 attempt 的 input_commit**，**不是 H0 提交**；
    ⛔ 不要为对齐 hash 做额外提交；⛔ 不得用「基线计数方式差异」解释测试数缺口。
-4. **贴测试证据要贴完整尾部**（`Test Files` / `Tests` 两行 + 有无 FAIL 段），不得只贴计数或只写结论。
+4. **贴测试证据要贴完整尾部**（`Test Files` / `Tests` 两行 + 有无 FAIL 段）。
+5. **修好一条路径时，必须查同一形状是否还存在于别处**（G6 的 S1 变异就是为这条设的回归守卫）。
 
 ---
 
@@ -99,18 +112,20 @@ debater / synthesizer 是与 triage 同量级或更慢的 LLM 调用
 
 | 不做 | 理由 |
 |---|---|
-| 改 G5 的 `readTriageResult` / 响亮失败语义 | 已交付且被断言保护；本包只改**等待预算**与**可配置性** |
-| 改 worker 收割路径 | 生产实测正常 |
-| 改 `profiles/deploy/*.env`（含 `AGENT_RESULT_*` 取值） | 归部署方；本包只保证**缺省合理且可覆盖** |
-| 改模型档位 | 已拍死在 golden-order |
-| 注册任何 bus 协议 | 已完成 |
+| 改 `agent-runtime` | 不同仓；`--prompt-file` **已存在**，本包只是改用它 |
+| 裁剪/抽样语料以塞进 128 KB | ⛔ 那是静默丢证据 —— 本线一路在打的正是这个 |
+| 多位置参数分块 | `cli.ts:70` 用空格 `join`，会破坏 JSON（见 §1 警告） |
+| 改 `--input` 的 schema 守卫语义 | 有独立作用，不得削弱 |
+| 改语料的**内容/结构** | 本包只改**投递方式**，⛔ 内容逐字不变（T3） |
+| 改 `profiles/deploy/*.env` | 归部署方 |
 | 动 `tsconfig` 的 `include` | 已知加 `test/` 会炸出上百个 TS 错，属独立包 |
 
 ---
 
 ## 6　交付物落点
 
-- 实现：`src/tick-run.ts`（triage `readResult` + 生成段 `readBody` 的等待预算与可配置性）
-- 测试：`test/g6-result-timeout.test.ts`（R1–R6）
-- 证据：`docs/dev-notes/dev_ledr_g6_result_timeout_01.md`（R1–R9 逐条 + §3 变异四行**实测** + 还原证据 +
-  **你采用的缺省值与依据**（须复述 §0 的实测分布）+ 全量测试时长对比）
+- 实现：`src/generate.ts`（`buildGenerateRoleArgv` + `spawnGenerateRole`）、
+  `src/tick-run.ts`（`buildTriageArgv` + `spawnTriageRole`）
+- 测试：`test/g7-prompt-file.test.ts`（T1–T6）
+- 证据：`docs/dev-notes/dev_ledr_g7_prompt_file_01.md`（T1–T9 逐条 + §3 变异四行**实测** + 还原证据 +
+  **你构造的超限语料实际字节数**）

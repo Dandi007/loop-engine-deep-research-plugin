@@ -9,10 +9,12 @@
  *  Y5  triage / worker 两条路径的 run-id 生成不受影响
  */
 import { describe, it, expect, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { spawnGenerateRole } from "../src/generate";
 import type { DebaterCorpus } from "../src/generate";
-import { assembleGenerateDeps } from "../src/tick-run";
-import type { TerminationState, BoardState } from "../src/tick";
+import { assembleGenerateDeps, runWrite } from "../src/tick-run";
+import type { WriteDeps, WriteCasInput, TriageSpawnRuntime } from "../src/tick-run";
+import type { TerminationState, BoardState, Decision } from "../src/tick";
 
 const ROLES = [
   "dr-debater-advocate",
@@ -167,23 +169,57 @@ describe("Y4: assertions drive production assembleGenerateDeps", () => {
 // ── Y5: triage / worker 两条路径的 run-id 生成不受影响 ─────────────────
 
 describe("Y5: triage and worker run-id generation unchanged", () => {
-  it("TriageSpawnRuntime has runId (not newRunId)", async () => {
-    const { randomUUID } = await import("node:crypto");
-    const runtime: import("../src/tick-run").TriageSpawnRuntime = {
-      agentRunBin: "/fake/agent-run",
-      runId: randomUUID(),
-      spawnProcess: async () => ({}),
-      readResult: async () => [],
+  it("worker dispatch generates unique run-id per spawn via runWrite", async () => {
+    const spawnRunIds: string[] = [];
+    const spawnWorker = vi.fn(async (_clueId: string, _role: string, runId: string) => {
+      spawnRunIds.push(runId);
+    });
+    const deps: WriteDeps = {
+      cas: async () => ({ success: true }),
+      spawnWorker,
     };
-    expect(runtime).toHaveProperty("runId");
-    expect(runtime).not.toHaveProperty("newRunId");
-    expect(typeof runtime.runId).toBe("string");
-    expect(runtime.runId.length).toBeGreaterThan(0);
+    const decisions: Decision[] = [
+      { kind: "dispatch", clueId: "c1", role: "dr-worker", text: "t1", depth: 0, sources: [] },
+      { kind: "dispatch", clueId: "c2", role: "dr-worker", text: "t2", depth: 0, sources: [] },
+    ];
+    await runWrite(deps, decisions);
+    expect(spawnRunIds).toHaveLength(2);
+    expect(new Set(spawnRunIds).size).toBe(2);
+    for (const id of spawnRunIds) {
+      expect(typeof id).toBe("string");
+      expect(id.length).toBeGreaterThan(0);
+    }
   });
 
-  it("worker per-dispatch runId is const runId = randomUUID() in src/tick.ts", async () => {
-    const { readFileSync } = await import("node:fs");
-    const src = readFileSync("src/tick.ts", "utf8");
-    expect(src).toMatch(/const runId = randomUUID\(\)/);
+  it("triage spawn generates unique run-id per invocation via runWrite", async () => {
+    const recordedRunIds: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const rt: TriageSpawnRuntime = {
+        agentRunBin: "/fake/agent-run",
+        runId: randomUUID(),
+        spawnProcess: async () => ({}),
+        readResult: async () => [],
+      };
+      const deps: WriteDeps = {
+        cas: vi.fn(async (_input: WriteCasInput) => ({ success: true })),
+        spawnWorker: vi.fn(async () => {}),
+        readQuestion: async () => "test question?",
+        triageSpawnRuntime: rt,
+      };
+      const result = await runWrite(deps, [
+        {
+          kind: "triage",
+          proposedClues: [{ clueId: `c${i}`, clueText: `clue ${i}` }],
+          exploredSummaries: [],
+        },
+      ]);
+      expect(result.triageReports).toHaveLength(1);
+      recordedRunIds.push(result.triageReports[0].runId);
+    }
+    expect(new Set(recordedRunIds).size).toBe(2);
+    for (const id of recordedRunIds) {
+      expect(typeof id).toBe("string");
+      expect(id.length).toBeGreaterThan(0);
+    }
   });
 });

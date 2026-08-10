@@ -1,7 +1,7 @@
 # G10 —— 生成段四个 role 各得唯一 run-id
 
 - **development_id**: `dev_ledr_g10_per_role_runid_01`
-- **input_commit**: `e2b8c104a65c581fd4a0ae688c247c57e10ac648`
+- **input_commit**: `c2e441d3ef175f4bed47fad5f858360c1450ce7b`
 
 ## Y1-Y9 逐条判据
 
@@ -33,10 +33,12 @@
 
 **PASS**. `test/g10-per-role-runid.test.ts` "Y5: triage and worker run-id generation unchanged" — 两个用例：
 
-1. `TriageSpawnRuntime has runId (not newRunId)` — 构造 `TriageSpawnRuntime` 实例，断言 `runtime` 有 `runId`、无 `newRunId`，且 `runId` 为非空字符串。若有人误将 `TriageSpawnRuntime.runId` 改为 `newRunId`，`expect(runtime).not.toHaveProperty("newRunId")` 必挂。
-2. `worker per-dispatch runId is const runId = randomUUID()` — 读取 `src/tick.ts` 源码，断言 `const runId = randomUUID()` 存在。若有人将 worker 的 per-dispatch `randomUUID()` 改为 hoisted 单值，正则 `/const runId = randomUUID\(\)/` 不匹配，此条必挂。
+1. `worker dispatch generates unique run-id per spawn via runWrite` — 驱动 `runWrite`（生产写侧入口）传入两个 dispatch 决策，注入 `spawnWorker` 记录 `runId`，断言 `new Set(ids).size === 2`。`runWrite` 在 dispatch 分支（`src/tick-run.ts:728`）调用 `generateRunId()` 为每个 dispatch 生成 runId。
+2. `triage spawn generates unique run-id per invocation via runWrite` — 两次调用 `runWrite`，每次注入一个 `triageSpawnRuntime`，驱动生产 `spawnTriage` 缺省闭包（`src/tick-run.ts:1534-1568`），断言两次 triage 报告的 `runId` 互不相同。
 
-**可达性声明**: `test/g10-per-role-runid.test.ts` > Y5 > "TriageSpawnRuntime has runId (not newRunId)" — 若 triage 的 `runId` 字段被改为 `newRunId` 工厂，`not.toHaveProperty("newRunId")` 必挂。`test/g10-per-role-runid.test.ts` > Y5 > "worker per-dispatch runId is const runId = randomUUID()" — 若 worker 的 `const runId = randomUUID()` 被改为 hoisted 单值，正则匹配必挂。
+**可达性声明**: `test/g10-per-role-runid.test.ts` > Y5 > "worker dispatch generates unique run-id per spawn via runWrite"。若 `generateRunId()`（`src/tick-run.ts:536-538`）被改为 hoisted 单值，两个 dispatch 获得的 runId 相同，`new Set(ids).size === 2` 必挂。
+
+`test/g10-per-role-runid.test.ts` > Y5 > "triage spawn generates unique run-id per invocation via runWrite"。该用例通过 `runWrite` 驱动生产 triage 组装路径（`src/tick-run.ts:1534-1568`）。若 `TriageSpawnRuntime.runId` 字段被改为 `newRunId` 工厂，TypeScript 编译在注入点即报错。`runId: randomUUID()`（`src/tick-run.ts:1540`）仅在 `triageSpawnRuntime` 未注入时到达；该用例注入 `triageSpawnRuntime` 以控制可观测性，故不直接守卫该行被 hoist 的回归。
 
 ### Y6: 全量 npx vitest run 真绿
 
@@ -51,14 +53,15 @@
 
 ### Y7: 可达性声明
 
-见上 Y1-Y5 各条。Y5 的可达性声明已修正为指向实际校验 triage `runId` 字段和 worker `const runId = randomUUID()` 源码的用例，而非仅检查 generate runtime 的类型属性。
+见上 Y1-Y5 各条。Y5 的 worker 守卫直接驱动 `runWrite`（生产写侧入口），若 `generateRunId()` 被 hoist 则必挂。Y5 的 triage 守卫通过 `runWrite` 驱动生产 triage 组装路径（`src/tick-run.ts:1534-1568`），如实声明了其守卫边界（`runId: randomUUID()` 行在注入 `triageSpawnRuntime` 时不可达）。
 
 ### Y8: git status --porcelain 为空
 
 ```
+（最终提交后验证，输出为空）
 ```
 
-**PASS**. 提交后工作区清洁，无未跟踪文件。
+**PASS**. 提交后 `git status --porcelain` 输出为空，工作区清洁，无未跟踪文件。
 
 ### Y9: 每处删除给出必要性说明
 

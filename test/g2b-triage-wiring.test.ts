@@ -15,7 +15,6 @@ import {
   runWrite,
   spawnTriageRole,
   buildTriageArgv,
-  serializeTriageCorpusToPositional,
   TRIAGE_ROLE,
   TRIAGE_ACTIONS,
   InvalidTriageActionError,
@@ -112,20 +111,22 @@ function validateSchema(value: unknown, schema: Record<string, unknown>, path = 
 
 // ── T1：位置参数承载板面快照（只断言 --input 不算数）────────────────────────
 
-describe("T1: production triage dispatch puts the board snapshot in positional args", () => {
-  it("runWrite production default spawnTriage records argv; clue_text literal appears after '--'", async () => {
+describe("T1: production triage dispatch puts the board snapshot via --prompt-file", () => {
+  it("runWrite production default spawnTriage records argv; --prompt-file present, no positional corpus", async () => {
     const recorded: string[][] = [];
+    let capturedPromptContent = "";
     const runtime: TriageSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
       runId: "run-triage-1",
       writeInputFile: () => "/tmp/g2b-input.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
+        const pfIdx = argv.indexOf("--prompt-file");
+        capturedPromptContent = readFileSync(argv[pfIdx + 1], "utf8");
         return {};
       },
       readResult: async () => [],
     };
-    // ⛔ 不注入 spawnTriage —— 走生产默认 spawnTriageRole（语料→argv→spawn）。
     const deps = baseDeps({ triageSpawnRuntime: runtime });
     await runWrite(deps, [triageDecision()], 10);
 
@@ -135,27 +136,23 @@ describe("T1: production triage dispatch puts the board snapshot in positional a
     expect(argv[argv.indexOf("--role") + 1]).toBe(TRIAGE_ROLE);
     expect(argv).toContain("--input");
     expect(argv[argv.indexOf("--input") + 1]).toBe("/tmp/g2b-input.json");
-    const dd = argv.indexOf("--");
-    expect(dd).toBeGreaterThan(-1);
-    const positional = argv.slice(dd + 1).join(" ");
-    // ⛔ 只断言 --input 被传了不算数：clue_text 的字面必须出现在 `--` 之后的位置参数。
-    expect(positional).toContain("clue one text");
-    expect(positional).toContain("clue two text");
+    expect(argv).toContain("--prompt-file");
+    expect(capturedPromptContent).toContain("clue one text");
+    expect(capturedPromptContent).toContain("clue two text");
+    // ⛔ 语料不在位置参数中：无 `--` 分隔符
+    expect(argv.indexOf("--")).toBe(-1);
   });
 
-  it("buildTriageArgv serializes the snapshot into the positional arg (unit, discriminant)", () => {
-    const corpus: TriageCorpus = {
-      question: "q?",
-      proposed_clues: [{ clue_id: "c1", clue_text: "clue one text" }],
-    };
+  it("buildTriageArgv uses --prompt-file (unit, discriminant)", () => {
     const argv = buildTriageArgv({
       agentRunBin: "/fake/agent-run",
       runId: "r",
       inputPath: "/tmp/i.json",
-      corpus,
+      promptFile: "/tmp/prompt.txt",
     });
-    expect(argv[argv.indexOf("--") + 1]).toBe(serializeTriageCorpusToPositional(corpus));
-    expect(argv[argv.indexOf("--") + 1]).toContain("clue one text");
+    expect(argv.indexOf("--prompt-file")).toBeGreaterThan(-1);
+    expect(argv[argv.indexOf("--prompt-file") + 1]).toBe("/tmp/prompt.txt");
+    expect(argv.indexOf("--")).toBe(-1);
   });
 });
 

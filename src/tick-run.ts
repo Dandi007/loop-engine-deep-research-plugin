@@ -146,24 +146,26 @@ export interface TriageReport {
 }
 
 /**
- * G2b §1.1 —— 把 triage 语料序列化为位置参数字符串。
- * agent-run 的 prompt 只由 persona + 位置参数构成，`--input` 只作 schema 守卫、从不注入 prompt。
- * ⇒ 板面快照必须放进位置参数，否则 role 交回空结果（照 G2a `serializeCorpusToPositional` 形状）。
+ * G7 —— 把 triage 语料序列化为字符串（`--prompt-file` 的文件内容）。
+ * agent-run 的 prompt 只由 persona + `--prompt-file` 内容构成，`--input` 只作 schema 守卫、从不注入 prompt。
+ * ⇒ 板面快照必须经 `--prompt-file` 投递，否则 role 交回空结果。
+ * ⛔ 语料不进位置参数：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），真实规模语料会触发 E2BIG。
  */
 export function serializeTriageCorpusToPositional(corpus: TriageCorpus): string {
   return JSON.stringify(corpus);
 }
 
 /**
- * G2b §1.1 —— 构造真实 triage agent-run 的完整 argv：
- * `agent-run --role dr-triage --run-id <id> --input <file> -- "<serialized board snapshot>"`
- * 快照序列化后放在 `--` 之后的位置参数（T1 判别点：⛔ 只断言 `--input` 存在不算数）。
+ * G7 —— 构造真实 triage agent-run 的完整 argv：
+ * `agent-run --role dr-triage --run-id <id> --input <file> --prompt-file <promptFile>`
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），语料正文经 `--prompt-file` 投递。
+ * ⛔ 语料不进位置参数：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），真实规模语料会触发 E2BIG。
  */
 export function buildTriageArgv(opts: {
   agentRunBin: string;
   runId: string;
   inputPath: string;
-  corpus: TriageCorpus;
+  promptFile: string;
 }): string[] {
   return [
     opts.agentRunBin,
@@ -173,14 +175,14 @@ export function buildTriageArgv(opts: {
     opts.runId,
     "--input",
     opts.inputPath,
-    "--",
-    serializeTriageCorpusToPositional(opts.corpus),
+    "--prompt-file",
+    opts.promptFile,
   ];
 }
 
 /**
- * G2b §1.1 —— 把 triage 语料写成 `--input` 载荷文件。
- * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须走位置参数。
+ * G7 —— 把 triage 语料写成 `--input` 载荷文件。
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须经 `--prompt-file` 投递。
  */
 export function writeTriageInputFile(corpus: TriageCorpus): string {
   const file = join(tmpdir(), `g2b-triage-input-${randomUUID()}.json`);
@@ -205,11 +207,11 @@ export interface TriageSpawnRuntime {
 }
 
 /**
- * G2b §1.1 —— 生产默认 triage 派发（照 G2a `spawnGenerateRole` 形状）：
- * 语料 → `--input` 载荷文件 → `buildTriageArgv` 把序列化快照放进位置参数 → spawn agent-run。
- * 这是 `buildTriageArgv` 的**唯一生产调用点**，杜绝「快照→argv」成为死代码（T7 判别点）。
- * ⛔ `spawnProcess` 必填且**无条件调用**（§1.3）：缺失即编译/调用期失败，绝不静默丢弃 argv
- *    返回「从未启动」的假成功。载荷文件的寿命绑定到本次派发：读回结果后**随即移除**（§1.3）。
+ * G7 —— 生产默认 triage 派发：
+ * 语料 → `--input` 载荷文件（schema 守卫） + `--prompt-file` 文件（语料正文）→ spawn agent-run。
+ * 这是 `buildTriageArgv` 的**唯一生产调用点**。
+ * ⛔ `spawnProcess` 必填且**无条件调用**。
+ * 两个临时文件（`--input` + `--prompt-file`）的寿命绑定到本次派发：读回结果后**随即移除**。
  */
 export async function spawnTriageRole(
   corpus: TriageCorpus,
@@ -218,19 +220,21 @@ export async function spawnTriageRole(
   const inputPath = runtime.writeInputFile
     ? runtime.writeInputFile(corpus)
     : writeTriageInputFile(corpus);
+  const serialized = serializeTriageCorpusToPositional(corpus);
+  const promptFile = join(tmpdir(), `g7-triage-prompt-${randomUUID()}.txt`);
+  writeFileSync(promptFile, serialized, "utf8");
   try {
     const argv = buildTriageArgv({
       agentRunBin: runtime.agentRunBin,
       runId: runtime.runId,
       inputPath,
-      corpus,
+      promptFile,
     });
-    // ⛔ 无条件 spawn：runtime 缺 spawnProcess 在类型层即不可通过（必填），杜绝零-spawn 假成功。
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
     return await runtime.readResult(runtime.runId);
   } finally {
-    // 载荷文件用后即删，不泄漏 tmp（§1.3）。
     rmSync(inputPath, { force: true });
+    rmSync(promptFile, { force: true });
   }
 }
 

@@ -1,5 +1,5 @@
 /**
- * S4 —— 生成阶段编排 + 单例 lock + 终态标记（G2a 接线版）
+ * S4 —— 生成阶段编排 + 单例 lock + 终态标记（G2a 接线版 / G7 --prompt-file 投递版）
  *
  * 终止判定（decideTermination）给出非空终态之后，编排生成阶段（spec §1）：
  *   debater（立论 / 反方 / 裁判，不同 route，advocate/opponent 并行 → judge 带 prior_arguments）
@@ -7,10 +7,9 @@
  *       → anchor-check（确定性节点，跑但不阻断导出）
  *         → 导出（确定性节点，最后）
  *
- * G2a 把 S4 的「占位 spawn」接到真实 R2 role（dr-debater-* / dr-synthesizer）：
- *   - spawnDebater/spawnSynthesizer 只收 route 的占位形状，替换为「role + route + 语料」，
- *     返回 `{ body }`，语料由引擎侧确定性组装后放进位置参数（⛔ 不得只靠 `--input` 注入 prompt）。
- *   - 产物回写 `research.doc.v2`：doc_kind 由「派的是哪个 role」推出（⛔ 绝不读 payload.doc_kind）。
+ * G7 把语料投递从位置参数改为 `--prompt-file`：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），
+ * 真实规模语料（256 KB+）经位置参数会触发 spawn E2BIG；`--prompt-file` 走文件投递无此限制。
+ * `--input` 的 schema 守卫语义保留不变。
  *
  * 结构沿用 S2/S3：编排决策是纯函数，副作用只在执行壳（runGenerate）里。
  * 本模块不 import ./bus；读 / spawn / lock / 回写全部经 deps 注入。
@@ -204,9 +203,10 @@ export interface EvidenceView {
 }
 
 /**
- * G2a §1.1 —— 把语料序列化为位置参数字符串。
- * agent-run 的 prompt 只由 persona + 位置参数构成，`--input` 只作 schema 守卫、从不注入 prompt。
- * ⇒ 生成段三类角色的语料必须放进位置参数，否则角色交回空结果。
+ * G7 —— 把语料序列化为字符串（`--prompt-file` 的文件内容）。
+ * agent-run 的 prompt 只由 persona + `--prompt-file` 内容构成，`--input` 只作 schema 守卫、从不注入 prompt。
+ * ⇒ 生成段三类角色的语料必须经 `--prompt-file` 投递，否则角色交回空结果。
+ * ⛔ 语料不进位置参数：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），真实规模语料（256 KB+）会触发 spawn E2BIG。
  */
 export function serializeCorpusToPositional(
   corpus: DebaterCorpus | SynthesizerCorpus,
@@ -215,9 +215,10 @@ export function serializeCorpusToPositional(
 }
 
 /**
- * G2a §1.1 —— 构造真实生成角色 agent-run 的完整 argv：
- * `agent-run --role <role> --route <route> --run-id <runId> --input <inputPath> -- "<serialized corpus>"`
- * 语料序列化后放在 `--` 之后的位置参数（D1 判别点：⛔ 只断言 `--input` 存在不算数）。
+ * G7 —— 构造真实生成角色 agent-run 的完整 argv：
+ * `agent-run --role <role> --route <route> --run-id <runId> --input <inputPath> --prompt-file <promptFile>`
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），语料正文经 `--prompt-file` 投递。
+ * ⛔ 语料不进位置参数：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），真实规模语料（256 KB+）会触发 E2BIG。
  */
 export function buildGenerateRoleArgv(opts: {
   agentRunBin: string;
@@ -225,7 +226,7 @@ export function buildGenerateRoleArgv(opts: {
   route: string;
   runId: string;
   inputPath: string;
-  corpus: DebaterCorpus | SynthesizerCorpus;
+  promptFile: string;
 }): string[] {
   return [
     opts.agentRunBin,
@@ -237,14 +238,14 @@ export function buildGenerateRoleArgv(opts: {
     opts.runId,
     "--input",
     opts.inputPath,
-    "--",
-    serializeCorpusToPositional(opts.corpus),
+    "--prompt-file",
+    opts.promptFile,
   ];
 }
 
 /**
- * G2a §1.1 —— 把语料写成 `--input` 载荷文件。
- * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须走位置参数。
+ * G7 —— 把语料写成 `--input` 载荷文件。
+ * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），⛔ 语料正文必须经 `--prompt-file` 投递。
  */
 export function writeGenerateInputFile(corpus: DebaterCorpus | SynthesizerCorpus): string {
   const file = join(tmpdir(), `g2a-generate-input-${randomUUID()}.json`);
@@ -269,12 +270,11 @@ export interface GenerateSpawnRuntime {
 }
 
 /**
- * G2a §1.1 —— 生产默认 agent-run 派发（类比 tick-run 的 `spawnAgentRunWorker`）：
- * 语料 → `--input` 载荷文件 → `buildGenerateRoleArgv` 把序列化语料放进位置参数 → spawn agent-run。
- * 这是 `buildGenerateRoleArgv` 的**唯一生产调用点**，杜绝「语料→argv」成为死代码（评审 blocker）。
- * ⛔ `spawnProcess` 必填且**无条件调用**（评审 major）：缺失即编译/调用期失败，绝不静默丢弃 argv
- *    返回「从未启动」的假成功。载荷文件的寿命绑定到本次派发：读回 body 后**随即移除**（评审 minor，
- *    类比 tick-run 的 `onExit` unlink），防止每个 generation role 泄漏一个 tmp 文件。
+ * G7 —— 生产默认 agent-run 派发：
+ * 语料 → `--input` 载荷文件（schema 守卫） + `--prompt-file` 文件（语料正文）→ spawn agent-run。
+ * 这是 `buildGenerateRoleArgv` 的**唯一生产调用点**。
+ * ⛔ `spawnProcess` 必填且**无条件调用**。
+ * 两个临时文件（`--input` + `--prompt-file`）的寿命绑定到本次派发：读回 body 后**随即移除**。
  */
 export async function spawnGenerateRole(
   role: string,
@@ -285,6 +285,9 @@ export async function spawnGenerateRole(
   const inputPath = runtime.writeInputFile
     ? runtime.writeInputFile(corpus)
     : writeGenerateInputFile(corpus);
+  const serialized = serializeCorpusToPositional(corpus);
+  const promptFile = join(tmpdir(), `g7-generate-prompt-${randomUUID()}.txt`);
+  writeFileSync(promptFile, serialized, "utf8");
   try {
     const argv = buildGenerateRoleArgv({
       agentRunBin: runtime.agentRunBin,
@@ -292,14 +295,13 @@ export async function spawnGenerateRole(
       route,
       runId: runtime.runId,
       inputPath,
-      corpus,
+      promptFile,
     });
-    // ⛔ 无条件 spawn：runtime 缺 spawnProcess 在类型层即不可通过（必填），杜绝零-spawn 假成功。
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
     return { body: await runtime.readBody(runtime.runId) };
   } finally {
-    // 载荷文件用后即删，不泄漏 tmp（评审 minor）。
     rmSync(inputPath, { force: true });
+    rmSync(promptFile, { force: true });
   }
 }
 
@@ -338,7 +340,7 @@ export interface GenerateDeps {
   readEvidences(): Promise<EvidenceView[]>;
   /**
    * 按 role+route 派发一个生成角色，喂入引擎侧组装好的语料，回收 { body }。
-   * ⛔ 语料必须由引擎序列化后放进位置参数（§1.1），不得只靠 `--input`。
+   * ⛔ 语料必须由引擎序列化后经 `--prompt-file` 投递，`--input` 只作 schema 守卫。
    * 缺省（不注入）走生产路径 `spawnGenerateRole`（语料→argv→spawn），经 `spawnRuntime` 提供运行时。
    */
   spawnRole?(

@@ -336,9 +336,10 @@ describe("S4 anchor-check never blocks export (D9/D10)", () => {
   });
 });
 
-describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production entry + fake agent-run)", () => {
-  it("D1: spawnGenerateRole (production entry) places serialized evidence text in the positional args of the recorded argv", async () => {
+describe("G7: corpus reaches the role prompt via --prompt-file (production entry + fake agent-run)", () => {
+  it("spawnGenerateRole (production entry) places serialized corpus in --prompt-file, not positional", async () => {
     const recorded: string[][] = [];
+    let capturedPromptContent = "";
     const corpus: DebaterCorpus = {
       question: "research question?",
       evidences: [
@@ -356,6 +357,8 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
+        const pfIdx = argv.indexOf("--prompt-file");
+        capturedPromptContent = readFileSync(argv[pfIdx + 1], "utf8");
         return {};
       },
       readBody: async () => "out",
@@ -364,18 +367,16 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production
 
     expect(recorded).toHaveLength(1);
     const argv = recorded[0];
-    const dd = argv.indexOf("--");
-    expect(dd).toBeGreaterThanOrEqual(0);
-    const positional = argv.slice(dd + 1).join(" ");
-    // ⛔ 断言序列化后的证据文本出现在【位置参数】中；只断言 `--input` 存在不算数。
-    expect(positional).toContain("code://repo@abc123:src/foo.ts#L42");
-    expect(positional).toContain("exact quoted text");
-    expect(positional).toContain("research question?");
+    expect(capturedPromptContent).toContain("code://repo@abc123:src/foo.ts#L42");
+    expect(capturedPromptContent).toContain("exact quoted text");
+    expect(capturedPromptContent).toContain("research question?");
     // `--input` 只作 schema 守卫，指向载荷文件（内容不得只靠它注入 prompt）。
     expect(argv[argv.indexOf("--input") + 1]).toBe("/tmp/payload.json");
+    // ⛔ 语料不在位置参数中：无 `--` 分隔符
+    expect(argv.indexOf("--")).toBe(-1);
   });
 
-  it("D1: runGenerate's default spawnRole turns readEvidences corpus into argv, anchor in positional", async () => {
+  it("runGenerate's default spawnRole turns readEvidences corpus into --prompt-file content", async () => {
     const evidences = [
       {
         clue_id: "c1",
@@ -385,17 +386,21 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production
       },
     ];
     const recorded: string[][] = [];
+    let capturedPromptContent = "";
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
       runId: "run-1",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
+        const pfIdx = argv.indexOf("--prompt-file");
+        if (pfIdx >= 0) {
+          capturedPromptContent = readFileSync(argv[pfIdx + 1], "utf8");
+        }
         return {};
       },
       readBody: async () => "out",
     };
-    // ⛔ 不注入 spawnRole —— runGenerate 走生产默认 spawnGenerateRole（语料→argv→spawn）。
     const deps = baseDeps({
       readEvidences: async () => evidences,
       spawnRole: undefined,
@@ -405,11 +410,9 @@ describe("G2a D1: corpus reaches the role prompt via POSITIONAL args (production
 
     const advArgv = recorded.find((a) => a.includes("dr-debater-advocate"));
     expect(advArgv).toBeDefined();
-    const dd = advArgv!.indexOf("--");
-    const positional = advArgv!.slice(dd + 1).join(" ");
-    expect(positional).toContain("code://repo@abc123:src/foo.ts#L42");
-    expect(positional).toContain("exact quoted text");
-    // 位置参数里带的语料就是序列化的 evidence（§1.1：只靠 --input 不算数）。
+    expect(capturedPromptContent).toContain("code://repo@abc123:src/foo.ts#L42");
+    expect(capturedPromptContent).toContain("exact quoted text");
+    // 语料内容就是序列化的 evidence（§1.1：只靠 --input 不算数）。
     expect(serializeCorpusToPositional({ question: "research question?", evidences })).toContain(
       "code://repo@abc123:src/foo.ts#L42",
     );

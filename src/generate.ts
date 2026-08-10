@@ -324,6 +324,12 @@ export interface AnchorCheckResult {
   loud_failures: Array<{ anchor: string; error: string }>;
 }
 
+/** G13 —— 从 doc channel 回读的已有 doc（含 message_id）。 */
+export interface ExistingDoc {
+  doc: DocV2;
+  messageId: string;
+}
+
 /** 执行壳的依赖注入面：所有副作用（读 / spawn / lock / 回写）都从这里走。 */
 export interface GenerateDeps {
   readTermination(): Promise<TerminationState>;
@@ -359,6 +365,11 @@ export interface GenerateDeps {
    * 任一时刻并发 = 1（spec §3），且绝不跳过 synthesizer 阶段（spec §3 严格串行边）。
    */
   lockSynthesizer(): Promise<() => Promise<void>>;
+  /**
+   * G13 —— 读 doc channel 上该 origin 的已有 doc（回读 research.doc.v2）。
+   * 缺省（未接线）⇒ 不作复用检查，行为与今天逐字一致。
+   */
+  readDocs?(origin: string): Promise<ExistingDoc[]>;
 }
 
 /**
@@ -396,42 +407,65 @@ export async function runGenerate(
   const origin = await deps.readOrigin();
   const evidences = await deps.readEvidences();
 
-  // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
-  const [advocate, opponent, judge] = cfg.debaters;
-  const [advOut, oppOut] = await Promise.all([
-    spawnRole(advocate.role, { question, evidences }),
-    spawnRole(opponent.role, { question, evidences }),
-  ]);
-  const judgeOut = await spawnRole(judge.role, {
-    question,
-    evidences,
-    prior_arguments: [advOut.body, oppOut.body],
-  });
+  // G13 —— 跑角色之前先查 doc channel 上该 origin 的已有产物。
+  let isReuse = false;
+  let reportBody = "";
+  let synthDocMessageId = "";
+  let synthBody = "";
 
-  // 产物回写：三条 debater 的 body → research.doc.v2（doc_kind=argument，由 role 推出）。
-  const debaterOuts = [advOut, oppOut, judgeOut];
-  for (let i = 0; i < cfg.debaters.length; i++) {
-    const spec = cfg.debaters[i];
-    await deps.writeDoc(
-      buildDoc(spec.role, debaterOuts[i], origin),
-      `dr-doc:${spec.role}:${origin}`,
-    );
+  if (deps.readDocs) {
+    const existingDocs = await deps.readDocs(origin);
+    const existingArgs = existingDocs.filter((d) => d.doc.doc_kind === "argument");
+    const existingReport = existingDocs.find((d) => d.doc.doc_kind === "report");
+
+    if (existingReport) {
+      isReuse = true;
+      reportBody = existingReport.doc.body;
+      synthDocMessageId = existingReport.messageId;
+    } else if (existingArgs.length > 0) {
+      throw new Error(
+        `G13: origin "${origin}" has ${existingArgs.length} existing argument(s) with no report — partial publish, cannot safely resume`,
+      );
+    }
   }
 
-  // synthesizer：单例 lock 串行化（wait-then-run）。拿锁后必跑，绝不跳过（D6 / spec §3）。
-  // ⛔ terminal_marker 传 `buildReportMarker()` 产出的结构化对象，不是渲染字符串（评审 blocker）。
-  const synthCorpus: SynthesizerCorpus = {
-    question,
-    evidences,
-    arguments: debaterOuts.map((o) => o.body),
-    terminal_marker: marker,
-  };
-  const release = await deps.lockSynthesizer();
-  let synthBody: string;
-  try {
-    synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
-  } finally {
-    await release();
+  if (!isReuse) {
+    // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
+    const [advocate, opponent, judge] = cfg.debaters;
+    const [advOut, oppOut] = await Promise.all([
+      spawnRole(advocate.role, { question, evidences }),
+      spawnRole(opponent.role, { question, evidences }),
+    ]);
+    const judgeOut = await spawnRole(judge.role, {
+      question,
+      evidences,
+      prior_arguments: [advOut.body, oppOut.body],
+    });
+
+    // 产物回写：三条 debater 的 body → research.doc.v2（doc_kind=argument，由 role 推出）。
+    const debaterOuts = [advOut, oppOut, judgeOut];
+    for (let i = 0; i < cfg.debaters.length; i++) {
+      const spec = cfg.debaters[i];
+      await deps.writeDoc(
+        buildDoc(spec.role, debaterOuts[i], origin),
+        `dr-doc:${spec.role}:${origin}`,
+      );
+    }
+
+    // synthesizer：单例 lock 串行化（wait-then-run）。拿锁后必跑，绝不跳过（D6 / spec §3）。
+    // ⛔ terminal_marker 传 `buildReportMarker()` 产出的结构化对象，不是渲染字符串（评审 blocker）。
+    const synthCorpus: SynthesizerCorpus = {
+      question,
+      evidences,
+      arguments: debaterOuts.map((o) => o.body),
+      terminal_marker: marker,
+    };
+    const release = await deps.lockSynthesizer();
+    try {
+      synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
+    } finally {
+      await release();
+    }
   }
 
   // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
@@ -475,15 +509,17 @@ export async function runGenerate(
     anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
   }
 
-  // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
-  const reportHead = renderReportHead(marker, anchorRate, anchorTail);
-  const reportBody = reportHead + synthBody;
+  if (!isReuse) {
+    // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
+    const reportHead = renderReportHead(marker, anchorRate, anchorTail);
+    reportBody = reportHead + synthBody;
 
-  // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
-  const synthDocMessageId = await deps.writeDoc(
-    buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
-    `dr-doc:${cfg.synthesizer.role}:${origin}`,
-  );
+    // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
+    synthDocMessageId = await deps.writeDoc(
+      buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
+      `dr-doc:${cfg.synthesizer.role}:${origin}`,
+    );
+  }
 
   // 导出：最后（D8），带 source_message_id。
   await deps.spawnExport(reportBody, synthDocMessageId);

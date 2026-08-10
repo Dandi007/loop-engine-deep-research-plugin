@@ -57,6 +57,7 @@ import {
   type GenerateDeps,
   type GenerateSpawnRuntime,
   type AnchorCheckResult,
+  type ExistingDoc,
   MissingAnchorCheckRepoRootError,
 } from "./generate";
 import { runExport, slugify, type ExportInput } from "./export";
@@ -1433,6 +1434,17 @@ export function assembleGenerateDeps(
       return async () => {
         rmSync(lockPath, { force: true });
       };
+    },
+    readDocs: async (origin: string) => {
+      if (!opts.docChannelId) return [];
+      const msgs = await readChannelMessages(opts.docChannelId);
+      return msgs
+        .filter((m) => m.kind === "research.doc.v2")
+        .map((m) => {
+          const p = (m.payload ?? {}) as DocV2;
+          return { doc: p, messageId: m.message_id };
+        })
+        .filter((d) => d.doc.origin === origin);
     },
   };
 }

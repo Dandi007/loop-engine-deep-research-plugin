@@ -2,7 +2,7 @@
  * S4 —— 生成阶段编排 + 单例 lock + 终态标记（G2a 接线版 / G7 --prompt-file 投递版）
  *
  * 终止判定（decideTermination）给出非空终态之后，编排生成阶段（spec §1）：
- *   debater（立论 / 反方 / 裁判，不同 route，advocate/opponent 并行 → judge 带 prior_arguments）
+ *   debater（立论 / 反方 / 裁判，advocate/opponent 并行 → judge 带 prior_arguments）
  *     → synthesizer（⛔ 单例 lock，任一时刻并发 = 1，绝不跳过）
  *       → anchor-check（确定性节点，跑但不阻断导出）
  *         → 导出（确定性节点，最后）
@@ -21,46 +21,32 @@ import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
 
-/** 单个生成角色：role（persona）+ route（模型）。 */
+/** 单个生成角色：role（persona）。档位（runtime + route）已移交 role YAML 为唯一真相。
+ *  agent-runtime profiles/roles/*.yaml 实测（已合入 main）：
+ *  | role                  | runtime   | route            |
+ *  | dr-debater-advocate   | opencode  | opus-4-8/ccs     |
+ *  | dr-debater-opponent   | opencode  | gpt-5.6-sol/ccs  |
+ *  | dr-debater-judge      | opencode  | ds-v4-pro/ccs    |
+ *  | dr-synthesizer        | opencode  | opus-5/ccs       |
+ */
 export interface GenerateRoleSpec {
   role: string;
-  route: string;
 }
 
-/** 生成阶段参数（spec §6）：三条 debater route 必须互不相同，不得硬编码。 */
+/** 生成阶段参数。档位真相已移交 role YAML（见 GenerateRoleSpec 的 JSDoc 表）。 */
 export interface GenerateConfig {
-  /** debater 三立场（立论 / 反方 / 裁判）的 role+route，route 互不相同。 */
   debaters: readonly [GenerateRoleSpec, GenerateRoleSpec, GenerateRoleSpec];
   synthesizer: GenerateRoleSpec;
-  exportRoute: string;
 }
 
 export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
-  // ⛔ role/route 以 agent-runtime 实际文件为准（spec §2.1 表格）。
   debaters: [
-    { role: "dr-debater-advocate", route: "opus-4-8/ccs" },
-    { role: "dr-debater-opponent", route: "gpt-5.6-sol/ccs" },
-    { role: "dr-debater-judge", route: "ds-v4-pro/ccs" },
+    { role: "dr-debater-advocate" },
+    { role: "dr-debater-opponent" },
+    { role: "dr-debater-judge" },
   ],
-  synthesizer: { role: "dr-synthesizer", route: "opus-5/ccs" },
-  exportRoute: "export",
+  synthesizer: { role: "dr-synthesizer" },
 };
-
-/**
- * 纯函数：校验三条 debater route 必须互不相同（spec §6 / D5 / G2a D3）。
- * 任何调用方传入重复 route 都立即抛错，杜绝「默认配置下恰好不同、自定义配置却静默接受重复」的 Q2 形态。
- */
-export function assertDistinctDebaterRoutes(cfg: GenerateConfig): void {
-  const routes = cfg.debaters.map((d) => d.route);
-  const distinct = new Set(routes);
-  if (cfg.debaters.length !== 3 || distinct.size !== 3) {
-    throw new Error(
-      `GenerateConfig.debaters must have three mutually distinct routes; got ${JSON.stringify(
-        routes,
-      )}`,
-    );
-  }
-}
 
 /** 终态标记：两个正交事实（spec §5.1），由报告 body 头部承载。 */
 export interface ReportMarker {
@@ -215,15 +201,15 @@ export function serializeCorpusToPositional(
 }
 
 /**
- * G7 —— 构造真实生成角色 agent-run 的完整 argv：
- * `agent-run --role <role> --route <route> --run-id <runId> --input <inputPath> --prompt-file <promptFile>`
+ * G8 —— 构造真实生成角色 agent-run 的 argv。
+ * 只传 `--role`（档位真相已移交 role YAML），不传 `--route` / `--runtime`。
+ * `agent-run --role <role> --run-id <runId> --input <inputPath> --prompt-file <promptFile>`
  * `--input` 只作 schema 守卫（校验完就扔、从不注入 prompt），语料正文经 `--prompt-file` 投递。
  * ⛔ 语料不进位置参数：Linux 单参数上限 128 KB（MAX_ARG_STRLEN），真实规模语料（256 KB+）会触发 E2BIG。
  */
 export function buildGenerateRoleArgv(opts: {
   agentRunBin: string;
   role: string;
-  route: string;
   runId: string;
   inputPath: string;
   promptFile: string;
@@ -232,8 +218,6 @@ export function buildGenerateRoleArgv(opts: {
     opts.agentRunBin,
     "--role",
     opts.role,
-    "--route",
-    opts.route,
     "--run-id",
     opts.runId,
     "--input",
@@ -278,7 +262,6 @@ export interface GenerateSpawnRuntime {
  */
 export async function spawnGenerateRole(
   role: string,
-  route: string,
   corpus: DebaterCorpus | SynthesizerCorpus,
   runtime: GenerateSpawnRuntime,
 ): Promise<{ body: string }> {
@@ -292,7 +275,6 @@ export async function spawnGenerateRole(
     const argv = buildGenerateRoleArgv({
       agentRunBin: runtime.agentRunBin,
       role,
-      route,
       runId: runtime.runId,
       inputPath,
       promptFile,
@@ -339,13 +321,12 @@ export interface GenerateDeps {
   /** 从 evidence channel 回读证据（anchor/quote/claim/clue_id）。 */
   readEvidences(): Promise<EvidenceView[]>;
   /**
-   * 按 role+route 派发一个生成角色，喂入引擎侧组装好的语料，回收 { body }。
+   * 按 role 派发一个生成角色，喂入引擎侧组装好的语料，回收 { body }。
    * ⛔ 语料必须由引擎序列化后经 `--prompt-file` 投递，`--input` 只作 schema 守卫。
    * 缺省（不注入）走生产路径 `spawnGenerateRole`（语料→argv→spawn），经 `spawnRuntime` 提供运行时。
    */
   spawnRole?(
     role: string,
-    route: string,
     corpus: DebaterCorpus | SynthesizerCorpus,
   ): Promise<{ body: string }>;
   /** 缺省 spawnRole 的生产运行时（不注入 spawnRole 时使用）。 */
@@ -377,18 +358,16 @@ export async function runGenerate(
   deps: GenerateDeps,
   cfg: GenerateConfig = DEFAULT_GENERATE_CONFIG,
 ): Promise<void> {
-  assertDistinctDebaterRoutes(cfg);
-
   // 缺省 spawnRole = 生产 agent-run 派发（语料→argv→spawn，经 spawnGenerateRole）。
   const spawnRole: NonNullable<GenerateDeps["spawnRole"]> =
     deps.spawnRole ??
-    ((role, route, corpus) => {
+    ((role, corpus) => {
       if (!deps.spawnRuntime) {
         throw new Error(
           "GenerateDeps.spawnRole has no default: provide spawnRole or a spawnRuntime",
         );
       }
-      return spawnGenerateRole(role, route, corpus, deps.spawnRuntime);
+      return spawnGenerateRole(role, corpus, deps.spawnRuntime);
     });
 
   const term = await deps.readTermination();
@@ -404,10 +383,10 @@ export async function runGenerate(
   // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
   const [advocate, opponent, judge] = cfg.debaters;
   const [advOut, oppOut] = await Promise.all([
-    spawnRole(advocate.role, advocate.route, { question, evidences }),
-    spawnRole(opponent.role, opponent.route, { question, evidences }),
+    spawnRole(advocate.role, { question, evidences }),
+    spawnRole(opponent.role, { question, evidences }),
   ]);
-  const judgeOut = await spawnRole(judge.role, judge.route, {
+  const judgeOut = await spawnRole(judge.role, {
     question,
     evidences,
     prior_arguments: [advOut.body, oppOut.body],
@@ -434,7 +413,7 @@ export async function runGenerate(
   const release = await deps.lockSynthesizer();
   let synthBody: string;
   try {
-    synthBody = (await spawnRole(cfg.synthesizer.role, cfg.synthesizer.route, synthCorpus)).body;
+    synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
   } finally {
     await release();
   }

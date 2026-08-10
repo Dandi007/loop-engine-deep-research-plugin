@@ -354,6 +354,12 @@ export interface GenerateDeps {
    *  返回发布出的 message_id。 */
   writeDoc(doc: DocV2, idempotencyKey: string): Promise<string>;
   /**
+   * G13 —— 按 (role, origin) 查 doc channel 上是否已有该 doc。
+   * 已存在 ⇒ 复用其 body，不 spawn、不重新 publish；不存在 ⇒ 走现有路径。
+   * 返回 { doc, messageId } 或 null。
+   */
+  readDoc?(role: string, origin: string): Promise<{ doc: DocV2; messageId: string } | null>;
+  /**
    * 单例 lock：串行化（wait-then-run），而不是拿不到就跳过。
    * 返回一个 release 函数；调用方拿到锁后必须跑 synthesizer，再释放。
    * 任一时刻并发 = 1（spec §3），且绝不跳过 synthesizer 阶段（spec §3 严格串行边）。
@@ -396,50 +402,128 @@ export async function runGenerate(
   const origin = await deps.readOrigin();
   const evidences = await deps.readEvidences();
 
+  // G13 —— 发布前按 (role, origin) 查 doc channel 上是否已有该 doc。
+  // 已存在 ⇒ 复用其 body，不 spawn、不重新 publish；不存在 ⇒ 走现有路径。
+  const readDoc = deps.readDoc;
+  const existingDocMap = new Map<string, { doc: DocV2; messageId: string } | null>();
+  if (readDoc) {
+    for (const spec of cfg.debaters) {
+      existingDocMap.set(spec.role, await readDoc(spec.role, origin));
+    }
+    existingDocMap.set(cfg.synthesizer.role, await readDoc(cfg.synthesizer.role, origin));
+  }
+
   // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
+  // ⛔ G13：已存在该 doc 的角色不 spawn，直接复用其 body。
   const [advocate, opponent, judge] = cfg.debaters;
-  const [advOut, oppOut] = await Promise.all([
-    spawnRole(advocate.role, { question, evidences }),
-    spawnRole(opponent.role, { question, evidences }),
-  ]);
-  const judgeOut = await spawnRole(judge.role, {
-    question,
-    evidences,
-    prior_arguments: [advOut.body, oppOut.body],
-  });
+  const advOut = existingDocMap.get(advocate.role)?.doc
+    ? { body: existingDocMap.get(advocate.role)!.doc.body }
+    : await spawnRole(advocate.role, { question, evidences });
+  const oppOut = existingDocMap.get(opponent.role)?.doc
+    ? { body: existingDocMap.get(opponent.role)!.doc.body }
+    : await spawnRole(opponent.role, { question, evidences });
+  const judgeOut = existingDocMap.get(judge.role)?.doc
+    ? { body: existingDocMap.get(judge.role)!.doc.body }
+    : await spawnRole(judge.role, {
+        question,
+        evidences,
+        prior_arguments: [advOut.body, oppOut.body],
+      });
 
   // 产物回写：三条 debater 的 body → research.doc.v2（doc_kind=argument，由 role 推出）。
+  // ⛔ G13：已存在该 doc 的角色不重新 publish（幂等键已占用）。
   const debaterOuts = [advOut, oppOut, judgeOut];
   for (let i = 0; i < cfg.debaters.length; i++) {
     const spec = cfg.debaters[i];
-    await deps.writeDoc(
-      buildDoc(spec.role, debaterOuts[i], origin),
-      `dr-doc:${spec.role}:${origin}`,
-    );
+    if (!existingDocMap.get(spec.role)?.doc) {
+      await deps.writeDoc(
+        buildDoc(spec.role, debaterOuts[i], origin),
+        `dr-doc:${spec.role}:${origin}`,
+      );
+    }
   }
 
   // synthesizer：单例 lock 串行化（wait-then-run）。拿锁后必跑，绝不跳过（D6 / spec §3）。
+  // ⛔ G13：若 synthesizer 的 doc 已存在，直接复用其 body，不 lock、不 spawn、不 publish。
   // ⛔ terminal_marker 传 `buildReportMarker()` 产出的结构化对象，不是渲染字符串（评审 blocker）。
-  const synthCorpus: SynthesizerCorpus = {
-    question,
-    evidences,
-    arguments: debaterOuts.map((o) => o.body),
-    terminal_marker: marker,
-  };
-  const release = await deps.lockSynthesizer();
   let synthBody: string;
-  try {
-    synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
-  } finally {
-    await release();
+  let synthDocMessageId: string;
+  const synthExisting = existingDocMap.get(cfg.synthesizer.role);
+  if (synthExisting?.doc) {
+    synthBody = synthExisting.doc.body;
+    synthDocMessageId = synthExisting.messageId;
+  } else {
+    const synthCorpus: SynthesizerCorpus = {
+      question,
+      evidences,
+      arguments: debaterOuts.map((o) => o.body),
+      terminal_marker: marker,
+    };
+    const release = await deps.lockSynthesizer();
+    try {
+      synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
+    } finally {
+      await release();
+    }
+
+    // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
+    // ⛔ 崩溃与真实 0% 核验率要可区分：崩溃时头部标 unavailable（评审 minor），而非伪装成 0。
+    // ⛔ 核验率 = current_verified_hit / total（分母必须是 total，不得用 current_parsed）。
+    // ⛔ total === 0 ⇒ unavailable（非「全部核验通过」）。
+    // ⛔ sums_ok === false ⇒ unavailable 且点名 sums_ok=false（须与崩溃可区分）。
+    // ⛔ ALLOWED_ROOT 未配置 ⇒ unavailable 且点名 no-repo-root（须与崩溃可区分）。
+    let anchorRate: number | null = null;
+    let anchorTail: string | undefined;
+    let anchorJsonWritten = true;
+    let anchorCheckJson: string | null = null;
+    try {
+      const ac = await deps.spawnAnchorCheck();
+      anchorCheckJson = JSON.stringify(ac);
+      if (ac.total === 0) {
+        // total === 0 ⇒ unavailable (V3)
+      } else if (!ac.sums_ok) {
+        // sums_ok === false ⇒ unavailable + name it (V4)
+        anchorTail = "sums_ok=false";
+      } else {
+        anchorRate = (ac.current_verified_hit / ac.total) * 100;
+      }
+    } catch (e) {
+      if (e instanceof MissingAnchorCheckRepoRootError) {
+        anchorTail = "no-repo-root";
+      }
+      // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
+    }
+
+    // anchor-check JSON 落盘（软闸门：失败不阻断导出）
+    if (anchorCheckJson !== null && deps.writeAnchorCheckJson) {
+      try {
+        await deps.writeAnchorCheckJson(anchorCheckJson);
+      } catch {
+        anchorJsonWritten = false;
+      }
+    }
+
+    if (!anchorJsonWritten) {
+      anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
+    }
+
+    // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
+    const reportHead = renderReportHead(marker, anchorRate, anchorTail);
+    const reportBody = reportHead + synthBody;
+
+    // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
+    synthDocMessageId = await deps.writeDoc(
+      buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
+      `dr-doc:${cfg.synthesizer.role}:${origin}`,
+    );
+
+    // 导出：最后（D8），带 source_message_id。
+    await deps.spawnExport(reportBody, synthDocMessageId);
+    return;
   }
 
+  // G13 —— synthesizer doc 已存在被复用：anchor-check 与导出照常执行。
   // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
-  // ⛔ 崩溃与真实 0% 核验率要可区分：崩溃时头部标 unavailable（评审 minor），而非伪装成 0。
-  // ⛔ 核验率 = current_verified_hit / total（分母必须是 total，不得用 current_parsed）。
-  // ⛔ total === 0 ⇒ unavailable（非「全部核验通过」）。
-  // ⛔ sums_ok === false ⇒ unavailable 且点名 sums_ok=false（须与崩溃可区分）。
-  // ⛔ ALLOWED_ROOT 未配置 ⇒ unavailable 且点名 no-repo-root（须与崩溃可区分）。
   let anchorRate: number | null = null;
   let anchorTail: string | undefined;
   let anchorJsonWritten = true;
@@ -448,9 +532,7 @@ export async function runGenerate(
     const ac = await deps.spawnAnchorCheck();
     anchorCheckJson = JSON.stringify(ac);
     if (ac.total === 0) {
-      // total === 0 ⇒ unavailable (V3)
     } else if (!ac.sums_ok) {
-      // sums_ok === false ⇒ unavailable + name it (V4)
       anchorTail = "sums_ok=false";
     } else {
       anchorRate = (ac.current_verified_hit / ac.total) * 100;
@@ -459,10 +541,8 @@ export async function runGenerate(
     if (e instanceof MissingAnchorCheckRepoRootError) {
       anchorTail = "no-repo-root";
     }
-    // 失败不得阻断导出；anchorRate 保持 null → 头部标 unavailable。
   }
 
-  // anchor-check JSON 落盘（软闸门：失败不阻断导出）
   if (anchorCheckJson !== null && deps.writeAnchorCheckJson) {
     try {
       await deps.writeAnchorCheckJson(anchorCheckJson);
@@ -475,16 +555,6 @@ export async function runGenerate(
     anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
   }
 
-  // 报告 body 头部 = 终态标记 + anchor-check 核验率；核验率 <90% 仍导出，但必须标在头部。
-  const reportHead = renderReportHead(marker, anchorRate, anchorTail);
-  const reportBody = reportHead + synthBody;
-
-  // 产物回写：synthesizer 的 report → research.doc.v2（doc_kind=report，由 role 推出）。
-  const synthDocMessageId = await deps.writeDoc(
-    buildDoc(cfg.synthesizer.role, { body: reportBody }, origin),
-    `dr-doc:${cfg.synthesizer.role}:${origin}`,
-  );
-
-  // 导出：最后（D8），带 source_message_id。
-  await deps.spawnExport(reportBody, synthDocMessageId);
+  // 导出：最后（D8），带 source_message_id（使用已存在 doc 的 messageId）。
+  await deps.spawnExport(synthBody, synthDocMessageId);
 }

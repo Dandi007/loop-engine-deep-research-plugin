@@ -53,6 +53,7 @@ import {
   decideGenerate,
   DEFAULT_GENERATE_CONFIG,
   buildReportMarker,
+  deriveDocKind,
   type EvidenceView,
   type GenerateDeps,
   type GenerateSpawnRuntime,
@@ -1418,6 +1419,18 @@ export function assembleGenerateDeps(
       if (!opts.docChannelId) throw new MissingDocChannelError();
       const result = await publishDoc(opts.docChannelId, doc, idempotencyKey);
       return result.message_id;
+    },
+    readDoc: async (role, origin) => {
+      if (!opts.docChannelId) return null;
+      const msgs = await readChannelMessages(opts.docChannelId);
+      const kind = deriveDocKind(role);
+      const found = msgs.find((m) => {
+        if (m.kind !== "research.doc.v2") return false;
+        const p = (m.payload ?? {}) as Record<string, unknown>;
+        return p.doc_kind === kind && p.origin === origin;
+      });
+      if (!found) return null;
+      return { doc: found.payload as DocV2, messageId: found.message_id };
     },
     lockSynthesizer: async () => {
       mkdirSync(synthLockDir, { recursive: true });

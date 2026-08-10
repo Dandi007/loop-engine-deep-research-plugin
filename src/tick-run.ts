@@ -1353,8 +1353,10 @@ export function assembleGenerateDeps(
         })();
         writeFileSync(corpusFile, JSON.stringify(evidences), "utf8");
         return (() => {
+          let stdout: string;
+          let exitCode: number | null;
           try {
-            const stdout = execFileSync(anchorCheckBin, [
+            stdout = execFileSync(anchorCheckBin, [
               "--corpus", corpusFile,
               "--repo-root", allowedRoot,
               "--json",
@@ -1363,16 +1365,23 @@ export function assembleGenerateDeps(
               stdio: ["ignore", "pipe", "pipe"],
               timeout: 30000,
             });
-            return JSON.parse(stdout) as AnchorCheckResult;
+            exitCode = 0;
           } catch (e: any) {
-            try {
-              if (e.stdout != null) {
+            if (e.stdout != null) {
+              try {
                 return JSON.parse(e.stdout) as AnchorCheckResult;
-              }
-            } catch (_) {}
+              } catch (_) {}
+            }
+            exitCode = e.status != null ? e.status : null;
             const stderrTail = e.stderr != null ? String(e.stderr).slice(-200) : "";
-            const exitCode = e.status != null ? `exit ${e.status}` : "killed";
-            throw new Error(`anchor-check ${exitCode}: ${stderrTail}`);
+            const exitLabel = exitCode != null ? `exit ${exitCode}` : "killed";
+            const cause = e.message ? `: ${String(e.message).slice(0, 200)}` : "";
+            throw new Error(`anchor-check ${exitLabel}${cause} stderr:${stderrTail}`);
+          }
+          try {
+            return JSON.parse(stdout) as AnchorCheckResult;
+          } catch (_) {
+            throw new Error(`anchor-check exit ${exitCode}: stdout is not valid JSON`);
           }
         })();
       } finally {

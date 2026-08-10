@@ -109,9 +109,10 @@ export function parseReportMarker(body: string): ReportMarker | null {
  * 核验率作为**紧随其后的独立行**标注（软闸门：<90% 不阻断导出，但必须标在头部）。
  */
 export function renderReportHead(marker: ReportMarker, anchorRate: number | null, anchorTail?: string): string {
+  const safeTail = anchorTail ? anchorTail.replace(/-->/g, "-- >") : undefined;
   const rate = anchorRate === null
-    ? (anchorTail ? `unavailable ${anchorTail}` : "unavailable")
-    : (anchorTail ? `${anchorRate} ${anchorTail}` : String(anchorRate));
+    ? (safeTail ? `unavailable ${safeTail}` : "unavailable")
+    : (safeTail ? `${anchorRate} ${safeTail}` : String(anchorRate));
   return `${renderReportBody(marker)}<!-- dr-anchor-rate ${rate} -->\n`;
 }
 

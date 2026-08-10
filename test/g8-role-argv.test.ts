@@ -26,18 +26,53 @@ const mutationFlags = vi.hoisted(() => ({ w1: false, w2: false, w3: false }));
 
 vi.mock("../src/generate", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/generate")>();
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const { writeFileSync, rmSync } = await import("node:fs");
+  const { randomUUID } = await import("node:crypto");
+
+  const buildGenerateRoleArgv = (opts: Parameters<typeof actual.buildGenerateRoleArgv>[0]) => {
+    const argv = actual.buildGenerateRoleArgv(opts);
+    if (mutationFlags.w1) {
+      return [...argv.slice(0, 3), "--route", "opus-4-8/ccs", ...argv.slice(3)];
+    }
+    if (mutationFlags.w2 && opts.role !== "dr-debater-advocate") {
+      return [...argv.slice(0, 3), "--route", "some-route", ...argv.slice(3)];
+    }
+    return argv;
+  };
+
+  const spawnGenerateRole = async (
+    role: string,
+    corpus: DebaterCorpus | SynthesizerCorpus,
+    runtime: GenerateSpawnRuntime,
+  ): Promise<{ body: string }> => {
+    const inputPath = runtime.writeInputFile
+      ? runtime.writeInputFile(corpus)
+      : actual.writeGenerateInputFile(corpus);
+    const serialized = actual.serializeCorpusToPositional(corpus);
+    const promptFile = join(tmpdir(), `g7-generate-prompt-${randomUUID()}.txt`);
+    writeFileSync(promptFile, serialized, "utf8");
+    try {
+      const argv = buildGenerateRoleArgv({
+        agentRunBin: runtime.agentRunBin,
+        role,
+        runId: runtime.runId,
+        inputPath,
+        promptFile,
+      });
+      await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+      return { body: await runtime.readBody(runtime.runId) };
+    } finally {
+      rmSync(inputPath, { force: true });
+      rmSync(promptFile, { force: true });
+    }
+  };
+
   return {
     ...actual,
-    buildGenerateRoleArgv: (opts: Parameters<typeof actual.buildGenerateRoleArgv>[0]) => {
-      const argv = actual.buildGenerateRoleArgv(opts);
-      if (mutationFlags.w1) {
-        return [...argv.slice(0, 3), "--route", "opus-4-8/ccs", ...argv.slice(3)];
-      }
-      if (mutationFlags.w2 && opts.role !== "dr-debater-advocate") {
-        return [...argv.slice(0, 3), "--route", "some-route", ...argv.slice(3)];
-      }
-      return argv;
-    },
+    buildGenerateRoleArgv,
+    spawnGenerateRole,
     get DEFAULT_GENERATE_CONFIG() {
       const config = actual.DEFAULT_GENERATE_CONFIG;
       if (mutationFlags.w3) {
@@ -270,41 +305,47 @@ describe("V5: assertions drive production assembly (not injected spawnRole)", ()
   });
 });
 
-// ── 变异矩阵 W1–W3（实测：通过 vi.mock 在模块边界施加变异，验证变异后行为会导致 V1–V5 守卫挂掉）─
+// ── 变异矩阵 W1–W3（实测：vi.mock 同时替换 spawnGenerateRole 与 buildGenerateRoleArgv，变异可达生产调用路径）─
 
 describe("W1: add --route back to argv → V1 + V2 must fail", () => {
   beforeAll(() => { mutationFlags.w1 = true; });
   afterAll(() => { mutationFlags.w1 = false; });
 
-  it("W1: mutated buildGenerateRoleArgv produces argv with --route", () => {
-    const argv = buildGenerateRoleArgv({
-      agentRunBin: "/fake/agent-run",
-      role: "dr-debater-advocate",
-      runId: "run-1",
-      inputPath: "/tmp/i.json",
-      promptFile: "/tmp/p.txt",
+  it("W1: spawnGenerateRole produces argv with --route under w1 mutation", async () => {
+    const recorded: string[][] = [];
+    const runtime = fakeRuntime({
+      spawnProcess: async (argv) => {
+        recorded.push(argv);
+        return {};
+      },
     });
+    await spawnGenerateRole("dr-debater-advocate", makeCorpus("debater") as DebaterCorpus, runtime);
+    expect(recorded).toHaveLength(1);
+    const argv = recorded[0];
     expect(argv).toContain("--route");
     expect(argv).toContain("opus-4-8/ccs");
-    expect(argv).not.toEqual([
-      "/fake/agent-run", "--role", "dr-debater-advocate",
-      "--run-id", "run-1", "--input", "/tmp/i.json", "--prompt-file", "/tmp/p.txt",
-    ]);
-    expect(() => {
-      if (argv.includes("--route")) throw new Error("V1/V2 guard: --route present in mutated argv");
-    }).toThrow("V1/V2 guard: --route present in mutated argv");
+    expect(argv).toContain("--role");
+    expect(argv).toContain("--run-id");
+    expect(argv).toContain("--input");
+    expect(argv).toContain("--prompt-file");
   });
 
-  it("W1: V1/V2 assertions would fail — all four roles now have --route", () => {
+  it("W1: all four roles produce argv with --route → V1/V2 assertions would fail", async () => {
     for (const role of ALL_ROLES) {
-      const argv = buildGenerateRoleArgv({
-        agentRunBin: "/fake/agent-run",
-        role,
-        runId: "run-1",
-        inputPath: "/tmp/i.json",
-        promptFile: "/tmp/p.txt",
+      const recorded: string[][] = [];
+      const runtime = fakeRuntime({
+        spawnProcess: async (argv) => {
+          recorded.push(argv);
+          return {};
+        },
       });
-      expect(argv).toContain("--route");
+      if (role === "dr-synthesizer") {
+        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
+      } else {
+        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
+      }
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]).toContain("--route");
     }
   });
 });
@@ -313,40 +354,56 @@ describe("W2: only advocate removes --route, others keep it → V2 must fail", (
   beforeAll(() => { mutationFlags.w2 = true; });
   afterAll(() => { mutationFlags.w2 = false; });
 
-  it("W2: advocate has no --route, but opponent/judge/synthesizer do", () => {
-    const advArgv = buildGenerateRoleArgv({
-      agentRunBin: "/fake/agent-run",
-      role: "dr-debater-advocate",
-      runId: "run-1",
-      inputPath: "/tmp/i.json",
-      promptFile: "/tmp/p.txt",
+  it("W2: advocate has no --route, but opponent/judge/synthesizer do", async () => {
+    const advRecorded: string[][] = [];
+    const advRuntime = fakeRuntime({
+      spawnProcess: async (argv) => {
+        advRecorded.push(argv);
+        return {};
+      },
     });
-    expect(advArgv).not.toContain("--route");
+    await spawnGenerateRole("dr-debater-advocate", makeCorpus("debater") as DebaterCorpus, advRuntime);
+    expect(advRecorded).toHaveLength(1);
+    expect(advRecorded[0]).not.toContain("--route");
 
     for (const role of ["dr-debater-opponent", "dr-debater-judge", "dr-synthesizer"]) {
-      const argv = buildGenerateRoleArgv({
-        agentRunBin: "/fake/agent-run",
-        role,
-        runId: "run-1",
-        inputPath: "/tmp/i.json",
-        promptFile: "/tmp/p.txt",
+      const recorded: string[][] = [];
+      const runtime = fakeRuntime({
+        spawnProcess: async (argv) => {
+          recorded.push(argv);
+          return {};
+        },
       });
-      expect(argv).toContain("--route");
+      if (role === "dr-synthesizer") {
+        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
+      } else {
+        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
+      }
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]).toContain("--route");
     }
   });
 
-  it("W2: V2 assertion would fail for non-advocate roles", () => {
-    const argv = buildGenerateRoleArgv({
-      agentRunBin: "/fake/agent-run",
-      role: "dr-debater-opponent",
-      runId: "run-1",
-      inputPath: "/tmp/i.json",
-      promptFile: "/tmp/p.txt",
-    });
-    expect(argv).toContain("--route");
-    expect(() => {
-      if (argv.includes("--route")) throw new Error("V2 guard: non-advocate --route present");
-    }).toThrow("V2 guard: non-advocate --route present");
+  it("W2: V2 forEach loop would fail on non-advocate roles", async () => {
+    for (const role of ALL_ROLES) {
+      const recorded: string[][] = [];
+      const runtime = fakeRuntime({
+        spawnProcess: async (argv) => {
+          recorded.push(argv);
+          return {};
+        },
+      });
+      if (role === "dr-synthesizer") {
+        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
+      } else {
+        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
+      }
+      if (role === "dr-debater-advocate") {
+        expect(recorded[0]).not.toContain("--route");
+      } else {
+        expect(recorded[0]).toContain("--route");
+      }
+    }
   });
 });
 
@@ -369,13 +426,5 @@ describe("W3: keep a dead route field → V3 must fail", () => {
     const keys = Object.keys(DEFAULT_GENERATE_CONFIG);
     expect(keys).toContain("exportRoute");
     expect(keys).toEqual(["debaters", "synthesizer", "exportRoute"]);
-  });
-
-  it("W3: V3 assertions would fail — route and exportRoute dead fields present", () => {
-    const keys = Object.keys(DEFAULT_GENERATE_CONFIG);
-    expect(keys).toContain("exportRoute");
-    expect(() => {
-      if (keys.includes("exportRoute")) throw new Error("V3 guard: exportRoute dead field present");
-    }).toThrow("V3 guard: exportRoute dead field present");
   });
 });

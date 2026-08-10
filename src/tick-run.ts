@@ -52,7 +52,6 @@ import {
   runGenerate,
   decideGenerate,
   DEFAULT_GENERATE_CONFIG,
-  spawnGenerateRole,
   buildReportMarker,
   type EvidenceView,
   type GenerateDeps,

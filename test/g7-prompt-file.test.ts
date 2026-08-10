@@ -10,7 +10,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   spawnGenerateRole,
-  buildGenerateRoleArgv,
   serializeCorpusToPositional,
 } from "../src/generate";
 import type {
@@ -83,7 +82,7 @@ describe("T1: oversize corpus (>128 KB) works via --prompt-file (generate side)"
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
 
     expect(recorded).toHaveLength(1);
     const argv = recorded[0];
@@ -125,7 +124,7 @@ describe("T2: both generate and triage paths use --prompt-file, no positional co
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
     const argv = recorded[0];
     expect(argv).toContain("--prompt-file");
     expect(argv.indexOf("--")).toBe(-1);
@@ -191,7 +190,7 @@ describe("T3: --prompt-file content equals original serializeCorpusToPositional 
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
 
     expect(capturedPromptContent).toBe(serialized);
   });
@@ -244,7 +243,7 @@ describe("T4: --input schema guard is preserved", () => {
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
     const argv = recorded[0];
     expect(argv).toContain("--input");
     expect(argv[argv.indexOf("--input") + 1]).toBe("/tmp/payload.json");
@@ -301,7 +300,7 @@ describe("T5: temp files cleaned up after spawn (success and failure)", () => {
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
     expect(existsSync(inputPath)).toBe(false);
     expect(existsSync(promptFilePath)).toBe(false);
   });
@@ -330,7 +329,7 @@ describe("T5: temp files cleaned up after spawn (success and failure)", () => {
       readBody: async () => "out",
     };
     await expect(
-      spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime),
+      spawnGenerateRole("dr-debater-advocate", corpus, runtime),
     ).rejects.toThrow("spawn boom");
     expect(existsSync(inputPath)).toBe(false);
     expect(existsSync(promptFilePath)).toBe(false);
@@ -359,7 +358,7 @@ describe("T6: assertions drive production assembly (not injected spawnRole)", ()
       readBody: async () => "out",
     };
     // ⛔ 走 spawnGenerateRole（生产入口），不注入 spawnRole
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
     expect(recorded).toHaveLength(1);
     const argv = recorded[0];
     expect(argv).toContain("--prompt-file");

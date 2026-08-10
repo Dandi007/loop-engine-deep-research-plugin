@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { parse } from "yaml";
 import {
   runGenerate,
   decideGenerate,
@@ -16,7 +15,7 @@ import {
   buildDoc,
   serializeCorpusToPositional,
   spawnGenerateRole,
-  assertDistinctDebaterRoutes,
+  assertDistinctDebaterRoles,
   MAX_DOC_BODY_BYTES,
   DEFAULT_GENERATE_CONFIG,
 } from "../src/generate";
@@ -70,17 +69,6 @@ function resolveAgentRuntimeProfiles(): string | null {
 
 const AGENT_RUNTIME_PROFILES = resolveAgentRuntimeProfiles();
 const agentRuntimeAvailable = AGENT_RUNTIME_PROFILES !== null;
-
-/** 从 agent-runtime profiles/roles/<role>.yaml 读出该 role 的 route（spec §2.1：别照本文猜）。 */
-function agentRoleRoute(role: string): string {
-  const root = resolveAgentRuntimeProfiles();
-  if (!root) throw new Error("agent-runtime profiles unavailable");
-  const p = join(root, "roles", `${role}.yaml`);
-  if (!existsSync(p)) throw new Error(`missing agent-runtime role file: ${p}`);
-  const doc = parse(readFileSync(p, "utf-8")) as { route?: string };
-  if (!doc.route) throw new Error(`role file ${p} has no route`);
-  return doc.route;
-}
 
 /** 从 agent-runtime 读某输入 schema（debater / synthesizer）。 */
 function readRoleInputSchema(name: "debater" | "synthesizer"): unknown {
@@ -167,50 +155,50 @@ describe("S4 debaters (D4/D5/D16)", () => {
     expect(synthSpawns(deps)).toHaveLength(1);
   });
 
-  it("D5: the three debater routes are mutually distinct (dedup size === 3)", async () => {
-    const routes: string[] = [];
+  it("D5: the three debater roles are mutually distinct (dedup size === 3)", async () => {
+    const roles: string[] = [];
     const deps = baseDeps({
-      spawnRole: vi.fn(async (role: string, route: string) => {
-        if (DEBATER_ROLES.has(role)) routes.push(route);
+      spawnRole: vi.fn(async (role: string) => {
+        if (DEBATER_ROLES.has(role)) roles.push(role);
         return { body: "out" };
       }),
     });
     await runGenerate(deps, cfg);
-    expect(routes).toHaveLength(3);
-    expect(new Set(routes).size).toBe(3);
+    expect(roles).toHaveLength(3);
+    expect(new Set(roles).size).toBe(3);
   });
 
-  it("D5/Q2: a caller-supplied config with duplicate debater routes is rejected (not silently accepted)", async () => {
+  it("D5/Q2: a caller-supplied config with duplicate debater roles is rejected (not silently accepted)", async () => {
     const bad: GenerateConfig = {
       ...cfg,
       debaters: [
-        { role: "dr-debater-advocate", route: "a" },
-        { role: "dr-debater-opponent", route: "a" },
-        { role: "dr-debater-judge", route: "c" },
+        { role: "dr-debater-advocate" },
+        { role: "dr-debater-advocate" },
+        { role: "dr-debater-judge" },
       ],
     };
-    expect(() => assertDistinctDebaterRoutes(bad)).toThrow(/mutually distinct/);
+    expect(() => assertDistinctDebaterRoles(bad)).toThrow(/mutually distinct/);
     await expect(runGenerate(baseDeps(), bad)).rejects.toThrow(/mutually distinct/);
   });
 
-  it("D16: route combination is not hardcoded — custom three routes are the ones used", async () => {
-    const routes: string[] = [];
+  it("D16: role combination is not hardcoded — custom three roles are the ones used", async () => {
+    const roles: string[] = [];
     const custom: GenerateConfig = {
       ...cfg,
       debaters: [
-        { role: "dr-debater-advocate", route: "custom.one" },
-        { role: "dr-debater-opponent", route: "custom.two" },
-        { role: "dr-debater-judge", route: "custom.three" },
+        { role: "dr-debater-advocate" },
+        { role: "dr-debater-opponent" },
+        { role: "dr-debater-judge" },
       ],
     };
     const deps = baseDeps({
-      spawnRole: vi.fn(async (role: string, route: string) => {
-        if (role !== "dr-synthesizer") routes.push(route);
+      spawnRole: vi.fn(async (role: string) => {
+        if (role !== "dr-synthesizer") roles.push(role);
         return { body: "out" };
       }),
     });
     await runGenerate(deps, custom);
-    expect(routes).toEqual(["custom.one", "custom.two", "custom.three"]);
+    expect(roles).toEqual(["dr-debater-advocate", "dr-debater-opponent", "dr-debater-judge"]);
   });
 });
 
@@ -363,7 +351,7 @@ describe("G7: corpus reaches the role prompt via --prompt-file (production entry
       },
       readBody: async () => "out",
     };
-    await spawnGenerateRole("dr-debater-advocate", "opus-4-8/ccs", corpus, runtime);
+    await spawnGenerateRole("dr-debater-advocate", corpus, runtime);
 
     expect(recorded).toHaveLength(1);
     const argv = recorded[0];
@@ -453,34 +441,6 @@ describe("G2a D2: doc_kind is derived from role, never from payload", () => {
     expect(deriveDocKind("dr-debater-judge")).toBe("argument");
   });
 });
-
-describe.skipIf(!agentRuntimeAvailable)(
-  "G2a D3: role/route wiring matches the real agent-runtime values",
-  () => {
-    it("D3: the four roles' role/route pairs equal the values read from agent-runtime role files (not guessed)", () => {
-      // 每条 debater route 必须互不相同（spec §2.1 ⛔ / §2.1 表格）。
-      const routes = cfg.debaters.map((d) => d.route);
-      expect(routes).toHaveLength(3);
-      expect(new Set(routes).size).toBe(3);
-
-      // 从 agent-runtime profiles/roles/<role>.yaml 实际读出 route，逐一核对（spec §2.1：别照本文猜）。
-      for (const d of cfg.debaters) {
-        expect(agentRoleRoute(d.role)).toBe(d.route);
-      }
-      expect(agentRoleRoute(cfg.synthesizer.role)).toBe(cfg.synthesizer.route);
-    });
-
-    it("D3: every configured route exists in agent-runtime profiles/routes.yaml", () => {
-      const root = resolveAgentRuntimeProfiles()!;
-      const routesPath = join(root, "routes.yaml");
-      const doc = parse(readFileSync(routesPath, "utf-8")) as { routes?: Record<string, unknown> };
-      const known = new Set(Object.keys(doc.routes ?? {}));
-      for (const r of [...cfg.debaters.map((d) => d.route), cfg.synthesizer.route]) {
-        expect(known).toContain(r);
-      }
-    });
-  },
-);
 
 describe.skipIf(!agentRuntimeAvailable)(
   "G2a corpus schema conformance (major finding)",

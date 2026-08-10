@@ -208,6 +208,7 @@ export async function transcribeMaterial(
       digest: input.digest,
       body: mdContent,
       origin: input.uri,
+      role: "dr-transcriber",
     };
     await deps.publishDoc(doc);
     return doc;

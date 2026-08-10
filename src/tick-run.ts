@@ -1397,6 +1397,7 @@ export function assembleGenerateDeps(
         body: reportBody,
         digest: createHash("sha256").update(reportBody).digest("hex"),
         origin: opts.origin!,
+        role: "dr-synthesizer",
       };
       const input: ExportInput = {
         report,
@@ -1418,6 +1419,17 @@ export function assembleGenerateDeps(
       if (!opts.docChannelId) throw new MissingDocChannelError();
       const result = await publishDoc(opts.docChannelId, doc, idempotencyKey);
       return result.message_id;
+    },
+    readDoc: async (role, origin) => {
+      if (!opts.docChannelId) return null;
+      const msgs = await readChannelMessages(opts.docChannelId);
+      const found = msgs.find((m) => {
+        if (m.kind !== "research.doc.v2") return false;
+        const p = (m.payload ?? {}) as Record<string, unknown>;
+        return p.role === role && p.origin === origin;
+      });
+      if (!found) return null;
+      return { doc: found.payload as DocV2, messageId: found.message_id };
     },
     lockSynthesizer: async () => {
       mkdirSync(synthLockDir, { recursive: true });

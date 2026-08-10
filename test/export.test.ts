@@ -11,7 +11,7 @@ import type { DocV2 } from "../src/protocol";
 import { renderReportBody } from "../src/generate";
 
 function report(body: string): DocV2 {
-  return { doc_kind: "report", digest: "rep-1", body, origin: "research-1" };
+  return { doc_kind: "report", digest: "rep-1", body, origin: "research-1", role: "dr-synthesizer" };
 }
 
 function input(over: Partial<ExportInput> = {}): ExportInput {

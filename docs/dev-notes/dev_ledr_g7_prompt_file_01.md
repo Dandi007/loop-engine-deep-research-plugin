@@ -1,6 +1,6 @@
 # G7 —— 语料走位置参数，撞上 Linux 单参数 128 KB 上限：真实规模下生成段必 `spawn E2BIG`
 
-> 本文件是验收证据。`input_commit` = `eaf697478cad63987e7e04ab9b6515d44115515f`。
+> 本文件是验收证据。`input_commit` = `cf5dd6440c93d031773563d7137842f19886fe74`。
 
 ## 缺口（生产实测，非估计）
 
@@ -25,7 +25,7 @@
 ### T2：两条路径都改
 
 - **generate 侧**：argv 包含 `--prompt-file`，无 `--` 位置参数分隔符。✓
-- **triage 侧**：argv 包含 `--prompt-file`，无 `--` 位置参数分隔符。✓
+- **triage 侧**：使用 850 条 `proposed_clues` 的超限语料（150 692 字节 > 128 KB），argv 包含 `--prompt-file`，无 `--` 位置参数分隔符。遍历 argv 中每个参数，**没有任何单个参数 ≥ 131 072 字节**。`--prompt-file` 文件内容逐字 = `serializeTriageCorpusToPositional` 输出。✓
 
 ### T3：语料内容逐字不变
 
@@ -53,8 +53,8 @@
 ```
  Test Files  28 passed (28)
       Tests  498 passed (498)
-   Start at  08:29:09
-   Duration  7.05s
+   Start at  08:38:08
+   Duration  7.04s
 ```
 
 未设置 `ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*`。28 files ≥ 基线 27，498 tests ≥ 基线 487。✓
@@ -76,10 +76,10 @@
 
 ## 构造的超限语料实际字节数
 
-| 语料类型 | 构造方式 | 实际字节数 |
+| 语料类型 | 构造方式 | 实测字节数 |
 |---|---|---|
-| generate 侧（debater 语料） | 850 条 evidence，每条含 clue_id / anchor / quote（3x repeat）/ claim | **181 177 字节（~177 KB）** |
-| triage 侧（triage 语料） | 850 条 proposed_clues，每条含 clue_id / clue_text（5x repeat）/ depth=1 / sources=["wiki"] | **150 692 字节（~147 KB）** |
+| generate 侧（debater 语料） | 850 条 evidence，每条含 clue_id / anchor / quote（3x repeat）/ claim | **181 177 字节（~177 KB）** |
+| triage 侧（triage 语料） | 850 条 proposed_clues，每条含 clue_id / clue_text（5x repeat）/ depth=1 / sources=["wiki"] | **150 692 字节（~147 KB）** |
 
 两者均 > 128 KB（131 072 字节），均能通过 `--prompt-file` 正常投递，argv 中无任何单个参数 ≥ 131 072 字节。
 

@@ -131,18 +131,22 @@ describe("T2: both generate and triage paths use --prompt-file, no positional co
     expect(argv.indexOf("--")).toBe(-1);
   });
 
-  it("triage argv uses --prompt-file, no positional corpus", async () => {
+  it("triage argv uses --prompt-file, no positional corpus, oversize corpus works", async () => {
     const recorded: string[][] = [];
-    const corpus: TriageCorpus = {
-      question: "q?",
-      proposed_clues: [{ clue_id: "c1", clue_text: "clue one text" }],
-    };
+    let capturedPromptContent = "";
+    const corpus = makeOversizeTriageCorpus();
+    const serialized = serializeTriageCorpusToPositional(corpus);
+    const serializedBytes = Buffer.byteLength(serialized, "utf8");
+    expect(serializedBytes).toBeGreaterThan(131072);
+
     const runtime: TriageSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
       runId: "run-triage",
       writeInputFile: () => "/tmp/i.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
+        const pfIdx = argv.indexOf("--prompt-file");
+        capturedPromptContent = readFileSync(argv[pfIdx + 1], "utf8");
         return {};
       },
       readResult: async () => [],
@@ -151,6 +155,13 @@ describe("T2: both generate and triage paths use --prompt-file, no positional co
     const argv = recorded[0];
     expect(argv).toContain("--prompt-file");
     expect(argv.indexOf("--")).toBe(-1);
+
+    // ⛔ 没有任何单个参数 ≥ 131072 字节
+    for (const arg of argv) {
+      expect(Buffer.byteLength(arg, "utf8")).toBeLessThan(131072);
+    }
+
+    expect(capturedPromptContent).toBe(serialized);
   });
 });
 

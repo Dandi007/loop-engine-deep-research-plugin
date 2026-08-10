@@ -168,6 +168,7 @@ export function buildDoc(
     digest: computeDocDigest(body),
     body,
     origin,
+    role,
   };
 }
 
@@ -523,36 +524,21 @@ export async function runGenerate(
   }
 
   // G13 —— synthesizer doc 已存在被复用：anchor-check 与导出照常执行。
-  // anchor-check：跑，但失败/报缺陷都不得阻断导出（D9/D10 / G2a §2.3 软闸门）。
-  let anchorRate: number | null = null;
-  let anchorTail: string | undefined;
-  let anchorJsonWritten = true;
+  // anchor-check 照常运行并写 JSON（仅副作用），报告 body 使用已持久化的头部。
   let anchorCheckJson: string | null = null;
   try {
     const ac = await deps.spawnAnchorCheck();
     anchorCheckJson = JSON.stringify(ac);
-    if (ac.total === 0) {
-    } else if (!ac.sums_ok) {
-      anchorTail = "sums_ok=false";
-    } else {
-      anchorRate = (ac.current_verified_hit / ac.total) * 100;
-    }
-  } catch (e) {
-    if (e instanceof MissingAnchorCheckRepoRootError) {
-      anchorTail = "no-repo-root";
-    }
+  } catch {
+    // anchor-check 失败不得阻断导出
   }
 
   if (anchorCheckJson !== null && deps.writeAnchorCheckJson) {
     try {
       await deps.writeAnchorCheckJson(anchorCheckJson);
     } catch {
-      anchorJsonWritten = false;
+      // writeAnchorCheckJson 失败不得阻断导出
     }
-  }
-
-  if (!anchorJsonWritten) {
-    anchorTail = anchorTail ? `${anchorTail} anchor-json-write-failed` : "anchor-json-write-failed";
   }
 
   // 导出：最后（D8），带 source_message_id（使用已存在 doc 的 messageId）。

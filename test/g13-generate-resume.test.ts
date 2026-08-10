@@ -76,6 +76,7 @@ function emptyMessagesResponse() {
 
 function docMsg(
   messageId: string,
+  role: string,
   docKind: string,
   origin: string,
   body: string,
@@ -91,6 +92,7 @@ function docMsg(
       body,
       digest: "abc",
       origin,
+      role,
     },
     entity_id: `doc-${messageId}`,
     supersedes: null,
@@ -124,7 +126,7 @@ describe("W1: doc exists for one role ⇒ no spawn, no publish, reuse body", () 
     const readDoc = vi.fn(async (role: string, _origin: string) => {
       if (role === "dr-debater-advocate") {
         return {
-          doc: { doc_kind: "argument" as const, body: existingBody, digest: "abc", origin: "research-1" },
+          doc: { doc_kind: "argument" as const, body: existingBody, digest: "abc", origin: "research-1", role },
           messageId: "existing-msg-1",
         };
       }
@@ -164,6 +166,7 @@ describe("W2: all docs already exist ⇒ zero spawn, zero publish, export + anch
         body: "pre-existing body",
         digest: "abc",
         origin: "research-1",
+        role: _role,
       },
       messageId: "existing-msg",
     }));
@@ -192,6 +195,7 @@ describe("W3: partial docs exist ⇒ only spawn missing roles", () => {
           body: `pre-existing ${role} body`,
           digest: "abc",
           origin: "research-1",
+          role,
         },
         messageId: `existing-${role}`,
       };
@@ -221,6 +225,7 @@ describe("W3: partial docs exist ⇒ only spawn missing roles", () => {
             body: "pre-existing report body",
             digest: "abc",
             origin: "research-1",
+            role: "dr-synthesizer",
           },
           messageId: "existing-synth",
         };
@@ -355,7 +360,7 @@ describe("W6: assertions drive production assembleGenerateDeps", () => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("/messages")) {
         return messagesResponse([
-          docMsg(targetMessageId, "report", targetOrigin, targetBody),
+          docMsg(targetMessageId, "dr-synthesizer", "report", targetOrigin, targetBody),
         ]);
       }
       return emptyMessagesResponse();
@@ -382,7 +387,7 @@ describe("W6: assertions drive production assembleGenerateDeps", () => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("/messages")) {
         return messagesResponse([
-          docMsg("msg-1", "argument", "other-origin", "other body"),
+          docMsg("msg-1", "dr-debater-advocate", "argument", "other-origin", "other body"),
         ]);
       }
       return emptyMessagesResponse();
@@ -405,6 +410,45 @@ describe("W6: assertions drive production assembleGenerateDeps", () => {
       boardState(),
     );
     expect(deps.readDoc).toBeDefined();
+  });
+
+  it("readDoc discriminates role among multiple argument docs for the same origin", async () => {
+    const docChannelId = "research:doc";
+    const origin = "research-1";
+    const advocateBody = "advocate argument body";
+    const opponentBody = "opponent argument body";
+    const advocateMsgId = "doc-advocate";
+    const opponentMsgId = "doc-opponent";
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) {
+        return messagesResponse([
+          docMsg(advocateMsgId, "dr-debater-advocate", "argument", origin, advocateBody, 1),
+          docMsg(opponentMsgId, "dr-debater-opponent", "argument", origin, opponentBody, 2),
+        ]);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const deps = assembleGenerateDeps(
+      { channelId: "research:test", docChannelId, origin },
+      term(),
+      boardState(),
+    );
+
+    const advocateResult = await deps.readDoc!("dr-debater-advocate", origin);
+    expect(advocateResult).not.toBeNull();
+    expect(advocateResult!.doc.body).toBe(advocateBody);
+    expect(advocateResult!.messageId).toBe(advocateMsgId);
+
+    const opponentResult = await deps.readDoc!("dr-debater-opponent", origin);
+    expect(opponentResult).not.toBeNull();
+    expect(opponentResult!.doc.body).toBe(opponentBody);
+    expect(opponentResult!.messageId).toBe(opponentMsgId);
+
+    const judgeResult = await deps.readDoc!("dr-debater-judge", origin);
+    expect(judgeResult).toBeNull();
   });
 
   it("generated deps are not hand-built: all fields sourced from assembleGenerateDeps", () => {

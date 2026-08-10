@@ -29,6 +29,7 @@ export interface DocV2 {
   digest: string;    // 内容摘要，transcript 用此做全局去重键
   body: string;      // 正文，≤ 4MB
   origin: string;    // transcript=源 URI；report/argument=研究 id
+  role: string;      // G13: 产出该 doc 的 agent role，用于 (role, origin) 复用查找
 }
 
 /** Clue 状态机合法迁移 */

@@ -33,6 +33,7 @@ describe("protocol types", () => {
       digest: "test_report_v1",
       body: "# Test",
       origin: "research:test",
+      role: "dr-synthesizer",
     };
     expect(["transcript", "report", "argument"]).toContain(doc.doc_kind);
   });

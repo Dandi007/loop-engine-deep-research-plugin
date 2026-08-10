@@ -1,25 +1,39 @@
 # G13 —— 生成段可恢复：按 (role, origin) 查已有 doc 并复用
 
-- `input_commit`: `2b5c7aa7b2ef40745edb36470faf5d505012e15c`
+- `input_commit`: `cde5928f67c4c12c290600b0f6ac3815976ac851`
 
 ## 实现
 
+### `src/protocol.ts`
+
+- `DocV2` 新增 `role: string` 字段：产出该 doc 的 agent role，用于 (role, origin) 复用查找。
+  三个 debater 角色（advocate/opponent/judge）各自产出不同的 `role` 值，即使 `doc_kind` 同为 `"argument"` 也能区分。
+
 ### `src/generate.ts`
 
-- `GenerateDeps` 新增 `readDoc?(role, origin): Promise<{ doc: DocV2; messageId: string } | null>`。
+- `buildDoc` 在构造 `DocV2` 时写入 `role` 字段。
 - `runGenerate` 在派 role 之前先按 (role, origin) 查已有 doc：
   - 已存在 ⇒ 直接用其 body，不 spawn、不 publish。
   - 不存在 ⇒ 走现有路径（spawn → publish）。
   - synthesizer doc 已存在时跳过 lock+spawn+publish，但仍执行 anchor-check 与导出。
   - `readDoc` 未提供时行为不变（向后兼容）。
+- 移除 resumed-synthesizer 分支中的死计算（`anchorRate`/`anchorTail`/`anchorJsonWritten` 在已复用分支中从不使用，因为 synthBody 已带有持久化的头部）。
 
 ### `src/tick-run.ts`
 
-- `assembleGenerateDeps` 新增 `readDoc` 实现：从 `opts.docChannelId` 读 `research.doc.v2` 消息，
-  按 `doc_kind`（由 `deriveDocKind(role)` 推出）和 `origin` 匹配。
-- 新增 `deriveDocKind` 导入。
+- `assembleGenerateDeps` 的 `readDoc` 实现改为按 `(role, origin)` 匹配（检查 `payload.role === role && payload.origin === origin`），不再使用 `deriveDocKind(role)` 推导的 `doc_kind` 做 match。
+- 移除 `deriveDocKind` 导入（不再使用）。
+- `spawnExport` 中的 `DocV2` 构造加入 `role: "dr-synthesizer"`。
 
-### `test/g13-generate-resume.test.ts`（15 tests）
+### `src/ingest.ts`
+
+- `transcribeMaterial` 中加入 `role: "dr-transcriber"` 以适配 `DocV2` 新增字段。
+
+### `test/g13-generate-resume.test.ts`（16 tests）
+
+- W6 新增 `readDoc discriminates role among multiple argument docs for the same origin`：将两条不同 role 的 argument doc 放入同一 origin 的 fake bus，验证生产 `readDoc` 能正确区分角色、返回对应 body，且未出现的角色返回 null。
+- `docMsg` 辅助函数签名更新为 `(messageId, role, docKind, origin, body, channelSeq)`，payload 包含 `role` 字段。
+- 所有 mock `readDoc` 返回的 `DocV2` 对象加入 `role` 字段。
 
 ## 硬验收
 
@@ -44,7 +58,7 @@
 | W3 | `W3: three debater docs exist, synthesizer missing ⇒ only synthesizer spawned` | `readDoc` 对三个 debater 返回 doc、对 synthesizer 返回 null，断言 `spawnedRoles` 只有 `["dr-synthesizer"]`。若 debater 的已有 doc 未被识别，会多 spawn。 |
 | W4 | `W4: readDoc returns null for all roles ⇒ 4 spawns, 4 publishes` | `readDoc` 全部返回 null 时行为与今天一致。若 `readDoc` 未提供（向后兼容），同样 4 spawn + 4 publish。 |
 | W5 | `W5: writeDoc throws 409 ⇒ error propagates, not swallowed` | `writeDoc` 抛 IDEMPOTENCY_CONFLICT 时 `runGenerate` reject。若 409 被静默吞掉，`toThrow` 断言失败。 |
-| W6 | `W6: assembleGenerateDeps produces a readDoc function` | 直接调用 `assembleGenerateDeps` 并断言 `deps.readDoc` 是函数。若生产装配不包含 `readDoc`，`toBeDefined` 失败。 |
+| W6 | `W6: readDoc discriminates role among multiple argument docs for the same origin` | 生产 `readDoc`（`assembleGenerateDeps`）在 fake bus 中放置两条不同 role 的 argument doc，断言 `readDoc("dr-debater-advocate")` 返回 advocate body 而 `readDoc("dr-debater-judge")` 返回 null。若 `readDoc` 仍按 `doc_kind` 匹配，三个 debater 角色都会匹配到同一条消息，judge 也会返回非 null。 |
 
 ## §3 变异自检
 
@@ -58,12 +72,12 @@
 ## 测试运行尾部
 
 ```
- ✓ test/g13-generate-resume.test.ts (15 tests) 51ms
+ ✓ test/g13-generate-resume.test.ts (16 tests) 43ms
 
  Test Files  32 passed (32)
-      Tests  528 passed (528)
-   Start at  17:14:22
-   Duration  7.57s
+      Tests  529 passed (529)
+   Start at  17:30:59
+   Duration  7.48s
 ```
 
 无 FAIL 段。

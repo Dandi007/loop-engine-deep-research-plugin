@@ -70,7 +70,7 @@ function cleanChildEnv(): NodeJS.ProcessEnv {
 }
 
 function report(body: string): DocV2 {
-  return { doc_kind: "report", digest: "rep-1", body, origin: "research-1" };
+  return { doc_kind: "report", digest: "rep-1", body, origin: "research-1", role: "dr-synthesizer" };
 }
 
 function exportInput(): ExportInput {

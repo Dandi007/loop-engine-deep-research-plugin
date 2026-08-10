@@ -46,6 +46,7 @@ function doc(over: Partial<DocV2> = {}): DocV2 {
     digest: "d1",
     body: "body",
     origin: "http://example.com/a.pdf",
+    role: "dr-transcriber",
     ...over,
   };
 }

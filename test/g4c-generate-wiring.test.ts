@@ -551,6 +551,7 @@ describe("G4c U5: export path + EXPORT_ROOT check", () => {
         body: "<!-- dr-terminal stop=converged blocked=0 capHit=false -->\ncontent",
         digest: "abc",
         origin: "test-origin",
+        role: "dr-synthesizer",
       },
       sourceMessageId: "msg-1",
       createdAt: "2026-08-01T00:00:00Z",

@@ -45,8 +45,8 @@
 ```
  Test Files  30 passed (30)
       Tests  509 passed (509)
-   Start at  11:43:11
-   Duration  7.18s
+   Start at  12:00:38
+   Duration  7.21s
 ```
 
 无 FAIL 段。`ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*` 均未设置。
@@ -58,10 +58,9 @@
 ### Y8: git status --porcelain 为空
 
 ```
-（最终提交后验证，输出为空）
 ```
 
-**PASS**. 提交后 `git status --porcelain` 输出为空，工作区清洁，无未跟踪文件。
+**PASS**. 提交后 `git status --porcelain` 输出为空（如上），工作区清洁，无未跟踪文件。
 
 ### Y9: 每处删除给出必要性说明
 

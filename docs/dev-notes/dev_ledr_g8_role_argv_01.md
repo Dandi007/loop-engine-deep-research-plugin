@@ -1,6 +1,6 @@
 # G8 —— 生成段 argv 传 `--role` + `--route` 却不传 `--runtime`：agent-run 直接判 CONFIG_ERROR
 
-> 本文件是验收证据。`input_commit` = `e493910ede862ced008b6718cce148a099b4d698`。
+> 本文件是验收证据。`input_commit` = `f08c2968e9b46f359692df920314dd6a3c3c3a2e`。
 
 ## 缺口（生产实测，非估计）
 
@@ -33,7 +33,7 @@ role 自己已经带全了 runtime 与 route，且与 golden-order 拍死的档�
   - 更新 JSDoc：`GenerateConfig` 不再声明「三条 debater route 必须互不相同」；文件头不再描述 debater 为「不同 route」。
 - `test/generate.test.ts`：删除 D5（route 互异）、D5/Q2（重复 route 拒绝）、D16（route 组合非硬编码）、G2a D3（role/route 对 agent-runtime 核对）、G2a corpus schema conformance 测试（依赖已移除的 agent-runtime 读取函数）；更新 `spawnGenerateRole` 调用。
 - `test/g7-prompt-file.test.ts`：更新所有 `spawnGenerateRole` 调用去掉 `route` 参数。
-- `test/g8-role-argv.test.ts`：新增（V1–V5 + 变异矩阵 W1–W3 共 20 个测试）。
+- `test/g8-role-argv.test.ts`：新增（V1–V5 共 14 个测试）。
 
 ## 硬验收逐条
 
@@ -61,24 +61,78 @@ triage argv 含 `--role` 但无 `--route`（它一直是对的），既有断言
 
 ```
  Test Files  29 passed (29)
-      Tests  512 passed (512)
-   Start at  09:49:19
-   Duration  7.01s
+      Tests  506 passed (506)
+   Start at  10:08:48
+   Duration  7.07s
 ```
 
-未设置 `ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*`。29 files ≥ 基线 28，512 tests ≥ 基线 498。✓
+未设置 `ANCHOR_CHECK_BIN` / `DOC_CHANNEL` / `RESEARCH_ORIGIN` / `EXPORT_ROOT` / `AGENT_RESULT_*`。29 files ≥ 基线 28，506 tests ≥ 基线 498。✓
 
-### V7：变异矩阵逐断言归因（实测：vi.mock 同时替换 spawnGenerateRole 与 buildGenerateRoleArgv，变异可达生产调用路径）
+### V7：变异矩阵逐断言归因（实测：对 src/generate.ts 源码施加变异，运行 `npm test`，观察 V1–V3 守卫失败，还原后 `git status --porcelain` 为空）
 
-变异矩阵通过 `vi.mock` + `vi.hoisted` 在 `../src/generate` 模块边界施加变异。`spawnGenerateRole` 在 mock 中调用 mocked `buildGenerateRoleArgv`，因此变异可到达 spawnProcess 记录的 argv——即 V1/V2/V5 断言所观测的生产调用路径。每个 W describe 块在 `beforeAll` 中开启对应 flag、`afterAll` 中关闭。V1–V5 的断言在无变异时全部通过；变异开启时，W1–W3 的测试通过 `spawnGenerateRole`（生产入口）观察到变异生效，V1/V2 守卫 `expect(argv).not.toContain('--route')` 会因 recorded argv 含 `--route` 而失败，V3 守卫 `toEqual(["role"])` 会因 `DEFAULT_GENERATE_CONFIG` 含 `route` 字段而失败。全部三条变异仅通过 flag 控制，`afterAll` 关闭 flag 后模块恢复原状，`git status --porcelain` 无遗留改动。✓
+变异矩柞通过对 `src/generate.ts` 源码直接修改施加，而非通过 `vi.mock` 包装。每个变异行在施加后立即运行 `npm test`，记录失败断言，随后 `git checkout src/generate.ts` 还原。V1–V5 断言在无变异时全部通过（29 files / 506 tests），变异施加后对应守卫失败。
 
-| 变异 | 改什么 | 被测断言 | 实测 |
-|---|---|---|---|
-| **W1** | `buildGenerateRoleArgv` 在 `--role` 后插入 `"--route", "opus-4-8/ccs"`；`spawnGenerateRole` 使用 mocked `buildGenerateRoleArgv`，变异 argv 经 spawnProcess 记录 | V1 + V2 守卫 | W1 测试通过 `spawnGenerateRole` → 假 spawn 记录 argv，观察到所有四个 role 的 argv 均含 `--route`。V1 断言 `expect(argv).not.toContain('--route')` 和 V2 四个 role 的逐条断言均会失败。**被杀** ✓。 |
-| **W2** | `buildGenerateRoleArgv` 仅在 `opts.role !== "dr-debater-advocate"` 时插入 `"--route"`；`spawnGenerateRole` 使用 mocked `buildGenerateRoleArgv` | V2 守卫 | W2 测试通过 `spawnGenerateRole` 观察到 advocate 不含 `--route`，opponent/judge/synthesizer 均含 `--route`。V2 对四个 role 逐一断言 `not.toContain('--route')` 会挂掉非 advocate 三条。**被杀** ✓。 |
-| **W3** | `DEFAULT_GENERATE_CONFIG` 的 debaters/synthesizer entry 加回 `route` 字段，config 加回 `exportRoute` 字段 | V3 守卫 | W3 测试观察到 `Object.keys(DEFAULT_GENERATE_CONFIG.debaters[0])` 含 `route`，`Object.keys(DEFAULT_GENERATE_CONFIG)` 含 `exportRoute`。V3 守卫 `toEqual(["role"])` 和 `not.toContain("exportRoute")` 会挂。**被杀** ✓。 |
+**W1**：在 `buildGenerateRoleArgv` 的返回数组中插入 `"--route", "opus-4-8/ccs"`（加回 `--route`）。
 
-全部三条变异仅通过 flag 控制，`afterAll` 关闭 flag 后模块恢复原状，`git status --porcelain` 无遗留改动。✓
+```diff
+--- a/src/generate.ts
++++ b/src/generate.ts
+@@ -217,10 +217,12 @@ export function buildGenerateRoleArgv(opts: {
+   return [
+     opts.agentRunBin,
+     "--role",
+     opts.role,
++    "--route",
++    "opus-4-8/ccs",
+     "--run-id",
+     opts.runId,
+     "--input",
+```
+
+`npm test` 结果：**8 failed**（V1 ×1 + V2 四个 role ×4 + V3 `buildGenerateRoleArgv` ×1 + V5-a ×1 + V5-b ×1）。V1 守卫 `expect(argv).not.toContain('--route')` 和 V2 四个 role 逐条断言均因 argv 含 `--route` 而失败。**被杀 ✓**。
+
+**W2**：`buildGenerateRoleArgv` 仅在 `opts.role !== "dr-debater-advocate"` 时插入 `--route`（advocate 去掉，其余三个保留）。
+
+```diff
+--- a/src/generate.ts
++++ b/src/generate.ts
+@@ -217,10 +217,14 @@ export function buildGenerateRoleArgv(opts: {
+   return [
+     opts.agentRunBin,
+     "--role",
+     opts.role,
++    ...(opts.role !== "dr-debater-advocate" ? ["--route", "some-route"] : []),
+     "--run-id",
+     opts.runId,
+     "--input",
+```
+
+`npm test` 结果：**4 failed**（V2 opponent/judge/synthesizer ×3 + V5-b ×1）。V2 对 advocate 的断言仍通过（`not.toContain('--route')`），但 opponent/judge/synthesizer 三条均失败，证明 V2 覆盖了全部四个 role 而非仅验一条。**被杀 ✓**。
+
+**W3**：在 `DEFAULT_GENERATE_CONFIG` 的 debaters/synthesizer 上加回 `route` 字段，config 加回 `exportRoute` 字段。
+
+```diff
+--- a/src/generate.ts
++++ b/src/generate.ts
+@@ -42,10 +42,10 @@ export interface GenerateConfig {
+ export const DEFAULT_GENERATE_CONFIG: GenerateConfig = {
+   debaters: [
+-    { role: "dr-debater-advocate" },
+-    { role: "dr-debater-opponent" },
+-    { role: "dr-debater-judge" },
++    { role: "dr-debater-advocate", route: "dummy" },
++    { role: "dr-debater-opponent", route: "dummy" },
++    { role: "dr-debater-judge", route: "dummy" },
+   ],
+-  synthesizer: { role: "dr-synthesizer" },
++  synthesizer: { role: "dr-synthesizer", route: "dummy" },
++  exportRoute: "export",
+ };
+```
+
+`npm test` 结果：**2 failed**（V3 `toEqual(["role"])` ×1 + V3 `not.toContain("exportRoute")` ×1）。V3 守卫 `expect(Object.keys(d)).toEqual(["role"])` 因 debater entry 含 `route` 而失败；`expect(keys).not.toContain("exportRoute")` 因 config 含 `exportRoute` 而失败。**被杀 ✓**。
+
+全部三条变异施加后对 `src/generate.ts` 执行 `git checkout` 还原，`git status --porcelain` 无遗留改动。✓
 
 ### V8：每处删除给出必要性说明
 

@@ -1,10 +1,11 @@
 /**
- * G8 —— 生成段 argv 传 --role 却不传 --route / --runtime（spec §2 V1–V5 + §3 变异矩阵 W1–W3）。
+ * G8 —— 生成段 argv 传 --role 却不传 --route / --runtime（spec §2 V1–V5）。
  *
  * 每个 describe 对应一个判据 ID，不跨判据枚举。
  * 断言打在生产组装出的 deps 上（V5），注入分支会跳过生产装配——自建 runtime 注入的用例不算数。
+ * ⛔ 不 mock spawnGenerateRole：走生产入口，fake runtime 的 spawnProcess 记录 argv。
  */
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   spawnGenerateRole,
   buildGenerateRoleArgv,
@@ -21,71 +22,6 @@ import {
   buildTriageArgv,
 } from "../src/tick-run";
 import type { TriageCorpus, TriageSpawnRuntime } from "../src/tick-run";
-
-const mutationFlags = vi.hoisted(() => ({ w1: false, w2: false, w3: false }));
-
-vi.mock("../src/generate", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/generate")>();
-  const { join } = await import("node:path");
-  const { tmpdir } = await import("node:os");
-  const { writeFileSync, rmSync } = await import("node:fs");
-  const { randomUUID } = await import("node:crypto");
-
-  const buildGenerateRoleArgv = (opts: Parameters<typeof actual.buildGenerateRoleArgv>[0]) => {
-    const argv = actual.buildGenerateRoleArgv(opts);
-    if (mutationFlags.w1) {
-      return [...argv.slice(0, 3), "--route", "opus-4-8/ccs", ...argv.slice(3)];
-    }
-    if (mutationFlags.w2 && opts.role !== "dr-debater-advocate") {
-      return [...argv.slice(0, 3), "--route", "some-route", ...argv.slice(3)];
-    }
-    return argv;
-  };
-
-  const spawnGenerateRole = async (
-    role: string,
-    corpus: DebaterCorpus | SynthesizerCorpus,
-    runtime: GenerateSpawnRuntime,
-  ): Promise<{ body: string }> => {
-    const inputPath = runtime.writeInputFile
-      ? runtime.writeInputFile(corpus)
-      : actual.writeGenerateInputFile(corpus);
-    const serialized = actual.serializeCorpusToPositional(corpus);
-    const promptFile = join(tmpdir(), `g7-generate-prompt-${randomUUID()}.txt`);
-    writeFileSync(promptFile, serialized, "utf8");
-    try {
-      const argv = buildGenerateRoleArgv({
-        agentRunBin: runtime.agentRunBin,
-        role,
-        runId: runtime.runId,
-        inputPath,
-        promptFile,
-      });
-      await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
-      return { body: await runtime.readBody(runtime.runId) };
-    } finally {
-      rmSync(inputPath, { force: true });
-      rmSync(promptFile, { force: true });
-    }
-  };
-
-  return {
-    ...actual,
-    buildGenerateRoleArgv,
-    spawnGenerateRole,
-    get DEFAULT_GENERATE_CONFIG() {
-      const config = actual.DEFAULT_GENERATE_CONFIG;
-      if (mutationFlags.w3) {
-        return {
-          debaters: config.debaters.map((d) => ({ ...d, route: "dummy" })),
-          synthesizer: { ...config.synthesizer, route: "dummy" },
-          exportRoute: "export",
-        } as unknown as typeof config;
-      }
-      return config;
-    },
-  };
-});
 
 const ALL_ROLES = [
   "dr-debater-advocate",
@@ -302,129 +238,5 @@ describe("V5: assertions drive production assembly (not injected spawnRole)", ()
       "/tmp/p.txt",
     ]);
     expect(argv).not.toContain("--route");
-  });
-});
-
-// ── 变异矩阵 W1–W3（实测：vi.mock 同时替换 spawnGenerateRole 与 buildGenerateRoleArgv，变异可达生产调用路径）─
-
-describe("W1: add --route back to argv → V1 + V2 must fail", () => {
-  beforeAll(() => { mutationFlags.w1 = true; });
-  afterAll(() => { mutationFlags.w1 = false; });
-
-  it("W1: spawnGenerateRole produces argv with --route under w1 mutation", async () => {
-    const recorded: string[][] = [];
-    const runtime = fakeRuntime({
-      spawnProcess: async (argv) => {
-        recorded.push(argv);
-        return {};
-      },
-    });
-    await spawnGenerateRole("dr-debater-advocate", makeCorpus("debater") as DebaterCorpus, runtime);
-    expect(recorded).toHaveLength(1);
-    const argv = recorded[0];
-    expect(argv).toContain("--route");
-    expect(argv).toContain("opus-4-8/ccs");
-    expect(argv).toContain("--role");
-    expect(argv).toContain("--run-id");
-    expect(argv).toContain("--input");
-    expect(argv).toContain("--prompt-file");
-  });
-
-  it("W1: all four roles produce argv with --route → V1/V2 assertions would fail", async () => {
-    for (const role of ALL_ROLES) {
-      const recorded: string[][] = [];
-      const runtime = fakeRuntime({
-        spawnProcess: async (argv) => {
-          recorded.push(argv);
-          return {};
-        },
-      });
-      if (role === "dr-synthesizer") {
-        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
-      } else {
-        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
-      }
-      expect(recorded).toHaveLength(1);
-      expect(recorded[0]).toContain("--route");
-    }
-  });
-});
-
-describe("W2: only advocate removes --route, others keep it → V2 must fail", () => {
-  beforeAll(() => { mutationFlags.w2 = true; });
-  afterAll(() => { mutationFlags.w2 = false; });
-
-  it("W2: advocate has no --route, but opponent/judge/synthesizer do", async () => {
-    const advRecorded: string[][] = [];
-    const advRuntime = fakeRuntime({
-      spawnProcess: async (argv) => {
-        advRecorded.push(argv);
-        return {};
-      },
-    });
-    await spawnGenerateRole("dr-debater-advocate", makeCorpus("debater") as DebaterCorpus, advRuntime);
-    expect(advRecorded).toHaveLength(1);
-    expect(advRecorded[0]).not.toContain("--route");
-
-    for (const role of ["dr-debater-opponent", "dr-debater-judge", "dr-synthesizer"]) {
-      const recorded: string[][] = [];
-      const runtime = fakeRuntime({
-        spawnProcess: async (argv) => {
-          recorded.push(argv);
-          return {};
-        },
-      });
-      if (role === "dr-synthesizer") {
-        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
-      } else {
-        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
-      }
-      expect(recorded).toHaveLength(1);
-      expect(recorded[0]).toContain("--route");
-    }
-  });
-
-  it("W2: V2 forEach loop would fail on non-advocate roles", async () => {
-    for (const role of ALL_ROLES) {
-      const recorded: string[][] = [];
-      const runtime = fakeRuntime({
-        spawnProcess: async (argv) => {
-          recorded.push(argv);
-          return {};
-        },
-      });
-      if (role === "dr-synthesizer") {
-        await spawnGenerateRole(role, makeCorpus("dr-synthesizer") as SynthesizerCorpus, runtime);
-      } else {
-        await spawnGenerateRole(role, makeCorpus("debater") as DebaterCorpus, runtime);
-      }
-      if (role === "dr-debater-advocate") {
-        expect(recorded[0]).not.toContain("--route");
-      } else {
-        expect(recorded[0]).toContain("--route");
-      }
-    }
-  });
-});
-
-describe("W3: keep a dead route field → V3 must fail", () => {
-  beforeAll(() => { mutationFlags.w3 = true; });
-  afterAll(() => { mutationFlags.w3 = false; });
-
-  it("W3: GenerateRoleSpec has route field after mutation", () => {
-    for (const d of DEFAULT_GENERATE_CONFIG.debaters) {
-      const keys = Object.keys(d);
-      expect(keys).toContain("route");
-      expect(keys).toEqual(["role", "route"]);
-    }
-    const synthKeys = Object.keys(DEFAULT_GENERATE_CONFIG.synthesizer);
-    expect(synthKeys).toContain("route");
-    expect(synthKeys).toEqual(["role", "route"]);
-  });
-
-  it("W3: GenerateConfig has exportRoute field after mutation", () => {
-    const keys = Object.keys(DEFAULT_GENERATE_CONFIG);
-    expect(keys).toContain("exportRoute");
-    expect(keys).toEqual(["debaters", "synthesizer", "exportRoute"]);
   });
 });

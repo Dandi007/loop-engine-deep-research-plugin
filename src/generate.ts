@@ -505,6 +505,9 @@ export async function runGenerate(
       }
     } else if (anchorCheckError instanceof MissingAnchorCheckRepoRootError) {
       anchorTail = "no-repo-root";
+    } else if (anchorCheckError) {
+      const msg = anchorCheckError instanceof Error ? anchorCheckError.message : String(anchorCheckError);
+      anchorTail = `anchor-check-failed:${msg}`;
     }
 
     if (!anchorJsonWritten) {

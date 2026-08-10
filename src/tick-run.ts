@@ -1352,16 +1352,29 @@ export function assembleGenerateDeps(
             });
         })();
         writeFileSync(corpusFile, JSON.stringify(evidences), "utf8");
-        const stdout = execFileSync(anchorCheckBin, [
-          "--corpus", corpusFile,
-          "--repo-root", allowedRoot,
-          "--json",
-        ], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 30000,
-        });
-        return JSON.parse(stdout) as AnchorCheckResult;
+        return (() => {
+          try {
+            const stdout = execFileSync(anchorCheckBin, [
+              "--corpus", corpusFile,
+              "--repo-root", allowedRoot,
+              "--json",
+            ], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+              timeout: 30000,
+            });
+            return JSON.parse(stdout) as AnchorCheckResult;
+          } catch (e: any) {
+            try {
+              if (e.stdout != null) {
+                return JSON.parse(e.stdout) as AnchorCheckResult;
+              }
+            } catch (_) {}
+            const stderrTail = e.stderr != null ? String(e.stderr).slice(-200) : "";
+            const exitCode = e.status != null ? `exit ${e.status}` : "killed";
+            throw new Error(`anchor-check ${exitCode}: ${stderrTail}`);
+          }
+        })();
       } finally {
         rmSync(corpusFile, { force: true });
       }

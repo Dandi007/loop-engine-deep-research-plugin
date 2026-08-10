@@ -72,7 +72,7 @@ describe("T1: oversize corpus (>128 KB) works via --prompt-file (generate side)"
 
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-oversize",
+      newRunId: () => "run-oversize",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
@@ -116,7 +116,7 @@ describe("T2: both generate and triage paths use --prompt-file, no positional co
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-gen",
+      newRunId: () => "run-gen",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
@@ -180,7 +180,7 @@ describe("T3: --prompt-file content equals original serializeCorpusToPositional 
 
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-t3",
+      newRunId: () => "run-t3",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
@@ -235,7 +235,7 @@ describe("T4: --input schema guard is preserved", () => {
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-t4",
+      newRunId: () => "run-t4",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
@@ -286,7 +286,7 @@ describe("T5: temp files cleaned up after spawn (success and failure)", () => {
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-t5-ok",
+      newRunId: () => "run-t5-ok",
       writeInputFile: (c) => {
         inputPath = join(tmpdir(), `g7-t5-input-${Date.now()}.json`);
         writeFileSync(inputPath, JSON.stringify(c));
@@ -316,7 +316,7 @@ describe("T5: temp files cleaned up after spawn (success and failure)", () => {
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-t5-fail",
+      newRunId: () => "run-t5-fail",
       writeInputFile: (c) => {
         inputPath = join(tmpdir(), `g7-t5-fail-input-${Date.now()}.json`);
         writeFileSync(inputPath, JSON.stringify(c));
@@ -349,7 +349,7 @@ describe("T6: assertions drive production assembly (not injected spawnRole)", ()
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-t6",
+      newRunId: () => "run-t6",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);

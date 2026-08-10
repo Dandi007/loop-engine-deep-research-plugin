@@ -252,7 +252,8 @@ export function writeGenerateInputFile(corpus: DebaterCorpus | SynthesizerCorpus
 /** 生产默认 agent-run 派发所需的运行时（agent-run 定位 / spawn / body 回填）。 */
 export interface GenerateSpawnRuntime {
   agentRunBin: string;
-  runId: string;
+  /** 每次 spawn 现取全新 id；四个 role 并发 spawn 必须互不相同（spec §1）。 */
+  newRunId(): string;
   /** 写 `--input` 载荷文件；缺省 `writeGenerateInputFile`。 */
   writeInputFile?: (corpus: DebaterCorpus | SynthesizerCorpus) => string;
   /**
@@ -277,6 +278,7 @@ export async function spawnGenerateRole(
   corpus: DebaterCorpus | SynthesizerCorpus,
   runtime: GenerateSpawnRuntime,
 ): Promise<{ body: string }> {
+  const runId = runtime.newRunId();
   const inputPath = runtime.writeInputFile
     ? runtime.writeInputFile(corpus)
     : writeGenerateInputFile(corpus);
@@ -287,12 +289,12 @@ export async function spawnGenerateRole(
     const argv = buildGenerateRoleArgv({
       agentRunBin: runtime.agentRunBin,
       role,
-      runId: runtime.runId,
+      runId,
       inputPath,
       promptFile,
     });
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
-    return { body: await runtime.readBody(runtime.runId) };
+    return { body: await runtime.readBody(runId) };
   } finally {
     rmSync(inputPath, { force: true });
     rmSync(promptFile, { force: true });

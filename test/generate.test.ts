@@ -341,7 +341,7 @@ describe("G7: corpus reaches the role prompt via --prompt-file (production entry
     };
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-1",
+      newRunId: () => "run-1",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);
@@ -377,7 +377,7 @@ describe("G7: corpus reaches the role prompt via --prompt-file (production entry
     let capturedPromptContent = "";
     const runtime: GenerateSpawnRuntime = {
       agentRunBin: "/fake/agent-run",
-      runId: "run-1",
+      newRunId: () => "run-1",
       writeInputFile: () => "/tmp/payload.json",
       spawnProcess: async (argv) => {
         recorded.push(argv);

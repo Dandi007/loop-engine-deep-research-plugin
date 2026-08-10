@@ -196,4 +196,20 @@ TRIGGER_ID="a9-$(date +%s%N)-$$"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"
-"$LOOP_ENGINE_RUNNER" "$LOOP_ENGINE_CLI" drain "$RUNTIME_FLEET" --label "$MODE"
+# G15: drain 后检查 tick 失败 —— 捕获 drain 输出，解析 drain_id，
+# 遍历 index.jsonl → journal.jsonl 查找 [bash 非零退出 EXIT:<n>]，
+# 命中则响亮失败并点名 run_dir 与退出码。
+DRAIN_TMP=$(mktemp)
+trap 'rm -f "$DRAIN_TMP"' EXIT
+set +e
+"$LOOP_ENGINE_RUNNER" "$LOOP_ENGINE_CLI" drain "$RUNTIME_FLEET" --label "$MODE" > "$DRAIN_TMP"
+DRAIN_EXIT_CODE=$?
+set -e
+
+cat "$DRAIN_TMP"
+
+if [ "$DRAIN_EXIT_CODE" -ne 0 ]; then
+  exit "$DRAIN_EXIT_CODE"
+fi
+
+node "$PLUGIN_ROOT/scripts/check-drain-failures.mjs" < "$DRAIN_TMP"

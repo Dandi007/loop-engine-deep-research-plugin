@@ -27,7 +27,7 @@ function runtimeRoot() {
     if (typeof j.runtimeRoot === "string" && j.runtimeRoot.length > 0) return j.runtimeRoot;
   } catch {}
   if (process.env.LOOP_ENGINE_STATE) return process.env.LOOP_ENGINE_STATE;
-  return join(homedir(), ".loop-engine");
+  return "/data/loop-engine";
 }
 
 const root = runtimeRoot();

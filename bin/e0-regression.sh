@@ -45,6 +45,41 @@ if [ -z "$RUN_ID" ]; then
   RUN_ID="e0-$(date +%s%N)-$$"
 fi
 
+# §2.3.5 —— 归档入口命令自身的 stdout/stderr（profile-load、channel 预备等诊断行）。
+# 从入口一开始就把脚本自身的 stdout/stderr tee 进一个临时缓冲（同时回显到原终端），
+# 到记录目录就绪后由 EXIT trap 整体落入 run.entry.log；连同 loop 的 run.stdout.log /
+# run.stderr.log 共同构成「入口命令的完整 stdout/stderr」。护栏拒绝（exit 3）或更早的
+# 用法错误不建记录目录，缓冲随 trap 清理，不在仓内/记录根留下脏目录。
+ENTRY_TMP="$(mktemp)"
+exec 1> >(tee -a "$ENTRY_TMP")
+exec 2> >(tee -a "$ENTRY_TMP" >&2)
+# 记录持久化：先关掉 teed 的 fd1/fd2 让 tee 子进程收到 EOF、刷出缓冲并退出，再整体写入
+# run.entry.log；若 run.meta 尚未写出（loop 前的早期失败），补写一份含最终退出码的最小记录。
+_persist_record() {
+  local ec=$?
+  if [ -n "${RECORD_DIR:-}" ] && [ -d "$RECORD_DIR" ]; then
+    exec 1>&- 2>&- 2>/dev/null || true
+    wait 2>/dev/null || true
+    cat "$ENTRY_TMP" > "$RECORD_DIR/run.entry.log" 2>/dev/null || true
+    if [ ! -f "$RECORD_DIR/run.meta" ]; then
+      {
+        echo "run_id=$RUN_ID"
+        echo "profile=$PROFILE"
+        echo "tick_channel=${TICK_CHANNEL:-}"
+        echo "evidence_channel=${EVIDENCE_CHANNEL:-}"
+        echo "doc_channel=${DOC_CHANNEL:-}"
+        echo "loop_run_root=$RECORD_DIR/loop-run"
+        echo "entry_exit_code=$ec"
+        echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } > "$RECORD_DIR/run.meta" 2>/dev/null || true
+      cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt" 2>/dev/null || true
+    fi
+  fi
+}
+# EXIT trap 按注册逆序执行（LIFO）：先注册 rm、后注册 persist ⇒ persist 先跑、rm 后跑。
+trap 'rm -f "$ENTRY_TMP"' EXIT
+trap '_persist_record' EXIT
+
 # ── 测试总线默认（可由显式 env 覆盖；覆盖后的**最终生效值**在护栏里复核）。──
 export AGENT_BUS_URL="${AGENT_BUS_URL:-http://127.0.0.1:7495}"
 export AGENT_BUS_TOKEN_FILE="${AGENT_BUS_TOKEN_FILE:-/data/agent-bus-test/tokens/uther-tui.token}"

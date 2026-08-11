@@ -17,15 +17,22 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const fsProbe = vi.hoisted(() => ({ readPaths: [] as string[], capture: false }));
+const fsProbe = vi.hoisted(() => ({
+  readPaths: [] as string[],
+  capture: false,
+  overrides: {} as Record<string, string>,
+}));
 
-// 仅当 capture 打开时记录 bus 模块读取的 token 文件路径（代理到真实实现，不改语义）。
+// 仅当 capture 打开时记录 bus 模块读取的 token 文件路径；overrides 命中时返回合成内容
+// （T-A 'unset' 方向用它为默认凭证路径提供合成 token，使单测不依赖生产凭证文件是否存在）。
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     readFileSync: (path: unknown, ...args: unknown[]) => {
-      if (fsProbe.capture) fsProbe.readPaths.push(String(path));
+      const p = String(path);
+      if (fsProbe.capture) fsProbe.readPaths.push(p);
+      if (fsProbe.overrides[p] !== undefined) return fsProbe.overrides[p];
       return (actual.readFileSync as (p: unknown, ...a: unknown[]) => string)(path, ...args);
     },
   };
@@ -155,7 +162,8 @@ describe("T-A: AGENT_BUS_TOKEN_FILE selects the token path", () => {
     delete process.env.AGENT_BUS_TOKEN_FILE;
     fsProbe.readPaths.length = 0;
     fsProbe.capture = true;
-    stubFetchCapture();
+    fsProbe.overrides[DEFAULT_TOKEN_PATH] = "SYNTHETIC_TOKEN";
+    const getAuth = stubFetchCapture();
     const bus = await loadBus();
     await bus.publish("research:e0-regression.index", {
       kind: "k",
@@ -163,7 +171,9 @@ describe("T-A: AGENT_BUS_TOKEN_FILE selects the token path", () => {
       idempotency_key: "ik",
     });
     fsProbe.capture = false;
+    delete fsProbe.overrides[DEFAULT_TOKEN_PATH];
     expect(fsProbe.readPaths).toContain(DEFAULT_TOKEN_PATH);
+    expect(getAuth()).toBe("Bearer SYNTHETIC_TOKEN");
   });
 });
 
@@ -238,7 +248,8 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
   it("every §2.2 key is present and non-empty", () => {
     const prof = readProfile("e0-regression");
     for (const k of REQUIRED_PROFILE_KEYS) {
-      expect(k, prof[k]).toBeTruthy();
+      expect(prof[k], `profile key ${k} must be present and non-empty`).toBeTruthy();
+      expect(prof[k].trim(), `profile key ${k} must not be blank`).not.toBe("");
     }
   });
 
@@ -256,13 +267,20 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
   it("--profile e0-regression loads via the entry script (guard passes, script proceeds past profile load)", () => {
     // 使用测试总线 URL + 一个不存在的测试 token 路径：护栏放行（不指向生产），
     // 脚本应越过 profile 加载并进入 channel 预备阶段（因测试 token 缺失而响亮失败，而非“unknown profile”）。
-    const env = {
-      ...process.env,
-      AGENT_BUS_URL: "http://127.0.0.1:7495",
-      AGENT_BUS_TOKEN_FILE: "/data/agent-bus-test/tokens/nonexistent.token",
-    };
-    const res = runScript(env);
-    expect(res.err).not.toMatch(/unknown deploy profile/);
-    expect(res.err).toMatch(/e0-regression/);
+    // E0_RECORD_ROOT 指向临时目录，避免在 /data/loop-engine/e0-runs 下累积空记录目录。
+    const recRoot = mkdtempSync(join(tmpdir(), "e0-recroot-"));
+    try {
+      const env = {
+        ...process.env,
+        AGENT_BUS_URL: "http://127.0.0.1:7495",
+        AGENT_BUS_TOKEN_FILE: "/data/agent-bus-test/tokens/nonexistent.token",
+        E0_RECORD_ROOT: recRoot,
+      };
+      const res = runScript(env);
+      expect(res.err).not.toMatch(/unknown deploy profile/);
+      expect(res.err).toMatch(/e0-regression/);
+    } finally {
+      rmSync(recRoot, { recursive: true, force: true });
+    }
   });
 });

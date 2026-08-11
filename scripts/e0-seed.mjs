@@ -78,9 +78,19 @@ async function main() {
   const repoRoot = fileURLToPath(new URL("..", import.meta.url));
   const tickEntry = fileURLToPath(new URL("../bin/tick-entry.sh", import.meta.url));
   const clueArgs = clues.flatMap((c) => ["--clue", c]);
+  // attempt 2 评审 minor —— 发布步必须与判空步用**同一个 bus**：
+  // tick-entry --seed 经 src/bus.ts 从 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE 解析总线；
+  // 若只靠调用方传入的 baseUrl/tokenPath 判空、却把发布交给继承的环境，两者可能各指一个 bus
+  // （一个查 A 板空、一个写 B 板 append-only）。这里把**已解析**的 baseUrl/tokenPath 显式塞进
+  // 子进程 env，消除这份耦合。
   const res = spawnSync("bash", [tickEntry, "--seed", tickChannel, ...clueArgs], {
     cwd: repoRoot,
     encoding: "utf8",
+    env: {
+      ...process.env,
+      AGENT_BUS_URL: baseUrl,
+      AGENT_BUS_TOKEN_FILE: tokenPath,
+    },
   });
   if (res.status !== 0) {
     console.error(

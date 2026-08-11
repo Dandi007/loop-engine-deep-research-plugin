@@ -10,13 +10,32 @@ import { readFileSync } from "node:fs";
 // A10b —— agent-bus 基址可用 AGENT_BUS_URL 覆盖（默认本机 7490）。
 // 显式覆盖保持既有语义：默认仍是 127.0.0.1:7490，不覆盖时行为不变。
 const BASE_URL = process.env.AGENT_BUS_URL ?? "http://127.0.0.1:7490";
-const TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
+// E0 —— 凭证路径可用 AGENT_BUS_TOKEN_FILE 覆盖（与 agent-runtime 的 src/agent-bus.ts:56 同名同义）。
+// ⛔ 未设置该变量时行为逐字不变：仍读 /data/agent-bus/tokens/uther-tui.token。
+const TOKEN_PATH =
+  process.env.AGENT_BUS_TOKEN_FILE ?? "/data/agent-bus/tokens/uther-tui.token";
 
 let _cachedToken: string | null = null;
 
 function token(): string {
   if (_cachedToken === null) {
-    _cachedToken = readFileSync(TOKEN_PATH, "utf-8").trim();
+    let raw: string;
+    try {
+      raw = readFileSync(TOKEN_PATH, "utf-8").trim();
+    } catch (err) {
+      // E0 —— 凭证读取失败必须响亮失败并点名变量与解析到的路径，⛔ 不回退默认路径。
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `AGENT_BUS_TOKEN_FILE: failed to read token file at '${TOKEN_PATH}' (${detail})`,
+      );
+    }
+    if (!raw) {
+      // E0 —— 空凭证同样响亮失败，⛔ 不返回空 token 继续跑（宪法第四条：失败必须现形）。
+      throw new Error(
+        `AGENT_BUS_TOKEN_FILE: token file at '${TOKEN_PATH}' is empty; refusing to continue with an empty token`,
+      );
+    }
+    _cachedToken = raw;
   }
   return _cachedToken;
 }

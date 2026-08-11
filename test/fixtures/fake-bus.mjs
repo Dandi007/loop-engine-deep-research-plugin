@@ -1,7 +1,11 @@
-// test fixture —— 本地受控 agent-bus（A10b B1/B2 真跑用）。
+// test fixture —— 本地受控 agent-bus（A10b B1/B2 真跑用 / E0 判别性契约用）。
 // ⛔ 零外网：只在 127.0.0.1:<A10B_BUS_PORT> 上 listen，供产品代码经 AGENT_BUS_URL 读取/写入。
 // 支持：GET /v1/channels/<id>/messages?limit&after_seq；GET /v1/channels/<id>；
-// GET /v1/entities/<id>；POST /v1/channels/<id>/publish（supersedes 语义）。
+// GET /v1/channels（列表，**含 head_seq**）；GET /v1/entities/<id>；
+// POST /v1/channels/<id>/publish（supersedes 语义）。
+// ⛔ 字段集与真实 agent-bus 契约一致（2026-08-12 真机实测）：
+//    * 单 channel GET **不返回** head_seq；head_seq 只在列表端点 GET /v1/channels 出现。
+//    * 判别性：若把单 channel GET 改回返回 head_seq（E0a 虚构契约），E0 判别测试必须变红。
 // 可选 SEED 文件（A10B_SEED）预置消息。
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
@@ -51,8 +55,32 @@ const server = createServer((req, res) => {
       const list = (channels.get(id) ?? []).filter((m) => m.channel_seq > after);
       return send(200, { messages: list });
     }
+    if (req.method === "GET" && path === "/v1/channels") {
+      const list = [];
+      for (const [id, msgs] of channels) {
+        list.push({
+          channel_id: id,
+          delivery_mode: "fanout",
+          visibility: "public",
+          head_seq: msgs.length,
+        });
+      }
+      return send(200, list);
+    }
     if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
-      return send(200, { head_seq: (channels.get(decodeURIComponent(path.split("/")[3])) ?? []).length });
+      const id = decodeURIComponent(path.split("/")[3]);
+      return send(200, {
+        channel_id: id,
+        closed_at: null,
+        created_at: new Date().toISOString(),
+        default_lease_ms: 300000,
+        delivery_mode: "fanout",
+        max_attempts: 5,
+        metadata: {},
+        owner_agent_id: null,
+        refs_required: false,
+        visibility: "public",
+      });
     }
     if (req.method === "GET" && /^\/v1\/entities\/[^/]+$/.test(path)) {
       const id = decodeURIComponent(path.split("/")[3]);

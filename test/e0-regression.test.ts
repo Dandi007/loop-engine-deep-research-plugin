@@ -9,7 +9,7 @@
  *  - T-D  --profile e0-regression 加载后，§2.2 列出的每个键都非空；channel 名与生产 profile 无交集。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
@@ -40,6 +40,8 @@ vi.mock("node:fs", async (importOriginal) => {
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "e0-regression.sh");
+const VERIFY_BIN = join(ROOT, "bin", "e0-verify.sh");
+const FAKE_BUS = join(ROOT, "test", "fixtures", "fake-bus.mjs");
 const PROFILES_DIR = join(ROOT, "profiles", "deploy");
 const DEFAULT_TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 const REQUIRED_PROFILE_KEYS = [
@@ -134,6 +136,90 @@ function startCountingBus(): Promise<{
     });
   });
 }
+
+function runCmd(argv: string[], env: NodeJS.ProcessEnv = process.env): { code: number; out: string; err: string } {
+  try {
+    const out = execFileSync(argv[0], argv.slice(1), {
+      cwd: ROOT,
+      encoding: "utf8",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { code: 0, out, err: "" };
+  } catch (e) {
+    const err = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+    return {
+      code: err.status ?? -1,
+      out: String(err.stdout ?? ""),
+      err: String(err.stderr ?? ""),
+    };
+  }
+}
+
+interface SnapshotJson {
+  tick_channel: string;
+  tick_head_seq: number;
+  sum: number;
+  channel_count: number;
+  channels: Record<string, number>;
+}
+
+function runVerify(
+  beforeRun: SnapshotJson,
+  afterRun: SnapshotJson,
+  beforeProd: { sum: number; channel_count: number; channels: Record<string, number> },
+  afterProd: { sum: number; channel_count: number; channels: Record<string, number> },
+): { code: number; out: string; err: string } {
+  const dir = mkdtempSync(join(tmpdir(), "e0-verify-"));
+  const w = (name: string, obj: unknown) => writeFileSync(join(dir, name), JSON.stringify(obj));
+  w("br.json", beforeRun);
+  w("ar.json", afterRun);
+  w("bp.json", beforeProd);
+  w("ap.json", afterProd);
+  try {
+    return runCmd([
+      "bash",
+      VERIFY_BIN,
+      join(dir, "br.json"),
+      join(dir, "ar.json"),
+      join(dir, "bp.json"),
+      join(dir, "ap.json"),
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function startFakeBus(port: number): Promise<{ base: string; close: () => void }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [FAKE_BUS], {
+      env: { ...process.env, A10B_BUS_PORT: String(port) },
+      stdio: "ignore",
+    });
+    const deadline = Date.now() + 5000;
+    const poll = async () => {
+      try {
+        await fetch(`http://127.0.0.1:${port}/v1/channels/_probe`);
+        resolve({ base: `http://127.0.0.1:${port}`, close: () => child.kill() });
+      } catch {
+        if (Date.now() > deadline) {
+          child.kill();
+          reject(new Error(`fake bus did not come up on ${port}`));
+          return;
+        }
+        setTimeout(poll, 40);
+      }
+    };
+    poll();
+  });
+}
+
+const SNAP = (
+  tick: number,
+  sum: number,
+  channels: Record<string, number>,
+): SnapshotJson => ({ tick_channel: "t", tick_head_seq: tick, sum, channel_count: Object.keys(channels).length, channels });
+const PROD = (sum: number, channels: Record<string, number>) => ({ sum, channel_count: Object.keys(channels).length, channels });
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -284,3 +370,83 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
     }
   });
 });
+
+// ── T-VERIFY-Z2（⭐ 判别性，blocker 2）：生产总线 sum(head_seq) 增长 ⇒ 非零退出并点名污染 ──
+
+describe("T-VERIFY-Z2: production bus sum(head_seq) growth is flagged", () => {
+  it("production sum grew after run ⇒ non-zero exit naming the pollution", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(6, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(50, { a: 30, b: 20 }),
+    );
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/Z2/);
+    expect(res.err).toMatch(/pollut/i);
+  });
+
+  it("production sum unchanged after run ⇒ exit 0", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(6, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+    );
+    expect(res.code).toBe(0);
+  });
+});
+
+// ── T-VERIFY-Z1（⭐ 判别性，E0a 目标）：loop 退出 0 但零写入 / 板面无终态 ⇒ 非零退出 ──
+
+describe("T-VERIFY-Z1: loop exit 0 with zero bus growth is flagged", () => {
+  it("tick head_seq did not grow (loop wrote nothing / no terminal state) ⇒ non-zero exit naming Z1", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(5, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+    );
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/Z1/);
+  });
+
+  it("tick head_seq strictly grew ⇒ exit 0", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(9, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+    );
+    expect(res.code).toBe(0);
+  });
+});
+
+// ── T-FIXTURE-CONTRACT（⭐ 判别性，blocker 1 / §1.3）：fixture 必须与真实 agent-bus 契约一致 ──
+//    真实 API 的单 channel GET 不返回 head_seq；head_seq 只在列表端点 GET /v1/channels 出现。
+//    若把 fixture 改回 E0a 虚构契约（单 channel GET 返回 head_seq / 列表不返回），本组必须变红。
+
+describe("T-FIXTURE-CONTRACT: fake bus matches the real agent-bus field contract", () => {
+  it("single channel GET does NOT return head_seq; list GET DOES return head_seq", async () => {
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    try {
+      await fetch(`${bus.base}/v1/channels/research:e0-test.ch/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "k", payload: {}, idempotency_key: "ik" }),
+      });
+      const single = (await (await fetch(`${bus.base}/v1/channels/research:e0-test.ch`)).json()) as Record<string, unknown>;
+      expect(single).not.toHaveProperty("head_seq");
+
+      const list = (await (await fetch(`${bus.base}/v1/channels`)).json()) as Array<Record<string, unknown>>;
+      expect(Array.isArray(list)).toBe(true);
+      const entry = list.find((c) => c.channel_id === "research:e0-test.ch");
+      expect(entry).toBeDefined();
+      expect(entry).toHaveProperty("head_seq");
+    } finally {
+      bus.close();
+    }
+  });
+});
+

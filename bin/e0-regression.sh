@@ -84,6 +84,12 @@ trap '_persist_record' EXIT
 export AGENT_BUS_URL="${AGENT_BUS_URL:-http://127.0.0.1:7495}"
 export AGENT_BUS_TOKEN_FILE="${AGENT_BUS_TOKEN_FILE:-/data/agent-bus-test/tokens/uther-tui.token}"
 
+# ── 生产总线只读采样（Z2）：跑前跑后各读一次 sum(head_seq)，证明本次运行零污染。
+#    ⛔ 只读，绝不写生产；护栏只约束运行用的 AGENT_BUS_URL，生产采样是独立只读 URL。
+#    ⛔ 一律从 **列表端点** GET /v1/channels 取 head_seq（真实 API 的单 channel GET 没有该字段）。
+export E0_PROD_BUS_URL="${E0_PROD_BUS_URL:-http://127.0.0.1:7490}"
+export E0_PROD_BUS_TOKEN_FILE="${E0_PROD_BUS_TOKEN_FILE:-/data/agent-bus/tokens/uther-tui.token}"
+
 # ── 加载 profile（显式 env 优先，绝不覆盖已显式给的 env）。──
 PROFILE_FILE="$PLUGIN_ROOT/profiles/deploy/$PROFILE.env"
 if [ ! -f "$PROFILE_FILE" ]; then
@@ -152,6 +158,9 @@ _ensure_channel() {
 _ensure_channel "$TICK_CHANNEL"
 _ensure_channel "$EVIDENCE_CHANNEL"
 _ensure_channel "$DOC_CHANNEL"
+# §1 —— 预备清单含系统板 board:agent-runs（该名字在仓内只有一处真相源：本变量）。
+BOARD_AGENT_RUNS_CHANNEL="board:agent-runs"
+_ensure_channel "$BOARD_AGENT_RUNS_CHANNEL"
 
 # ── 把 run 上下文导出，供 loop-engine run 目录与 idempotency key 落到本次记录目录下。──
 export DD_RUN_ID="$RUN_ID"
@@ -160,6 +169,13 @@ export DD_RUN_ROOT="$RECORD_DIR/loop-run"
 echo "[e0-regression] run_id=$RUN_ID"
 echo "[e0-regression] record_dir=$RECORD_DIR"
 
+# ── 实证读数：head_seq / sum 一律走 scripts/e0-metrics.mjs（真实 JSON 解析，⛔ 不用贪婪正则）。
+#    Z1 —— 测试总线 TICK head_seq 跑前基线；Z2 —— 生产总线 sum(head_seq) 跑前基线。
+E0_METRICS="$PLUGIN_ROOT/scripts/e0-metrics.mjs"
+BEFORE_RUN_JSON="$(node "$E0_METRICS" snapshot "$AGENT_BUS_URL" "$AGENT_BUS_TOKEN_FILE" "$TICK_CHANNEL")"
+BEFORE_PROD_JSON="$(node "$E0_METRICS" sum "$E0_PROD_BUS_URL" "$E0_PROD_BUS_TOKEN_FILE")"
+echo "[e0-regression] before: run-tick=$TICK_CHANNEL ($(printf '%s' "$BEFORE_RUN_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);process.stdout.write(String(j.tick_head_seq))})')) prod-sum=$(printf '%s' "$BEFORE_PROD_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);process.stdout.write(String(j.sum))})')" >&2
+
 # ── 跑现状链路到终态；完整 stdout/stderr 落盘，退出码单独记录。──
 set +e
 bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
@@ -167,8 +183,31 @@ bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
 LOOP_EXIT=$?
 set -e
 
+# ── 跑后读数（Z1/Z2）：测试总线 TICK head_seq、生产总线 sum(head_seq)。──
+AFTER_RUN_JSON="$(node "$E0_METRICS" snapshot "$AGENT_BUS_URL" "$AGENT_BUS_TOKEN_FILE" "$TICK_CHANNEL")"
+AFTER_PROD_JSON="$(node "$E0_METRICS" sum "$E0_PROD_BUS_URL" "$E0_PROD_BUS_TOKEN_FILE")"
+echo "[e0-regression] after: run-tick=$(printf '%s' "$AFTER_RUN_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);process.stdout.write(String(j.tick_head_seq))})') prod-sum=$(printf '%s' "$AFTER_PROD_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);process.stdout.write(String(j.sum))})')" >&2
+
+# ── 实证判据（Z1/Z2）：只有 loop 本身跑到终态（exit 0）才判；否则以 loop 失败码退出。
+#    两条读数的**全量 JSON**都落进运行记录，供派发方用独立实现交叉复算。──
+printf '%s\n' "$BEFORE_RUN_JSON" > "$RECORD_DIR/before.run.json"
+printf '%s\n' "$AFTER_RUN_JSON" > "$RECORD_DIR/after.run.json"
+printf '%s\n' "$BEFORE_PROD_JSON" > "$RECORD_DIR/before.prod.json"
+printf '%s\n' "$AFTER_PROD_JSON" > "$RECORD_DIR/after.prod.json"
+
 # ── 运行记录归档（§2.3.5）：入口命令 stdout/stderr、最终 exit code、profile 与 channel 名、
 #    可据以回查的 loop-engine run 目录路径。⛔ 记录目录在仓外。──
+if [ "$LOOP_EXIT" -ne 0 ]; then
+  FINAL_EXIT="$LOOP_EXIT"
+else
+  set +e
+  bash "$PLUGIN_ROOT/bin/e0-verify.sh" \
+    "$RECORD_DIR/before.run.json" "$RECORD_DIR/after.run.json" \
+    "$RECORD_DIR/before.prod.json" "$RECORD_DIR/after.prod.json"
+  VERIFY_EXIT=$?
+  set -e
+  FINAL_EXIT="$VERIFY_EXIT"
+fi
 {
   echo "run_id=$RUN_ID"
   echo "profile=$PROFILE"
@@ -176,12 +215,12 @@ set -e
   echo "evidence_channel=$EVIDENCE_CHANNEL"
   echo "doc_channel=$DOC_CHANNEL"
   echo "loop_run_root=$RECORD_DIR/loop-run"
-  echo "entry_exit_code=$LOOP_EXIT"
+  echo "entry_exit_code=$FINAL_EXIT"
   echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RECORD_DIR/run.meta"
 cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
 
-echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT)"
+echo "[e0-regression] run record written: $RECORD_DIR (exit=$FINAL_EXIT)"
 
-# 终态可判：0 = 跑到终态；非零 = 没跑到终态。绝不以 0 掩盖未跑完。
-exit "$LOOP_EXIT"
+# 终态可判：0 = 跑到终态且实证判据成立；非零 = 没跑到终态或实证判据被违反。绝不以 0 掩盖未跑完。
+exit "$FINAL_EXIT"

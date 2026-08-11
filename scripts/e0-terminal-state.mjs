@@ -1,31 +1,49 @@
 #!/usr/bin/env node
 /**
- * E0 —— 从 loop 输出里判定板面是否到达终态（判据 4 / §1.2）。
+ * E0 —— 从真实 tick run_output（journal.jsonl）里判定板面是否到达终态（判据 4 / §1.2）。
  *
  * ⛔ 凡是从 JSON 取值一律真解析（JSON.parse），⛔ 不用贪婪正则从 JSON 抽多值。
  *
  * 输入：run.stdout.log（stdin）—— 即 bin/deep-research-loop.sh 的完整 stdout。
- * ⛔ 该文件**不是** tick 级 termination 的载体：真实驱动（bin/deep-research-loop.sh）的 stdout
- *    只含 loop-store put 输出、"[deep-research-loop] mode=… run_root=…" 行，以及
- *    `cat "$DRAIN_TMP"` 发出的 **drain 摘要**（loop-engine drain 输出的单个 JSON 对象）。
- *    tick 节点里的 run_output（含 termination.state）被 loop-engine 收进
- *    <run_dir>/journal.jsonl，**不会**落到 run.stdout.log。
- *    因此这里不读 termination.state，而是解析真实驱动确实发出的 **drain 摘要**：
- *       {"reason":"drained","rounds":1}
- *       {"reason":"drained","rounds":0,"ticksByLabel":{"tick":0}}
- *       {"reason":"max_rounds","rounds":16,"ticksByLabel":{"tick":16}}
+ *   其中含 loop-engine 的 **drain 摘要**（单个 JSON 对象，带 reason / rounds / drain_id）。
+ *
+ * ⛔ 板面真正的 termination.state **不在** run.stdout.log 里：那是 tick 节点（tick-entry --run）
+ *   在**每一轮 tick** 用真实板面 + 跨 tick 累计的 zeroGrowthRounds 调 decideTermination 算出的，
+ *   tick.md 用 `printf '%s\n' "$run_output"` 打出 run_output 的 JSON（含 termination），
+ *   被 loop-engine 收进 <run_dir>/journal.jsonl。因此要读真实终态，须沿
+ *   scripts/check-drain-failures.mjs 同一条取证路径：
+ *     drain 摘要.drain_id → index.jsonl → run_dir → journal.jsonl → 最后一轮 tick run_output
+ *     → termination.state。
  *
  * 判定：
- *   - run.stdout.log 里没有 drain 摘要（reason+rounds 的 JSON 对象）⇒ exit 1（板面无终态证据）。
- *   - 有 drain 摘要但 rounds === 0（空板，loop 没跑任何一轮）⇒ 输出字面量 "null"（板面无终态），exit 0。
- *   - rounds >= 1 ⇒ 输出 reason（如 "drained"），exit 0。
+ *   - run.stdout.log 里没有 drain 摘要、或摘要没有 drain_id ⇒ exit 1（板面无终态证据）。
+ *   - index.jsonl / journal.jsonl 读不到、或找不到该 drain 的 run_dir ⇒ exit 1（无终态证据）。
+ *   - journal.jsonl 里没有含 termination 的 tick run_output ⇒ exit 1（无终态证据）。
+ *   - 最后一轮 tick 的 termination.state === null ⇒ 输出字面量 "null"（板面未达终态），exit 0。
+ *   - termination.state 非 null（如 "converged" / "capped" / "partial"）⇒ 输出该终态，exit 0。
  *
- * 输出（stdout）：终态字符串；"null" 表示板面无终态。
- * 退出码：0 = 找到 drain 摘要；1 = 没有 drain 摘要（板面无终态证据）。
+ * 输出（stdout）：终态字符串；"null" 表示板面未达终态。
+ * 退出码：0 = 读到终态判定（含 null）；1 = 没有终态证据（读不到）。
  */
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+function runtimeRoot() {
+  if (process.env.LOOP_ENGINE_RUNTIME_ROOT) return process.env.LOOP_ENGINE_RUNTIME_ROOT;
+  const cfg = join(homedir(), ".config", "loop-engine", "config.json");
+  try {
+    const j = JSON.parse(readFileSync(cfg, "utf8"));
+    if (typeof j.runtimeRoot === "string" && j.runtimeRoot.length > 0) return j.runtimeRoot;
+  } catch {}
+  if (process.env.LOOP_ENGINE_STATE) return process.env.LOOP_ENGINE_STATE;
+  return "/data/loop-engine";
+}
+
 let s = "";
 process.stdin.on("data", (d) => (s += d));
 process.stdin.on("end", () => {
+  // 解析 drain 摘要（最后一个 reason+rounds 的 JSON 行）。
   let drain;
   for (const line of s.split("\n")) {
     const t = line.trim();
@@ -42,20 +60,70 @@ process.stdin.on("end", () => {
       typeof obj.reason === "string" &&
       typeof obj.rounds === "number"
     ) {
-      // 取最后一个（drain 摘要是驱动的最后一个 JSON 行）。
       drain = obj;
     }
   }
-  if (!drain) {
+  if (!drain || typeof drain.drain_id !== "string" || drain.drain_id === "") {
     process.stderr.write(
-      "[e0-terminal-state] loop output contains no drain summary (reason+rounds JSON); board has no terminal state\n",
+      "[e0-terminal-state] loop output contains no drain summary with drain_id; cannot locate the run's journal to read the board's real termination.state\n",
     );
     process.exit(1);
   }
-  if (drain.rounds < 1) {
-    process.stdout.write("null\n");
-    process.exit(0);
+  const drainId = drain.drain_id;
+  const root = runtimeRoot();
+  const indexFile = join(root, "index.jsonl");
+  let indexContent;
+  try {
+    indexContent = readFileSync(indexFile, "utf8");
+  } catch {
+    process.stderr.write(`[e0-terminal-state] index.jsonl not found or unreadable at ${indexFile}\n`);
+    process.exit(1);
   }
-  process.stdout.write(`${drain.reason}\n`);
+  const runDirs = [];
+  for (const line of indexContent.trim().split("\n")) {
+    if (!line) continue;
+    try {
+      const rec = JSON.parse(line);
+      if (rec.drain_id === drainId && rec.run_dir) runDirs.push(rec.run_dir);
+    } catch {}
+  }
+  if (runDirs.length === 0) {
+    process.stderr.write(`[e0-terminal-state] no run_dir found in index.jsonl for drain_id=${drainId}\n`);
+    process.exit(1);
+  }
+  // 遍历每个 run_dir 的 journal.jsonl，取最后一轮含 termination 的 tick run_output。
+  let lastTermination = null;
+  for (const runDir of runDirs) {
+    const journalFile = join(runDir, "journal.jsonl");
+    let journalContent;
+    try {
+      journalContent = readFileSync(journalFile, "utf8");
+    } catch {
+      process.stderr.write(
+        `[e0-terminal-state] journal.jsonl not found or unreadable at ${journalFile}\n`,
+      );
+      process.exit(1);
+    }
+    for (const line of journalContent.trim().split("\n")) {
+      if (!line) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (obj && typeof obj === "object" && obj.termination && typeof obj.termination === "object") {
+        lastTermination = obj.termination;
+      }
+    }
+  }
+  if (lastTermination === null) {
+    process.stderr.write(
+      "[e0-terminal-state] journal.jsonl contains no tick run_output with a termination object; no terminal-state evidence\n",
+    );
+    process.exit(1);
+  }
+  const state = lastTermination.state;
+  process.stdout.write(`${state === null || state === undefined ? "null" : String(state)}\n`);
   process.exit(0);
 });

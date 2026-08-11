@@ -166,17 +166,89 @@ interface SnapshotJson {
   channels: Record<string, number>;
 }
 
-// 真实驱动（bin/deep-research-loop.sh）在 run.stdout.log 里发出的终态信号是 loop-engine 的
-// **drain 摘要**（`cat "$DRAIN_TMP"` 的单个 JSON 对象，reason+rounds），而非 tick 级 termination。
-// 本文件用与真实驱动一致的形式构造 run.stdout.log。
-const DRAIN_LINE = JSON.stringify({ reason: "drained", rounds: 1, ticksByLabel: { tick: 1 } });
+// 真实驱动（bin/deep-research-loop.sh）在 run.stdout.log 里发出的收尾信号是 loop-engine 的
+// **drain 摘要**（`cat "$DRAIN_TMP"` 的单个 JSON 对象，reason+rounds+drain_id）。
+// 板面真正的 termination.state **不在** run.stdout.log 里：那是 tick 节点每轮 run_output 的 JSON
+// （含 termination），被 loop-engine 收进 <run_dir>/journal.jsonl。e0-verify 沿
+// drain_id → index.jsonl → run_dir → journal.jsonl 读它。因此本文件要构造与真实驱动一致的
+// 运行时根（index.jsonl + journal.jsonl），让终态断言能读到真实 tick run_output 的 termination.state。
+
+interface EngineTerminal {
+  /** 写入 journal.jsonl 里最后一轮 tick run_output 的 termination.state（null = 板面未达终态）。 */
+  state: string | null;
+  /** drain 摘要里要带的 drain_id；null 表示 run.stdout.log 里没有 drain 摘要/drain_id。 */
+  drainId?: string;
+}
+
+// 构造一个假的 loop-engine 运行时根：index.jsonl + run_dir/journal.jsonl（含 tick run_output JSON）。
+function makeEngineRoot(
+  dir: string,
+  drainId: string,
+  termState: string | null,
+): { indexFile: string; runDir: string } {
+  const runDir = join(dir, "engine-root", "runs", "run-r", "tick-run");
+  mkdirSync(runDir, { recursive: true });
+  const runOutput = JSON.stringify({
+    channelId: "t",
+    messageCount: 1,
+    decisions: [],
+    writes: 1,
+    skipped: 0,
+    spawns: [],
+    harvestReports: [],
+    triageReports: [],
+    hasPendingWork: false,
+    termination: {
+      state: termState,
+      coverage: termState === null ? 1 : 1,
+      zeroGrowthRounds: termState === null ? 0 : 2,
+      capHit: false,
+    },
+  });
+  writeFileSync(join(runDir, "journal.jsonl"), `${runOutput}\n`);
+  const indexFile = join(dir, "engine-root", "index.jsonl");
+  writeFileSync(
+    indexFile,
+    JSON.stringify({
+      schema: "lei/1",
+      kind: "run.start",
+      run_id: "tick-run",
+      label: "tick",
+      fleet: "fleet.yaml",
+      caller: "drain",
+      run_dir: runDir,
+      ts: new Date().toISOString(),
+      pid: 12345,
+      drain_id: drainId,
+      lane: "tick",
+      tick: 1,
+    }) + "\n",
+  );
+  return { indexFile, runDir };
+}
+
+// run.stdout.log 里 loop-engine drain 摘要（与真实驱动 `cat "$DRAIN_TMP"` 同构）。
+function drainLine(drainId: string, rounds = 1): string {
+  return `${JSON.stringify({ reason: "drained", rounds, ticksByLabel: { tick: rounds }, drain_id: drainId })}\n`;
+}
+
+interface VerifyOpts {
+  /** 覆盖 run.stdout.log 内容。缺省用含 drainId 的 drain 摘要。 */
+  runLog?: string;
+  /** journal.jsonl 里最后一轮 tick 的 termination.state（缺省 "converged"）。 */
+  termState?: string | null;
+  /** drain_id；缺省随机生成。 */
+  drainId?: string;
+  /** 是否构建运行时根（index.jsonl + journal.jsonl）。true 时 set LOOP_ENGINE_RUNTIME_ROOT。 */
+  engine?: boolean;
+}
 
 function runVerify(
   beforeRun: SnapshotJson,
   afterRun: SnapshotJson,
   beforeProd: { sum: number; channel_count: number; channels: Record<string, number> },
   afterProd: { sum: number; channel_count: number; channels: Record<string, number> },
-  runLog = `${DRAIN_LINE}\n`,
+  opts: VerifyOpts = {},
 ): { code: number; out: string; err: string } {
   const dir = mkdtempSync(join(tmpdir(), "e0-verify-"));
   const w = (name: string, content: string) => writeFileSync(join(dir, name), content);
@@ -184,17 +256,28 @@ function runVerify(
   w("ar.json", JSON.stringify(afterRun));
   w("bp.json", JSON.stringify(beforeProd));
   w("ap.json", JSON.stringify(afterProd));
+  const drainId = opts.drainId ?? `drain-${Math.random().toString(36).slice(2)}`;
+  const termState = opts.termState === undefined ? "converged" : opts.termState;
+  const runLog = opts.runLog ?? drainLine(drainId);
   w("run.stdout.log", runLog);
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (opts.engine !== false) {
+    makeEngineRoot(dir, drainId, termState);
+    env.LOOP_ENGINE_RUNTIME_ROOT = join(dir, "engine-root");
+  }
   try {
-    return runCmd([
-      "bash",
-      VERIFY_BIN,
-      join(dir, "br.json"),
-      join(dir, "ar.json"),
-      join(dir, "bp.json"),
-      join(dir, "ap.json"),
-      join(dir, "run.stdout.log"),
-    ]);
+    return runCmd(
+      [
+        "bash",
+        VERIFY_BIN,
+        join(dir, "br.json"),
+        join(dir, "ar.json"),
+        join(dir, "bp.json"),
+        join(dir, "ap.json"),
+        join(dir, "run.stdout.log"),
+      ],
+      env,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -546,30 +629,62 @@ describe("T-SEED (criterion 5): empty-board auto-seeding is effective and idempo
   });
 });
 
-// ── T-VERIFY-TERMINAL（⭐ 判据 4 / finding 2）：loop 退出 0 但板面无终态 ⇒ 非零退出 ──
-//    run.stdout.log 必须真解析出非 null 的真实终态（drain 摘要 rounds>=1）；否则即使 Z1/Z2 成立也判不过。
+// ── T-VERIFY-TERMINAL（⭐ 判据 4 / attempt 3 final blocker 1+2）：板面真实终态判定 ──
+//    ⛔ 终态**不是** drain 的 reason/rounds：drain rounds>=1、head_seq 涨了，只要板面真实
+//    termination.state===null（板面未达终态）就必须非零退出。finnal 评审点名：reason='max_rounds'
+//    是死锁签名（永不 drained），'drained' 且 termination.state===null 也是"loop 做了事但板面无终态"。
+//    板面真实终态从 journal.jsonl（drain_id → index.jsonl → run_dir → 最后一轮 tick run_output）
+//    读取——这正是 E0a 想防的 'mock 全绿 ≠ 判据成立' 形状。
 
-describe("T-VERIFY-TERMINAL: loop exit 0 with no terminal state is flagged", () => {
-  it("drain rounds == 0 (empty board, loop did no work) ⇒ non-zero exit naming TERMINAL", () => {
-    const runLog = JSON.stringify({ reason: "drained", rounds: 0, ticksByLabel: { tick: 0 } }) + "\n";
+describe("T-VERIFY-TERMINAL: board with no real terminal state is flagged even when the loop did work", () => {
+  it("loop did work (rounds>=1, head_seq grew) yet board termination.state===null ⇒ non-zero exit naming TERMINAL", () => {
+    // max_rounds 死锁签名：drain rounds>=1 且 head_seq 涨，但板面 termination.state 为 null。
     const res = runVerify(
       SNAP(5, 20, { a: 10, b: 10 }),
       SNAP(9, 20, { a: 10, b: 10 }),
       PROD(20, { a: 10, b: 10 }),
       PROD(20, { a: 10, b: 10 }),
-      runLog,
+      { termState: null },
     );
     expect(res.code).not.toBe(0);
     expect(res.err).toMatch(/TERMINAL/);
   });
 
-  it("run.stdout.log contains no drain summary ⇒ non-zero exit naming TERMINAL", () => {
+  it("drain reason 'max_rounds' with rounds>=1 is NOT a terminal state ⇒ non-zero exit", () => {
+    const drainId = `drain-${Math.random().toString(36).slice(2)}`;
     const res = runVerify(
       SNAP(5, 20, { a: 10, b: 10 }),
       SNAP(9, 20, { a: 10, b: 10 }),
       PROD(20, { a: 10, b: 10 }),
       PROD(20, { a: 10, b: 10 }),
-      "some non-json diagnostic line\nand another\n",
+      {
+        runLog: `${JSON.stringify({ reason: "max_rounds", rounds: 16, ticksByLabel: { tick: 16 }, drain_id: drainId })}\n`,
+        termState: null,
+        drainId,
+      },
+    );
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/TERMINAL/);
+  });
+
+  it("board reached a real terminal state (termination.state non-null) ⇒ exit 0", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(9, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      { termState: "converged" },
+    );
+    expect(res.code).toBe(0);
+  });
+
+  it("run.stdout.log has no drain summary with drain_id ⇒ cannot read real termination ⇒ non-zero exit naming TERMINAL", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(9, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      { runLog: "some non-json diagnostic line\nand another\n" },
     );
     expect(res.code).not.toBe(0);
     expect(res.err).toMatch(/TERMINAL/);
@@ -603,11 +718,10 @@ describe("T-VERIFY-DRAIN: terminal assertion holds on real deep-research-loop.sh
     }
   }
 
-  it("drain rounds>=1 on real driver stdout ⇒ e0-verify exits 0 (Z1 reachable)", () => {
+  it("drain rounds>=1 with real board terminal state on real driver stdout ⇒ e0-verify exits 0 (Z1 reachable)", () => {
     const dir = mkdtempSync(join(tmpdir(), "e0-drain-real-"));
     try {
       mkdirSync(join(dir, "dist", "lib"), { recursive: true });
-      mkdirSync(join(dir, "engine-root", "runs", "run-r"), { recursive: true });
       mkdirSync(join(dir, "engine-root", "runs", "run-r", "tick-run"), { recursive: true });
       const cli = join(dir, "dist", "cli.js");
       const storeCli = join(dir, "dist", "lib", "store-cli.js");
@@ -639,9 +753,29 @@ describe("T-VERIFY-DRAIN: terminal assertion holds on real deep-research-loop.sh
           tick: 1,
         }) + "\n",
       );
+      // journal.jsonl 含真实 tick run_output（tick-entry --run 的 JSON，含 termination.state）。
+      // 这模拟 loop-engine 捕获的 tick 节点 stdout：最后一轮 run_output 的 termination.state 非 null
+      // （板面真的到了终态）⇒ e0-verify 的终态断言判过。
+      const runOutput = JSON.stringify({
+        channelId: "research:test-real",
+        messageCount: 1,
+        decisions: [],
+        writes: 1,
+        skipped: 0,
+        spawns: [],
+        harvestReports: [],
+        triageReports: [],
+        hasPendingWork: false,
+        termination: {
+          state: "converged",
+          coverage: 1,
+          zeroGrowthRounds: 2,
+          capHit: false,
+        },
+      });
       writeFileSync(
         join(dir, "engine-root", "runs", "run-r", "tick-run", "journal.jsonl"),
-        "OK: all fine\n",
+        `some diagnostic line\n${runOutput}\n`,
       );
 
       // 驱动生产 deep-research-loop.sh，取真实 stdout 作为 run.stdout.log。
@@ -666,15 +800,18 @@ describe("T-VERIFY-DRAIN: terminal assertion holds on real deep-research-loop.sh
       writeFileSync(join(dir, "ar.json"), JSON.stringify(SNAP(9, 20, { a: 10, b: 10 })));
       writeFileSync(join(dir, "bp.json"), JSON.stringify(PROD(20, { a: 10, b: 10 })));
       writeFileSync(join(dir, "ap.json"), JSON.stringify(PROD(20, { a: 10, b: 10 })));
-      const res2 = runCmd([
-        "bash",
-        VERIFY_BIN,
-        join(dir, "br.json"),
-        join(dir, "ar.json"),
-        join(dir, "bp.json"),
-        join(dir, "ap.json"),
-        runLogPath,
-      ]);
+      const res2 = runCmd(
+        [
+          "bash",
+          VERIFY_BIN,
+          join(dir, "br.json"),
+          join(dir, "ar.json"),
+          join(dir, "bp.json"),
+          join(dir, "ap.json"),
+          runLogPath,
+        ],
+        { ...process.env, LOOP_ENGINE_RUNTIME_ROOT: join(dir, "engine-root") },
+      );
       expect(res2.code).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });

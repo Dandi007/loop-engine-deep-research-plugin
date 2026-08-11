@@ -11,7 +11,11 @@ set -euo pipefail
 # ⛔ G4a——研究主问题 --question 也随装配系统一路注入（bin 导出 RESEARCH_QUESTION，无缺省）；
 #    CLI 支持它、引擎在 triage 决策上依赖它，唯独生产从不传它 ⇒ 收集段首个 triage 决策即响亮失败。
 # ⛔ A9——trigger 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 随装配系统一路注入；
-#    tick 完成后当且仅当板面仍有非终态 clue（hasPendingWork=true）才投下一条触发（spec §1.3 / F9）。
+#    E0c（§1.3 / GT-5）——续投门对齐终态判据：板面仍有非终态 clue（hasPendingWork=true），
+#    **或** 板面已排空但终态尚未判定（termination.state 仍为 null 且未触顶）⇒ 仍投下一条触发，
+#    让零增长轮把 zeroGrowthRounds 攒够，直到 decideTermination 给出非 null 的 converged / partial / capped。
+#    ⛔ 触顶（capHit）时按既有语义（capped 需等在途排空），不得因本改动绕过熔断；
+#    ⛔ 续投拿到非 null 终态后停止。判据用**真 JSON 解析**读 run_output（不再用 grep 正则）。
 # ⛔ G4b——终止计数（coverage / zeroGrowthRounds）经 trigger body 跨 tick 传递（spec §1.2）：
 #    claim.bind 已把 trigger_body 绑进 pipeline input；本节点读 trigger_body（claim.bind 绑进来的 JSON）解析上一轮计数，
 #    以 --prev-coverage / --prev-zero-growth 传给 tick-entry，并把本轮 decideTermination 的计数
@@ -75,21 +79,56 @@ if [ -n "$tick_channel" ]; then
     fi
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
-      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"。
+      # ⛔ 不用 `read -a`（bash 数组语法在 zsh 下报 bad option: -a；tick 的 harness shell 未必是 bash）。
+      # ⛔ 也不用 unquoted 分词 `arr=($line)`（zsh 默认不 SH_WORD_SPLIT，会当单个含 tab 的 token，
+      #    使 --prev-coverage / --prev-zero-growth 无法被 parseRunCliArgs 识别 ⇒ 计数器恒 0）。
+      #    改用 read 的字段切分：IFS（空格/tab/换行）把整行切成 _k1 _v1 _k2 _v2 四个 token。
+      prev_args=()
+      read -r _k1 _v1 _k2 _v2 <<< "$prev_line"
+      if [ -n "${_k1:-}" ]; then
+        prev_args+=(--prev-coverage "$_v1" --prev-zero-growth "$_v2")
+      fi
     fi
   fi
   tick_args+=("${prev_args[@]}")
   run_output="$("${tick_args[@]}")"
   printf '%s\n' "$run_output"
-  # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
-  #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
-  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在 hasPendingWork=true 时
+  # A9 / E0c §1.3 —— 续投门（对齐终态判据，GT-5）：
+  #   hasPendingWork==true  或  (termination.state 仍为 null 且未触顶)  ⇒ 投下一条触发。
+  #   触发 id 每轮唯一（纳秒时间戳 + PID，否则 put 覆盖）。
+  # ⛔ E0c —— 判定用**真 JSON 解析**读 run_output（不再用 grep 正则抽 hasPendingWork）。
+  #    terminate=1 表示「本轮已拿到非 null 终态」⇒ 不再续投；0 表示仍需续投。
+  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在需续投时
   #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
   # G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
   #    从 run_output 的 JSON 解析 termination.coverage / termination.zeroGrowthRounds，写进下一条 body。
-  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+  terminate_flag=$(node - "$run_output" <<'E0C_GATE_EOF'
+    const s = process.argv[2];
+    let o;
+    try { o = JSON.parse(s); } catch (e) {
+      console.error("E0c: run output is not valid JSON: " + e.message);
+      process.exit(1);
+    }
+    if (!o || typeof o !== "object") {
+      console.error("E0c: run output is not a JSON object");
+      process.exit(1);
+    }
+    const hpw = o.hasPendingWork === true;
+    const t = o.termination && typeof o.termination === "object" ? o.termination : null;
+    if (!t || typeof t !== "object") {
+      console.error("E0c: run output missing termination object");
+      process.exit(1);
+    }
+    const state = t.state;
+    const capHit = t.capHit === true;
+    // 终态已判定（非 null）⇒ 不再续投；反之若板面有 pending 或终态未判定且未触顶 ⇒ 续投。
+    const terminal = state !== null && state !== undefined;
+    const shouldContinue = !terminal && (hpw || !capHit);
+    process.stdout.write(shouldContinue ? "0" : "1");
+E0C_GATE_EOF
+  )
+  if [ "$terminate_flag" = "0" ]; then
     if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
       echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
       exit 1

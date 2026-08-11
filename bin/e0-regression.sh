@@ -162,6 +162,14 @@ _ensure_channel "$DOC_CHANNEL"
 BOARD_AGENT_RUNS_CHANNEL="board:agent-runs"
 _ensure_channel "$BOARD_AGENT_RUNS_CHANNEL"
 
+# ── 空板自播种（§1.1 / 判据 5）：新建的 TICK_CHANNEL 若为空则投 research.clue.v2 种子线索，
+#    让现状链路有卡可认领、head_seq 可增长 ⇒ Z1（判据 8）在结构上可达。
+#    ⛔ 幂等：scripts/e0-seed.mjs 仅当板为空（head_seq=0）才播种；已非空则跳过，重复执行不使板面线索翻倍。
+#    ⛔ head_seq 一律走列表端点真解析（复用 e0-metrics），⛔ 不依赖单 channel GET 的 head_seq。
+echo "[e0-regression] auto-seed check: TICK_CHANNEL=$TICK_CHANNEL" >&2
+E0_SEED_JSON="$(node "$PLUGIN_ROOT/scripts/e0-seed.mjs" "$AGENT_BUS_URL" "$AGENT_BUS_TOKEN_FILE" "$TICK_CHANNEL" --clue "$RESEARCH_QUESTION")"
+echo "[e0-regression] auto-seed: $E0_SEED_JSON" >&2
+
 # ── 把 run 上下文导出，供 loop-engine run 目录与 idempotency key 落到本次记录目录下。──
 export DD_RUN_ID="$RUN_ID"
 export DD_RUN_ROOT="$RECORD_DIR/loop-run"
@@ -203,7 +211,8 @@ else
   set +e
   bash "$PLUGIN_ROOT/bin/e0-verify.sh" \
     "$RECORD_DIR/before.run.json" "$RECORD_DIR/after.run.json" \
-    "$RECORD_DIR/before.prod.json" "$RECORD_DIR/after.prod.json"
+    "$RECORD_DIR/before.prod.json" "$RECORD_DIR/after.prod.json" \
+    "$RECORD_DIR/run.stdout.log"
   VERIFY_EXIT=$?
   set -e
   FINAL_EXIT="$VERIFY_EXIT"

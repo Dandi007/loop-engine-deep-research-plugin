@@ -42,6 +42,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "e0-regression.sh");
 const VERIFY_BIN = join(ROOT, "bin", "e0-verify.sh");
 const FAKE_BUS = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+const SEED_BIN = join(ROOT, "scripts", "e0-seed.mjs");
+const METRICS_BIN = join(ROOT, "scripts", "e0-metrics.mjs");
 const PROFILES_DIR = join(ROOT, "profiles", "deploy");
 const DEFAULT_TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 const REQUIRED_PROFILE_KEYS = [
@@ -164,18 +166,26 @@ interface SnapshotJson {
   channels: Record<string, number>;
 }
 
+const TERMINAL_LINE = JSON.stringify({
+  channelId: "t",
+  hasPendingWork: false,
+  termination: { state: "converged", coverage: 1, zeroGrowthRounds: 1, capHit: false },
+});
+
 function runVerify(
   beforeRun: SnapshotJson,
   afterRun: SnapshotJson,
   beforeProd: { sum: number; channel_count: number; channels: Record<string, number> },
   afterProd: { sum: number; channel_count: number; channels: Record<string, number> },
+  runLog = `${TERMINAL_LINE}\n`,
 ): { code: number; out: string; err: string } {
   const dir = mkdtempSync(join(tmpdir(), "e0-verify-"));
-  const w = (name: string, obj: unknown) => writeFileSync(join(dir, name), JSON.stringify(obj));
-  w("br.json", beforeRun);
-  w("ar.json", afterRun);
-  w("bp.json", beforeProd);
-  w("ap.json", afterProd);
+  const w = (name: string, content: string) => writeFileSync(join(dir, name), content);
+  w("br.json", JSON.stringify(beforeRun));
+  w("ar.json", JSON.stringify(afterRun));
+  w("bp.json", JSON.stringify(beforeProd));
+  w("ap.json", JSON.stringify(afterProd));
+  w("run.stdout.log", runLog);
   try {
     return runCmd([
       "bash",
@@ -184,6 +194,7 @@ function runVerify(
       join(dir, "ar.json"),
       join(dir, "bp.json"),
       join(dir, "ap.json"),
+      join(dir, "run.stdout.log"),
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -447,6 +458,126 @@ describe("T-FIXTURE-CONTRACT: fake bus matches the real agent-bus field contract
     } finally {
       bus.close();
     }
+  });
+});
+
+// ── T-METRICS-CLI-HTTP（finding 4）：e0-metrics CLI 真正驱动 fixture 的 HTTP 契约 ──
+//    之前只有纯函数与字段集契约被测试，从没测过 CLI 经 HTTP 读 fixture 的路径。
+//    本组覆盖「POST /v1/channels 创建空 channel → 列表端点能读到 head_seq 0」这一条
+//    e0-regression.sh 实际依赖的路径（真实 agent-bus 里创建但为空的 channel 也会出现在列表）。
+
+describe("T-METRICS-CLI-HTTP: e0-metrics CLI drives the fixture over HTTP", () => {
+  it("a created-but-empty channel is listed with head_seq 0 and snapshot reads it via HTTP", async () => {
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    const tokenPath = makeTempToken("TEST_TOKEN\n");
+    try {
+      const created = await fetch(`${bus.base}/v1/channels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel_id: "research:e0-empty.ch" }),
+      });
+      expect(created.status).toBe(200);
+
+      const env = { ...process.env, AGENT_BUS_URL: bus.base, AGENT_BUS_TOKEN_FILE: tokenPath };
+      const snap = runCmd(["node", METRICS_BIN, "snapshot", bus.base, tokenPath, "research:e0-empty.ch"], env);
+      expect(snap.code).toBe(0);
+      const j = JSON.parse(snap.out.trim());
+      expect(j.tick_channel).toBe("research:e0-empty.ch");
+      expect(j.tick_head_seq).toBe(0);
+
+      const sum = runCmd(["node", METRICS_BIN, "sum", bus.base, tokenPath], env);
+      expect(sum.code).toBe(0);
+      expect(JSON.parse(sum.out.trim()).sum).toBe(0);
+    } finally {
+      bus.close();
+      rmSync(dirname(tokenPath), { recursive: true, force: true });
+    }
+  });
+});
+
+// ── T-SEED（⭐ 判据 5）：空板自播种生效且幂等 ──
+//    新建的空 TICK_CHANNEL ⇒ 投 research.clue.v2 种子线索（板面 head_seq 增长）；
+//    再次执行 ⇒ 跳过，板面线索**不翻倍**。
+
+describe("T-SEED (criterion 5): empty-board auto-seeding is effective and idempotent", () => {
+  it("seeds an empty channel once and does NOT double board clues on repeat", async () => {
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    const tokenPath = makeTempToken("TEST_TOKEN\n");
+    const CH = "research:e0-regression.index";
+    try {
+      const created = await fetch(`${bus.base}/v1/channels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel_id: CH }),
+      });
+      expect(created.status).toBe(200);
+
+      const env = { ...process.env, AGENT_BUS_URL: bus.base, AGENT_BUS_TOKEN_FILE: tokenPath };
+      // 空板 ⇒ 播种
+      const r1 = runCmd(
+        ["node", SEED_BIN, bus.base, tokenPath, CH, "--clue", "e0 seed clue", "--clue", "second seed clue"],
+        env,
+      );
+      expect(r1.code).toBe(0);
+      expect(JSON.parse(r1.out.trim()).seeded).toBe(true);
+
+      const snap1 = JSON.parse(
+        runCmd(["node", METRICS_BIN, "snapshot", bus.base, tokenPath, CH], env).out.trim(),
+      );
+      expect(snap1.tick_head_seq).toBe(2);
+
+      // 已非空 ⇒ 幂等跳过，板面线索不翻倍
+      const r2 = runCmd(
+        ["node", SEED_BIN, bus.base, tokenPath, CH, "--clue", "e0 seed clue", "--clue", "second seed clue"],
+        env,
+      );
+      expect(r2.code).toBe(0);
+      expect(JSON.parse(r2.out.trim()).seeded).toBe(false);
+
+      const snap2 = JSON.parse(
+        runCmd(["node", METRICS_BIN, "snapshot", bus.base, tokenPath, CH], env).out.trim(),
+      );
+      expect(snap2.tick_head_seq).toBe(snap1.tick_head_seq);
+    } finally {
+      bus.close();
+      rmSync(dirname(tokenPath), { recursive: true, force: true });
+    }
+  });
+});
+
+// ── T-VERIFY-TERMINAL（⭐ 判据 4 / finding 2）：loop 退出 0 但板面无终态 ⇒ 非零退出 ──
+//    run.stdout.log 必须真解析出非 null 的 termination.state；否则即使 Z1/Z2 成立也判不过。
+
+describe("T-VERIFY-TERMINAL: loop exit 0 with no terminal state is flagged", () => {
+  it("termination.state is null (hasPendingWork false but not terminal) ⇒ non-zero exit naming TERMINAL", () => {
+    const runLog =
+      JSON.stringify({
+        hasPendingWork: false,
+        termination: { state: null, coverage: 1, zeroGrowthRounds: 1, capHit: false },
+      }) + "\n";
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(9, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      runLog,
+    );
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/TERMINAL/);
+  });
+
+  it("run.stdout.log contains no termination JSON ⇒ non-zero exit naming TERMINAL", () => {
+    const res = runVerify(
+      SNAP(5, 20, { a: 10, b: 10 }),
+      SNAP(9, 20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      PROD(20, { a: 10, b: 10 }),
+      "some non-json diagnostic line\nand another\n",
+    );
+    expect(res.code).not.toBe(0);
+    expect(res.err).toMatch(/TERMINAL/);
   });
 });
 

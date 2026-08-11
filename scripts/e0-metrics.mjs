@@ -20,13 +20,16 @@
  *     → stdout 单行 JSON：{sum, channel_count, channels}（Z2 生产总线全量和，不要求某 channel）。
  *
  * 模块导出（供单测）：
- *   parseChannelList(json) -> {channelId: head_seq|null}
+ *   parseChannelList(json) -> {channelId: {headSeq: number|null, fieldSet: string[]}}
+ *     （保留每个 channel 的**实际字段集**，供 §1.1 响亮失败点名）
  *   headSeqFor(channels, channelId) -> {found, headSeq, fieldSet}
+ *     fieldSet 为该 channel 在列表项里的实际字段名；找不到 ⇒ null
  *   sumHeadSeqs(channels) -> number（对所有 channel 求和）
+ *   listChannels(baseUrl, token) -> parseChannelList 结果（按名取 head_seq 的唯一 HTTP 路径）
  */
 import { readFileSync } from "node:fs";
 
-/** 从列表端点响应 JSON 里解析出 {channel_id: head_seq|null}。 */
+/** 从列表端点响应 JSON 里解析出 {channel_id: {headSeq, fieldSet}}。 */
 export function parseChannelList(json) {
   const data = JSON.parse(json);
   const arr = Array.isArray(data) ? data : Array.isArray(data.channels) ? data.channels : null;
@@ -36,7 +39,10 @@ export function parseChannelList(json) {
   const channels = {};
   for (const c of arr) {
     if (c && typeof c.channel_id === "string") {
-      channels[c.channel_id] = typeof c.head_seq === "number" ? c.head_seq : null;
+      channels[c.channel_id] = {
+        headSeq: typeof c.head_seq === "number" ? c.head_seq : null,
+        fieldSet: Object.keys(c),
+      };
     }
   }
   return channels;
@@ -44,31 +50,49 @@ export function parseChannelList(json) {
 
 /** 在列表里按名取某 channel 的 head_seq；找不到 ⇒ found:false，找到但无字段 ⇒ headSeq:null。 */
 export function headSeqFor(channels, channelId) {
-  const fieldSet = Object.keys(channels);
   if (!(channelId in channels)) {
-    return { found: false, headSeq: null, fieldSet };
+    return { found: false, headSeq: null, fieldSet: null };
   }
-  return { found: true, headSeq: channels[channelId], fieldSet };
+  const entry = channels[channelId];
+  return { found: true, headSeq: entry.headSeq, fieldSet: entry.fieldSet };
 }
 
 /** 对所有 channel 的 head_seq 求和（真正的全量和；head_seq 为 null 的跳过）。 */
 export function sumHeadSeqs(channels) {
   let sum = 0;
   for (const k of Object.keys(channels)) {
-    const v = channels[k];
+    const v = channels[k].headSeq;
     if (typeof v === "number") sum += v;
   }
   return sum;
+}
+
+/** 把丰富的 per-channel 结构压平为 {channel_id: head_seq|null}，供 CLI 输出的 channels 字段（向后兼容）。 */
+function flattenChannels(channels) {
+  const flat = {};
+  for (const k of Object.keys(channels)) {
+    flat[k] = channels[k].headSeq;
+  }
+  return flat;
 }
 
 async function snapshot(baseUrl, tokenPath, tickChannel) {
   const token = readFileSync(tokenPath, "utf8").trim();
   const channels = await listChannels(baseUrl, token);
   const { found, headSeq, fieldSet } = headSeqFor(channels, tickChannel);
-  if (!found || headSeq === null) {
+  if (!found) {
     console.error(
-      `[e0-metrics] FAIL: could not read head_seq for channel '${tickChannel}' ` +
-        `on ${baseUrl} (found=${found}, actual field set=${JSON.stringify(fieldSet)})`,
+      `[e0-metrics] FAIL: could not read head_seq for channel '${tickChannel}' on ${baseUrl}: ` +
+        `channel is absent from GET /v1/channels list (found=false). Refusing to treat a read-miss as 0 — ` +
+        `Z1 growth would be meaningless.`,
+    );
+    process.exit(1);
+  }
+  if (headSeq === null) {
+    console.error(
+      `[e0-metrics] FAIL: channel '${tickChannel}' on ${baseUrl} exists but its list entry has no head_seq field. ` +
+        `Actual field set=${JSON.stringify(fieldSet)}. Refusing to treat a read-miss as 0 — ` +
+        `Z1 growth would be meaningless.`,
     );
     process.exit(1);
   }
@@ -77,12 +101,12 @@ async function snapshot(baseUrl, tokenPath, tickChannel) {
     tick_head_seq: headSeq,
     sum: sumHeadSeqs(channels),
     channel_count: Object.keys(channels).length,
-    channels,
+    channels: flattenChannels(channels),
   };
   process.stdout.write(`${JSON.stringify(out)}\n`);
 }
 
-async function listChannels(baseUrl, token) {
+export async function listChannels(baseUrl, token) {
   const resp = await fetch(`${baseUrl}/v1/channels`, {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
   });
@@ -98,7 +122,7 @@ async function sumCmd(baseUrl, tokenPath) {
   const out = {
     sum: sumHeadSeqs(channels),
     channel_count: Object.keys(channels).length,
-    channels,
+    channels: flattenChannels(channels),
   };
   process.stdout.write(`${JSON.stringify(out)}\n`);
 }

@@ -15,6 +15,7 @@ const SEED_FILE = process.env.A10B_SEED;
 let seq = 0;
 const channels = new Map();
 const entities = new Map();
+const createdChannels = new Set();
 
 function addMessage(channelId, msg) {
   const list = channels.get(channelId) ?? [];
@@ -56,16 +57,42 @@ const server = createServer((req, res) => {
       return send(200, { messages: list });
     }
     if (req.method === "GET" && path === "/v1/channels") {
+      // 与真实 agent-bus 一致：列表端点列出**已创建但为空**的 channel（head_seq 0），
+      // 也列出已持有消息的 channel（head_seq = 消息数）。⛔ 创建过但空也要出现在列表里。
+      const seen = new Set();
       const list = [];
-      for (const [id, msgs] of channels) {
+      const push = (id, headSeq) => {
+        if (seen.has(id)) return;
+        seen.add(id);
         list.push({
           channel_id: id,
           delivery_mode: "fanout",
           visibility: "public",
-          head_seq: msgs.length,
+          head_seq: headSeq,
         });
-      }
+      };
+      for (const [id, msgs] of channels) push(id, msgs.length);
+      for (const id of createdChannels) push(id, 0);
       return send(200, list);
+    }
+    if (req.method === "POST" && path === "/v1/channels") {
+      // 真实 agent-bus 支持创建 channel（POST /v1/channels）。创建后即使空也进列表（head_seq 0）。
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        let p;
+        try {
+          p = JSON.parse(body);
+        } catch {
+          return send(400, { code: "BAD" });
+        }
+        if (!p || typeof p.channel_id !== "string" || p.channel_id === "") {
+          return send(400, { code: "BAD" });
+        }
+        createdChannels.add(p.channel_id);
+        return send(200, { channel_id: p.channel_id });
+      });
+      return;
     }
     if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
       const id = decodeURIComponent(path.split("/")[3]);

@@ -59,20 +59,34 @@ describe("T-NAME: head_seq is looked up by channel_id in the list endpoint", () 
     expect(r.headSeq).toBe(12);
   });
 
-  it("reports found:false and the actual field set when the channel is missing", () => {
+  it("reports found:false (fieldSet null) when the channel is missing from the list", () => {
     const json = JSON.stringify([{ channel_id: "only", head_seq: 1 }]);
     const r = headSeqFor(parseChannelList(json), "research:missing.index");
     expect(r.found).toBe(false);
     expect(r.headSeq).toBe(null);
-    expect(r.fieldSet).toContain("only");
+    expect(r.fieldSet).toBeNull();
   });
 
-  it("reports headSeq:null when the channel exists but has no head_seq field", () => {
+  it("reports headSeq:null and the channel's ACTUAL field set when the channel exists but has no head_seq field", () => {
     const json = JSON.stringify([
-      { channel_id: "nohead", delivery_mode: "fanout" },
+      { channel_id: "nohead", delivery_mode: "fanout", visibility: "public" },
     ]);
     const r = headSeqFor(parseChannelList(json), "nohead");
     expect(r.found).toBe(true);
     expect(r.headSeq).toBe(null);
+    // §1.1 —— 响亮失败必须点名**该 channel 的实际字段集**（不是 channel_id 列表）。
+    expect(r.fieldSet).toEqual(["channel_id", "delivery_mode", "visibility"]);
+    expect(r.fieldSet).not.toContain("head_seq");
+  });
+
+  it("reports headSeq and the actual field set for a healthy channel", () => {
+    const json = JSON.stringify([
+      { channel_id: "ok", head_seq: 7, delivery_mode: "fanout" },
+    ]);
+    const r = headSeqFor(parseChannelList(json), "ok");
+    expect(r.found).toBe(true);
+    expect(r.headSeq).toBe(7);
+    expect(r.fieldSet).toContain("head_seq");
+    expect(r.fieldSet).toContain("channel_id");
   });
 });

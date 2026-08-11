@@ -181,6 +181,11 @@ interface EngineTerminal {
 }
 
 // 构造一个假的 loop-engine 运行时根：index.jsonl + run_dir/journal.jsonl（含 tick run_output JSON）。
+// ⛔ journal.jsonl 的每一行必须是 loop-engine 的 **JournalEntry**（{ run_id, identity, result, effects }），
+//    其中 `result` 是**转义字符串**，装着 tick 节点 stdout 的 run_output JSON（含 termination）——
+//    真实链路里 tick-entry --run 打印 JSON.stringify(outcome, null, 2)，bash 适配器因 outcome 无
+//    `result` 键而回退成 { result: stdout, effects: [] }，故 termination 嵌套在 result 字符串里。
+//    这里必须复刻这一真实形状（与本仓 g15 的 journal fixture 同构），否则测试验证的是无人产出的虚构契约。
 function makeEngineRoot(
   dir: string,
   drainId: string,
@@ -205,7 +210,14 @@ function makeEngineRoot(
       capHit: false,
     },
   });
-  writeFileSync(join(runDir, "journal.jsonl"), `${runOutput}\n`);
+  // JournalEntry：result 是转义字符串（run_output 的 JSON 文本），不是顶层对象。
+  const journalEntry = JSON.stringify({
+    run_id: "tick~1",
+    identity: "tick",
+    result: runOutput,
+    effects: [],
+  });
+  writeFileSync(join(runDir, "journal.jsonl"), `${journalEntry}\n`);
   const indexFile = join(dir, "engine-root", "index.jsonl");
   writeFileSync(
     indexFile,
@@ -754,8 +766,8 @@ describe("T-VERIFY-DRAIN: terminal assertion holds on real deep-research-loop.sh
         }) + "\n",
       );
       // journal.jsonl 含真实 tick run_output（tick-entry --run 的 JSON，含 termination.state）。
-      // 这模拟 loop-engine 捕获的 tick 节点 stdout：最后一轮 run_output 的 termination.state 非 null
-      // （板面真的到了终态）⇒ e0-verify 的终态断言判过。
+      // ⛔ 按 loop-engine 的 JournalEntry 形状写：result 是**转义字符串**（run_output JSON 文本），
+      //    与 g15 的 journal fixture 同构；不是把 run_output 裸对象当 journal 行。
       const runOutput = JSON.stringify({
         channelId: "research:test-real",
         messageCount: 1,
@@ -773,9 +785,15 @@ describe("T-VERIFY-DRAIN: terminal assertion holds on real deep-research-loop.sh
           capHit: false,
         },
       });
+      const journalEntry = JSON.stringify({
+        run_id: "tick~1",
+        identity: "tick",
+        result: runOutput,
+        effects: [],
+      });
       writeFileSync(
         join(dir, "engine-root", "runs", "run-r", "tick-run", "journal.jsonl"),
-        `some diagnostic line\n${runOutput}\n`,
+        `some diagnostic line\n${journalEntry}\n`,
       );
 
       // 驱动生产 deep-research-loop.sh，取真实 stdout 作为 run.stdout.log。

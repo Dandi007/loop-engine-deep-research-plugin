@@ -16,6 +16,7 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, chmodSync 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { decideTick, DEFAULT_TICK_CONFIG, type BoardState } from "../src/tick";
 
 const fsProbe = vi.hoisted(() => ({
   readPaths: [] as string[],
@@ -634,6 +635,234 @@ describe("T-SEED (criterion 5): empty-board auto-seeding is effective and idempo
         runCmd(["node", METRICS_BIN, "snapshot", bus.base, tokenPath, CH], env).out.trim(),
       );
       expect(snap2.tick_head_seq).toBe(snap1.tick_head_seq);
+    } finally {
+      bus.close();
+      rmSync(dirname(tokenPath), { recursive: true, force: true });
+    }
+  });
+});
+
+// ── T-SEED-TERMINATE（⭐ attempt 5 final blocker 1+2 + major）：seed-then-terminate 真路径 ──
+//    attempt 5 final 评审 blocker：bin/e0-regression.sh 播种只传 --clue、不传 --source，
+//    而 scripts/e0-seed.mjs 也只转发 --clue ⇒ 种子卡 sources=[] ⇒ decideTick 结构上只能 block
+//    （unmapped_source）⇒ 单 tick 终态、termination.state 恒 null ⇒ Z1（判据 8）在构造上不可达。
+//    本组把「入口的真实 seed-then-terminate」钉死：
+//     - e0-seed.mjs --source code-local 真播种 → 种子卡携带 sources=["code-local"]，decideTick 给 dispatch；
+//     - ⛔ 判别性：不带 --source 播种 → 种子卡被 decideTick block（unmapped_source）——即被修掉的缺陷。
+//     - 沿入口真实路径（真 e0-seed.mjs 播种 + 真 tick-entry --run 对假 bus 跑 tick）驱动到收敛，
+//       断言 termination.state 非 null（converged）——若 termination 被结构钉死在 null，本组必红。
+
+describe("T-SEED-TERMINATE (attempt 5 blockers): real seed-then-terminate path", () => {
+  async function readClue(port: number, ch: string): Promise<{
+    entity_id: string;
+    message_id: string;
+    payload: Record<string, unknown>;
+  }> {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/channels/${encodeURIComponent(ch)}/messages?limit=100`);
+    const data = (await r.json()) as { messages?: Array<Record<string, unknown>> };
+    const msgs = (data.messages ?? []).filter((m) => m.kind === "research.clue.v2");
+    const last = msgs[msgs.length - 1];
+    return {
+      entity_id: String(last.entity_id),
+      message_id: String(last.message_id),
+      payload: (last.payload ?? {}) as Record<string, unknown>,
+    };
+  }
+
+  async function createChannel(base: string, ch: string): Promise<void> {
+    const r = await fetch(`${base}/v1/channels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: ch }),
+    });
+    expect(r.status).toBe(200);
+  }
+
+  function boardFor(clue: {
+    entity_id: string;
+    payload: Record<string, unknown>;
+  }): BoardState {
+    return {
+      cards: [
+        {
+          clueId: clue.entity_id,
+          text: String(clue.payload.text ?? ""),
+          status: "open",
+          depth: 0,
+          sources: Array.isArray(clue.payload.sources)
+            ? (clue.payload.sources as string[])
+            : [],
+          retries: 0,
+        },
+      ],
+      runs: {},
+      triageInFlight: false,
+    };
+  }
+
+  it("e0-seed --source code-local publishes a dispatchable card (decideTick ⇒ dispatch, not block)", async () => {
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    const tokenPath = makeTempToken("TEST_TOKEN\n");
+    const CH = "research:e0-seedterm-dispatchable";
+    const env = { ...process.env, AGENT_BUS_URL: bus.base, AGENT_BUS_TOKEN_FILE: tokenPath };
+    try {
+      await createChannel(bus.base, CH);
+      // ⛔ 真播种：--source code-local 必须被 e0-seed.mjs 原样转发给 tick-entry --seed。
+      const r = runCmd(
+        ["node", SEED_BIN, bus.base, tokenPath, CH, "--clue", "e0 seed clue", "--source", "code-local"],
+        env,
+      );
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.out.trim()).seeded).toBe(true);
+
+      const clue = await readClue(port, CH);
+      // ⛔ 关键：种子卡携带 source（改动前 scripts/e0-seed.mjs 只转发 --clue ⇒ sources=[]）。
+      expect(clue.payload.sources).toEqual(["code-local"]);
+      expect(clue.payload.status).toBe("open");
+
+      // 真实 decideTick：种子卡可 dispatch 到 code-local role（Z1 结构可达）。
+      const decisions = decideTick(boardFor(clue), DEFAULT_TICK_CONFIG);
+      const dispatch = decisions.find((d) => d.kind === "dispatch");
+      expect(dispatch).toBeDefined();
+      expect(dispatch && dispatch.kind === "dispatch" && dispatch.role).toBe("dr-worker-code-local");
+    } finally {
+      bus.close();
+      rmSync(dirname(tokenPath), { recursive: true, force: true });
+    }
+  });
+
+  it("discriminant: seed WITHOUT --source publishes an undispatchable card that decideTick blocks (the fixed defect)", async () => {
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    const tokenPath = makeTempToken("TEST_TOKEN\n");
+    const CH = "research:e0-seedterm-nosource";
+    const env = { ...process.env, AGENT_BUS_URL: bus.base, AGENT_BUS_TOKEN_FILE: tokenPath };
+    try {
+      await createChannel(bus.base, CH);
+      const r = runCmd(
+        ["node", SEED_BIN, bus.base, tokenPath, CH, "--clue", "e0 seed clue"],
+        env,
+      );
+      expect(r.code).toBe(0);
+      const clue = await readClue(port, CH);
+      expect(clue.payload.sources).toEqual([]);
+
+      // 真实 decideTick：sources=[] ⇒ block(unmapped_source)，Z1 结构不可达（被修掉的缺陷形态）。
+      const decisions = decideTick(boardFor(clue), DEFAULT_TICK_CONFIG);
+      const block = decisions.find((d) => d.kind === "block");
+      expect(block).toBeDefined();
+      expect(block && block.kind === "block" && block.reason).toBe("unmapped_source");
+      expect(decisions.some((d) => d.kind === "dispatch")).toBe(false);
+    } finally {
+      bus.close();
+      rmSync(dirname(tokenPath), { recursive: true, force: true });
+    }
+  });
+
+  it("real seed-then-terminate: seeded code-local card, after worker completion, converges to a NON-NULL termination.state", async () => {
+    // 沿入口真实路径：真 e0-seed.mjs 播种（--source code-local）→ 模拟 worker 完成
+    // （把种子卡 CAS 到 in_flight + 在 board:agent-runs 投 exited(0)+worker.result）→
+    // 真 tick-entry --run 对假 bus 跑 tick → 跨 3 tick 收敛到 converged。
+    // ⛔ 本用例读的是**真实 tick 输出**的 termination.state；若 termination 被结构钉死为 null
+    //    （attempt 5 blocker 1 的缺陷形态），最终断言必红。
+    const port = 20000 + Math.floor(Math.random() * 40000);
+    const bus = await startFakeBus(port);
+    const tokenPath = makeTempToken("TEST_TOKEN\n");
+    const CH = "research:e0-seedterm-converge";
+    const EV = "research:e0-seedterm-converge.evidence";
+    const env = { ...process.env, AGENT_BUS_URL: bus.base, AGENT_BUS_TOKEN_FILE: tokenPath };
+    const TICK_ENTRY_BIN = join(ROOT, "bin", "tick-entry.sh");
+    const RUN_ID = "run-seedterm-1";
+    try {
+      await createChannel(bus.base, CH);
+      await createChannel(bus.base, EV);
+      const seeded = runCmd(
+        ["node", SEED_BIN, bus.base, tokenPath, CH, "--clue", "e0 seed clue", "--source", "code-local"],
+        env,
+      );
+      expect(seeded.code).toBe(0);
+      const clue = await readClue(port, CH);
+      const clueId = clue.entity_id;
+      const seedMsgId = clue.message_id;
+      expect(clue.payload.sources).toEqual(["code-local"]);
+
+      // 模拟 worker 认领并完成：种子卡 open → in_flight（携带 run_id），board:agent-runs 投完成事件。
+      const casInflight = await fetch(`${bus.base}/v1/channels/${encodeURIComponent(CH)}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "research.clue.v2",
+          entity_id: clueId,
+          supersedes: seedMsgId,
+          payload: {
+            status: "in_flight",
+            text: "e0 seed clue",
+            depth: 0,
+            sources: ["code-local"],
+            run_id: RUN_ID,
+          },
+        }),
+      });
+      expect(casInflight.status).toBe(200);
+      for (const m of [
+        {
+          kind: "agent.run.exited.v1",
+          entity_id: RUN_ID,
+          payload: { run_id: RUN_ID, exit_code: 0 },
+        },
+        {
+          kind: "worker.result.v1",
+          entity_id: RUN_ID,
+          payload: {
+            run_id: RUN_ID,
+            evidences: [{ quote: "q", claim: "c", source: "code", locator: "a", revision: "r" }],
+            proposed_clues: [],
+            materials: [{ uri: "m1" }],
+          },
+        },
+      ]) {
+        const r = await fetch(`${bus.base}/v1/channels/board:agent-runs/publish`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(m),
+        });
+        expect(r.status).toBe(200);
+      }
+
+      // 真 tick 1：收割 → evidence 发布到证据 channel、卡 CAS 到 explored（写后板面终态）。
+      //   ⛔ coverage 在 tick 顶部（收割前）读取 ⇒ 本轮覆盖读数滞后一轮（tick 1 读到 0）。
+      const t1 = runCmd(
+        ["bash", TICK_ENTRY_BIN, "--run", CH, "--evidence-channel", EV],
+        env,
+      );
+      expect(t1.code).toBe(0);
+      const o1 = JSON.parse(t1.out.trim());
+      expect(o1.harvestReports).toHaveLength(1);
+      expect(o1.termination.state).toBeNull();
+
+      // 跨 tick 零增长收敛：沿 trigger-body 语义，把上一 tick 的 coverage/zeroGrowthRounds 作为
+      // --prev-* 传下去，直到 termination.state 非 null（converged）。若 termination 被结构钉死在
+      // null（attempt 5 blocker 1 的缺陷形态），循环结束后断言必红。
+      let prevCov = o1.termination.coverage;
+      let prevZgr = o1.termination.zeroGrowthRounds;
+      let state: string | null = null;
+      let rounds = 1;
+      for (; rounds < 8; rounds += 1) {
+        const next = runCmd(
+          ["bash", TICK_ENTRY_BIN, "--run", CH, "--evidence-channel", EV, "--prev-coverage", String(prevCov), "--prev-zero-growth", String(prevZgr)],
+          env,
+        );
+        expect(next.code).toBe(0);
+        const on = JSON.parse(next.out.trim());
+        prevCov = on.termination.coverage;
+        prevZgr = on.termination.zeroGrowthRounds;
+        state = on.termination.state;
+        if (state !== null) break;
+      }
+      // ⭐ 覆盖度确实涨到 1（evidence 从独立证据 channel 读到），且达零增长阈 2 ⇒ converged（非 null）。
+      expect(prevCov).toBe(1);
+      expect(state).toBe("converged");
     } finally {
       bus.close();
       rmSync(dirname(tokenPath), { recursive: true, force: true });

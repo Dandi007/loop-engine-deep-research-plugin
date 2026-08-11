@@ -167,7 +167,11 @@ _ensure_channel "$BOARD_AGENT_RUNS_CHANNEL"
 #    ⛔ 幂等：scripts/e0-seed.mjs 仅当板为空（head_seq=0）才播种；已非空则跳过，重复执行不使板面线索翻倍。
 #    ⛔ head_seq 一律走列表端点真解析（复用 e0-metrics），⛔ 不依赖单 channel GET 的 head_seq。
 echo "[e0-regression] auto-seed check: TICK_CHANNEL=$TICK_CHANNEL" >&2
-E0_SEED_JSON="$(node "$PLUGIN_ROOT/scripts/e0-seed.mjs" "$AGENT_BUS_URL" "$AGENT_BUS_TOKEN_FILE" "$TICK_CHANNEL" --clue "$RESEARCH_QUESTION")"
+# ⛔ 必须带 --source code-local（attempt 5 评审 blocker）：不带 source 的种子卡 sources=[] ⇒
+#    decideTick 结构上只能 block ⇒ 单 tick 终态、termination.state 恒 null ⇒ Z1（判据 8）在构造上
+#    不可达。--source code-local 使种子卡映射到 dr-worker-code-local（profile 已配 ALLOWED_ROOT），
+#    可被 dispatch → 收割 → 覆盖 → 达终态。--source 逐条原样转发给 tick-entry --seed。
+E0_SEED_JSON="$(node "$PLUGIN_ROOT/scripts/e0-seed.mjs" "$AGENT_BUS_URL" "$AGENT_BUS_TOKEN_FILE" "$TICK_CHANNEL" --clue "$RESEARCH_QUESTION" --source code-local)"
 echo "[e0-regression] auto-seed: $E0_SEED_JSON" >&2
 
 # ── 把 run 上下文导出，供 loop-engine run 目录与 idempotency key 落到本次记录目录下。──

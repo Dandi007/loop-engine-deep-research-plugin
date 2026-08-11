@@ -12,7 +12,12 @@
  * 发布 research.clue.v2，每条 status=open、depth=0，idempotency key 由输入确定性派生。
  *
  * 用法：
- *   node e0-seed.mjs <baseUrl> <tokenPath> <tickChannel> --clue "<text>" [--clue "<text>" …]
+ *   node e0-seed.mjs <baseUrl> <tokenPath> <tickChannel> --clue "<text>" [--clue "<text>" …] [--source <name> …]
+ *   ⛔ --source 决定种子线索的可派发性（spec §1.2）：不带任何 source 的种子卡 status=open 但
+ *      sources=[] ⇒ decideTick 无法映射到任何 worker role ⇒ 结构上只能 block，单 tick 即终态、
+ *      termination.state 恒 null ⇒ Z1（判据 8）在构造上不可达。e0-regression 播种必须带
+ *      --source code-local（profile 已配 ALLOWED_ROOT 供该 code-local worker 派发），
+ *      使种子卡可被 dispatch → 收割 → 覆盖 → 终态。--source 逐条原样转发给 tick-entry --seed。
  *   → stdout 单行 JSON：
  *       {channelId, seeded:true,  reason:"empty"}  已播种
  *       {channelId, seeded:false, reason:"non-empty", headSeq}  板非空，跳过（幂等）
@@ -27,10 +32,11 @@ function parseArgs(argv) {
   const [baseUrl, tokenPath, tickChannel, ...rest] = argv;
   if (!baseUrl || !tokenPath || !tickChannel) {
     throw new Error(
-      "usage: node e0-seed.mjs <baseUrl> <tokenPath> <tickChannel> --clue <text> [--clue <text> …]",
+      "usage: node e0-seed.mjs <baseUrl> <tokenPath> <tickChannel> --clue <text> [--clue <text> …] [--source <name> …]",
     );
   }
   const clues = [];
+  const sources = [];
   for (let i = 0; i < rest.length; i += 1) {
     if (rest[i] === "--clue") {
       const text = rest[i + 1];
@@ -39,16 +45,23 @@ function parseArgs(argv) {
       }
       clues.push(text);
       i += 1;
+    } else if (rest[i] === "--source") {
+      const name = rest[i + 1];
+      if (name === undefined || name === "") {
+        throw new Error("e0-seed: --source requires a non-empty source name");
+      }
+      sources.push(name);
+      i += 1;
     }
   }
   if (clues.length === 0) {
     throw new Error("e0-seed: auto-seed requires at least one --clue. Refusing to seed zero clues.");
   }
-  return { baseUrl, tokenPath, tickChannel, clues };
+  return { baseUrl, tokenPath, tickChannel, clues, sources };
 }
 
 async function main() {
-  const { baseUrl, tokenPath, tickChannel, clues } = parseArgs(process.argv.slice(2));
+  const { baseUrl, tokenPath, tickChannel, clues, sources } = parseArgs(process.argv.slice(2));
   const token = readFileSync(tokenPath, "utf8").trim();
   const channels = await listChannels(baseUrl, token);
   const { found, headSeq, fieldSet } = headSeqFor(channels, tickChannel);
@@ -78,12 +91,16 @@ async function main() {
   const repoRoot = fileURLToPath(new URL("..", import.meta.url));
   const tickEntry = fileURLToPath(new URL("../bin/tick-entry.sh", import.meta.url));
   const clueArgs = clues.flatMap((c) => ["--clue", c]);
+  // attempt 5 评审 blocker/major —— 把 --source 原样转发给 tick-entry --seed：
+  //   不带 source 的种子卡 sources=[] ⇒ 结构上只能 block ⇒ 单 tick 终态、termination.state 恒 null，
+  //   Z1（判据 8）在构造上不可达。e0-regression 传 --source code-local 使种子卡可 dispatch → 终态可达。
+  const sourceArgs = sources.flatMap((s) => ["--source", s]);
   // attempt 2 评审 minor —— 发布步必须与判空步用**同一个 bus**：
   // tick-entry --seed 经 src/bus.ts 从 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE 解析总线；
   // 若只靠调用方传入的 baseUrl/tokenPath 判空、却把发布交给继承的环境，两者可能各指一个 bus
   // （一个查 A 板空、一个写 B 板 append-only）。这里把**已解析**的 baseUrl/tokenPath 显式塞进
   // 子进程 env，消除这份耦合。
-  const res = spawnSync("bash", [tickEntry, "--seed", tickChannel, ...clueArgs], {
+  const res = spawnSync("bash", [tickEntry, "--seed", tickChannel, ...clueArgs, ...sourceArgs], {
     cwd: repoRoot,
     encoding: "utf8",
     env: {

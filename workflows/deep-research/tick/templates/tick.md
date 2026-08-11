@@ -75,9 +75,13 @@ if [ -n "$tick_channel" ]; then
     fi
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
-      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切进 4 个位置变量再追加。
+      # ⛔ 用 `read -r a b c d`（固定变量）而非 `read -r -a arr`：loop-engine 的 bash 适配器经
+      #    `sh -c` 在沙箱容器里跑本脚本，容器里 `sh` 是 zsh，而 zsh 的 read 不支持 bash 的 `-a`
+      #    （`zsh:read: bad option: -a`，attempt 5 真机取证 tick 2 即在此崩）。固定变量式在
+      #    bash / zsh 下都成立。
+      IFS=$'\t' read -r _pv_key1 _pv_val1 _pv_key2 _pv_val2 <<< "$prev_line"
+      prev_args+=("$_pv_key1" "$_pv_val1" "$_pv_key2" "$_pv_val2")
     fi
   fi
   tick_args+=("${prev_args[@]}")

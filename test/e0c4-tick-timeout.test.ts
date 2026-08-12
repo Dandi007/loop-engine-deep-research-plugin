@@ -12,7 +12,6 @@ import {
   DEFAULT_AGENT_RESULT_TIMEOUT_MS,
   DEFAULT_AGENT_RESULT_POLL_MS,
   TRIAGE_ROLE,
-  RUNS_CHANNEL_ID,
   type WriteCasInput,
 } from "../src/tick-run";
 import { runChannelWrite } from "../src/tick-run";
@@ -20,6 +19,8 @@ import { assembleGenerateDeps } from "../src/tick-run";
 import type { RunWriteOptions } from "../src/tick-run";
 import {
   findRunExited,
+  findTriageResult,
+  readChannelMessages,
   type InspectMessage,
   type TriageResultDecision,
 } from "../src/tick-inspect";
@@ -195,6 +196,165 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env[TIMEOUT_ENV];
   delete process.env[POLL_ENV];
+});
+
+// ─── 判据 2 (GT-13/§1.1): 板面已达规模且处于终态 ⇒ 单个 tick --run 在声明上界内返回 ───
+
+describe("E0c4 §1.1: tick --run on large board in terminal state returns in bounded time", () => {
+  it("GT-13: large board (50+ cards) all terminal → tick returns quickly with termination.state=capped", async () => {
+    setEnv(TIMEOUT_ENV, "5000");
+    setEnv(POLL_ENV, "10");
+
+    const cards: InspectMessage[] = [];
+    for (let i = 0; i < 30; i++) {
+      cards.push(clueMsg(`c${i}`, { status: "explored" }, i + 1));
+    }
+    for (let i = 30; i < 65; i++) {
+      cards.push(clueMsg(`c${i}`, { status: "blocked" }, i + 1));
+    }
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const startTime = Date.now();
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 100,
+      maxClues: 64,
+    });
+    const elapsed = Date.now() - startTime;
+
+    expect(elapsed).toBeLessThan(5000);
+    expect(result.termination.state).toBe("capped");
+    expect(result.termination.capHit).toBe(true);
+    expect(result.termination.boardComposition.proposed).toBe(0);
+    expect(result.termination.boardComposition.open).toBe(0);
+    expect(result.termination.boardComposition.inFlight).toBe(0);
+    expect(result.termination.boardComposition.explored).toBe(30);
+    expect(result.termination.boardComposition.blocked).toBe(35);
+    expect(result.termination.coverage).toBe(0);
+    expect(result.decisions).toHaveLength(0);
+  });
+
+  it("D3 discriminant: revert §1.1 fix (remove findRunExited check) → triage on large board would timeout", async () => {
+    setEnv(TIMEOUT_ENV, "5000");
+    setEnv(POLL_ENV, "10");
+
+    const cards: InspectMessage[] = [];
+    for (let i = 0; i < 30; i++) {
+      cards.push(clueMsg(`c${i}`, { status: "explored" }, i + 1));
+    }
+    for (let i = 30; i < 50; i++) {
+      cards.push(clueMsg(`c${i}`, { status: "blocked" }, i + 1));
+    }
+    cards.push(clueMsg("triage-p1", { status: "proposed" }, 51));
+    cards.push(clueMsg("triage-p2", { status: "proposed" }, 52));
+    cards.push(clueMsg("triage-p3", { status: "proposed" }, 53));
+
+    let triageSpawnedRunId = "";
+    let agentRunsReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        if (triageSpawnedRunId && agentRunsReads >= 2) {
+          return messagesResponse([
+            agentRunExitedMsg(triageSpawnedRunId, 1),
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const startTime = Date.now();
+    try {
+      await runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 100,
+        maxClues: 64,
+        triageThreshold: 3,
+        triageSpawnRuntime: {
+          agentRunBin: "/fake/agent-run",
+          runId: "e0c4-d3-triage-001",
+          spawnProcess: async () => {
+            triageSpawnedRunId = "e0c4-d3-triage-001";
+            return {};
+          },
+          readResult: async (runId: string) => {
+            const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+            const startInner = Date.now();
+            const deadline = startInner + timeoutMs;
+            while (Date.now() < deadline) {
+              const messages = await readChannelMessages("board:agent-runs");
+              const triageResult = findTriageResult(runId, messages);
+              if (triageResult !== null) return triageResult;
+              const exited = findRunExited(runId, messages);
+              if (exited && exited.exited) {
+                const elapsed = Date.now() - startInner;
+                throw new RunExitedWithoutResultError(runId, TRIAGE_ROLE, elapsed);
+              }
+              await new Promise((r) => setTimeout(r, pollMs));
+            }
+            throw new Error("timed out");
+          },
+        },
+      });
+      expect.fail("expected RunExitedWithoutResultError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(RunExitedWithoutResultError);
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(2000);
+      const msg = (e as Error).message;
+      expect(msg).toContain("e0c4-d3-triage-001");
+      expect(msg).toContain(TRIAGE_ROLE);
+    }
+  });
 });
 
 // ─── 判据 3 (GT-14/§1.2): run 已 exited 但无 result ⇒ 立即停止并产出诊断 ───

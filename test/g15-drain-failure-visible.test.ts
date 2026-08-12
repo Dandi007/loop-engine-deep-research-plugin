@@ -130,6 +130,10 @@ function writeJournal(journalPath: string, result: string): void {
   );
 }
 
+function writeJsonJournal(journalPath: string, entry: Record<string, unknown>): void {
+  writeFileSync(journalPath, JSON.stringify(entry) + "\n");
+}
+
 describe("Y1: tick 非零退出 ⇒ 脚本非零退出，且 stderr 点名 run_dir 与退出码", () => {
   it("single tick failure detected from journal.jsonl", () => {
     const drainId = "test-drain-y1";
@@ -410,6 +414,81 @@ describe("Y4: 痕迹不可读 ⇒ 响亮失败", () => {
     expect(res.code).not.toBe(0);
     expect(res.err).toContain("no lane entries");
     expect(res.err).toContain(drainId);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("Y5: tick exec/TIMEOUT detected via journal error=exec", () => {
+  it("journal with error=exec and result containing TIMEOUT is detected", () => {
+    const drainId = "test-drain-y5";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y5");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeJsonJournal(join(runDir, "journal.jsonl"), {
+      identity: "tick",
+      error: "exec",
+      result: "[外部调用失败 status=TIMEOUT]\\n",
+    });
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y5",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("error=exec");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("Y6: tick TIMEOUT detected via result field containing TIMEOUT", () => {
+  it("journal with result containing TIMEOUT is detected even without error=exec", () => {
+    const drainId = "test-drain-y6";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y6");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeJsonJournal(join(runDir, "journal.jsonl"), {
+      identity: "tick",
+      result: "[外部调用失败 status=TIMEOUT]\\n",
+    });
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y6",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("TIMEOUT");
 
     rmSync(dir, { recursive: true, force: true });
   });

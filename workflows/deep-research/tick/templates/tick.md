@@ -76,50 +76,97 @@ if [ -n "$tick_channel" ]; then
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
       # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      # ⛔ GT-5（spec §0 / §1.2）：loop-engine 的 bash 叶子恒用 `zsh -c` 执行本模板
+      #    （loop-engine/src/lib/exec.ts:runScript → `zsh -c`）。`read -r -a` 是 bash-only
+      #    （zsh 的 read 无 `-a`），从第二轮起必死（`zsh:read: bad option: -a`）。
+      #    这里用 `tr '\t' '\n'` + `while read` 循环把制表符分隔的 token 逐个读进数组，
+      #    bash 与 zsh 都支持（read -r 不带 -a 在两者语义一致）。token 只含简单词/数字（无空格），
+      #    故无需 IFS 处理。
+      while IFS= read -r prev_tok; do
+        prev_args+=("$prev_tok")
+      done <<EOF
+$(printf '%s' "$prev_line" | tr '\t' '\n')
+EOF
     fi
   fi
   tick_args+=("${prev_args[@]}")
   run_output="$("${tick_args[@]}")"
   printf '%s\n' "$run_output"
-  # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
-  #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
-  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在 hasPendingWork=true 时
-  #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
+  # A9 + E0c2 GT-4（spec §1.2）—— 续投门从「只看 hasPendingWork」改为对齐终态判据：
+  #   续投 ⇔  hasPendingWork == true  或  (termination.state 仍为 null 且未触顶)
+  #   - 触顶（capHit）时按既有语义走（capped 需等在途排空），⛔ 不得因本改动绕过熔断。
+  #   - 拿到非 null 终态后**必须停止续投**（⛔ 不得无限空转）。
+  #   ⛔ 判定必须用**真 JSON 解析**读 run_output（现状是 grep 正则，spec §1.2 一并改掉）。
+  #   ⛔ GT-5：本段须在 `zsh -c` 下真能跑——不引入任何 bash-only 语法。
+  #      解析统一放进 node（已有的 node heredoc 范式，bash 与 zsh 下同形），
+  #      输出单个制表符分隔行 hasPendingWork<TAB>termState<TAB>termCapHit<TAB>coverage<TAB>zgr，
+  #      再用上面 prev_line 同款的 `tr '\t' '\n' | while read` 拆进数组（zsh-safe）。
+  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在决定续投时
+  #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2）。
   # G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
-  #    从 run_output 的 JSON 解析 termination.coverage / termination.zeroGrowthRounds，写进下一条 body。
-  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+  term_raw="$(node - "$run_output" <<'E0C2_PARSE_EOF'
+    const s = process.argv[2];
+    let o;
+    try { o = JSON.parse(s); } catch (e) {
+      console.error("E0c2/G4b: run output is not valid JSON: " + e.message);
+      process.exit(1);
+    }
+    const hasP = o && typeof o === "object" ? o.hasPendingWork : undefined;
+    const t = o && typeof o === "object" ? o.termination : null;
+    if (typeof hasP !== "boolean") {
+      console.error("E0c2/G4b: run output missing boolean hasPendingWork");
+      process.exit(1);
+    }
+    if (!t || typeof t !== "object") {
+      console.error("E0c2/G4b: run output missing termination object");
+      process.exit(1);
+    }
+    const st = t.state, cov = t.coverage, zgr = t.zeroGrowthRounds, cap = t.capHit;
+    if (typeof cov !== "number" || typeof zgr !== "number" || typeof cap !== "boolean") {
+      console.error("E0c2/G4b: termination.coverage/zeroGrowthRounds/capHit missing or wrong type");
+      process.exit(1);
+    }
+    if (st !== null && st !== "converged" && st !== "capped" && st !== "partial") {
+      console.error("E0c2/G4b: termination.state is not a known TerminalState or null: " + JSON.stringify(st));
+      process.exit(1);
+    }
+    // termState 用字面量字符串（converged/capped/partial）或字面量 "null"；hasP/cap 用 "true"/"false"。
+    process.stdout.write((hasP ? "true" : "false") + "\t" + (st === null ? "null" : st) + "\t" + (cap ? "true" : "false") + "\t" + cov + "\t" + zgr);
+E0C2_PARSE_EOF
+  )"
+  # E0c2 §1.2 / GT-5：用参数展开逐字段剥离 tab 分隔行（${var%%	*} / ${var#*	}），
+  # bash 与 zsh 同形同义（⛔ 不用数组下标——bash 0-indexed、zsh 1-indexed，会静默发散）。
+  # term_raw = "hasPendingWork\ttermState\tcapHit\tcoverage\tzeroGrowthRounds"
+  _has_pending="${term_raw%%	*}"
+  _term_rest="${term_raw#*	}"
+  _term_state="${_term_rest%%	*}"
+  _term_rest="${_term_rest#*	}"
+  _term_cap_hit="${_term_rest%%	*}"
+  _term_rest="${_term_rest#*	}"
+  _next_cov="${_term_rest%%	*}"
+  _next_zgr="${_term_rest#*	}"
+  # 兜底：node 不会给出空字段，但防御性处理防止 zsh 在空串上的 `${var#*	}` 行为差异。
+  [ -z "$_has_pending" ] && _has_pending="false"
+  [ -z "$_term_state" ] && _term_state="null"
+  [ -z "$_term_cap_hit" ] && _term_cap_hit="false"
+  [ -z "$_next_cov" ] && _next_cov="0"
+  [ -z "$_next_zgr" ] && _next_zgr="0"
+  # E0c2 §1.2 续投门：hasPendingWork==true 或 (state==null 且 未触顶)。
+  # 触顶（capHit）时即便 state 仍为 null（在途排空中）也不续投——让 drain 收敛，避免绕过熔断。
+  # 拿到非 null 终态（converged/capped/partial）时停止续投——避免无限空转。
+  _continue=""
+  if [ "$_has_pending" = "true" ]; then
+    _continue=1
+  elif [ "$_term_state" = "null" ] && [ "$_term_cap_hit" != "true" ]; then
+    _continue=1
+  fi
+  if [ -n "$_continue" ]; then
     if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
-      echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
+      echo "[tick] continuation decided (hasPendingWork=$_has_pending, termination.state=$_term_state, capHit=$_term_cap_hit) but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
       exit 1
     fi
-    # G4b —— 解析本轮 termination 计数写进下一条 trigger body。run_output 必含 termination（tick-entry --run 输出）。
-    #   JS 经 heredoc 喂 node stdin，避免引号冲突（同上 G4B_PARSE_EOF 块的理由）。
-    next_term=$(node - "$run_output" <<'G4B_NEXT_EOF'
-      const s = process.argv[2];
-      let o;
-      try { o = JSON.parse(s); } catch (e) {
-        console.error("G4b: run output is not valid JSON: " + e.message);
-        process.exit(1);
-      }
-      const t = o && typeof o === "object" ? o.termination : null;
-      if (!t || typeof t !== "object") {
-        console.error("G4b: run output missing termination object");
-        process.exit(1);
-      }
-      const cov = t.coverage, zgr = t.zeroGrowthRounds;
-      if (typeof cov !== "number" || typeof zgr !== "number") {
-        console.error("G4b: termination.coverage/zeroGrowthRounds missing");
-        process.exit(1);
-      }
-      process.stdout.write(cov + "\t" + zgr);
-G4B_NEXT_EOF
-    )
-    next_cov="${next_term%$'\t'*}"
-    next_zgr="${next_term#*$'\t'}"
     next_id="a9-$(date +%s%N)-$$"
-    next_body="{\"tick\":true,\"coverage\":${next_cov},\"zeroGrowthRounds\":${next_zgr}}"
+    next_body="{\"tick\":true,\"coverage\":${_next_cov},\"zeroGrowthRounds\":${_next_zgr}}"
     "$loop_engine_runner" "$loop_store_cli" "$trigger_store_dir" put \
       "{\"id\":\"${next_id}\",\"status\":\"open\",\"body\":${next_body}}"
   fi

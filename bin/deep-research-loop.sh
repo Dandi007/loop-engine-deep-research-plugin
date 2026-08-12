@@ -190,9 +190,27 @@ fi
 
 # A9 —— drain 之前投下首个触发（status:"open"），否则 claimableCount() 恒 0 ⇒ 0 tick。
 # 实测 loop-store 契约：put '{"id":"...","status":"open","body":{...}}' → 落盘 <id>.json。
+# E0c2 §1.3 / GT-3 —— 跨 drain 循环支持：若 store 里已有 open 触发（上一轮 drain 的续投 trigger
+#   仍在），**不再投新 seed**（新 seed body={"seed":true} 会让 tick 以 firstRound 语义重置
+#   zeroGrowthRounds 计数器，正是 GT-4 要修的计数丢失）。只有 store 为空（首次 drain）才投 seed。
+#   判据用 loop-store list open：返回非空数组 ⇒ 已有待处理触发 ⇒ 跳过 seed。
 TRIGGER_ID="a9-$(date +%s%N)-$$"
-"$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
-  "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
+_EXISTING_OPEN=""
+set +e
+_EXISTING_OPEN="$("$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" list open 2>/dev/null)"
+_LIST_EC=$?
+set -e
+if [ "$_LIST_EC" -ne 0 ]; then
+  echo "[deep-research-loop] REFUSING to continue: failed to list open triggers (store-cli list exit=$_LIST_EC). Cannot determine whether to seed." >&2
+  exit 3
+fi
+# loop-store list 返回 JSON 数组；空数组 "[]" ⇒ 无 open 触发 ⇒ 投 seed。
+if printf '%s' "$_EXISTING_OPEN" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=JSON.parse(s);process.exit(Array.isArray(a)&&a.length===0?0:1)}catch{process.exit(2)}})'; then
+  "$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
+    "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
+else
+  echo "[deep-research-loop] skipping seed: open triggers already in store (cross-drain continuation; spec §1.3 / GT-3)." >&2
+fi
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"

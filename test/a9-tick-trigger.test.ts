@@ -120,9 +120,20 @@ function makeFakeEngine(): { dir: string; cli: string; storeCli: string; runner:
   const runner = join(dir, "runner");
   writeFileSync(cli, "// fake cli");
   writeFileSync(storeCli, "// fake store-cli");
+  // E0c2 §1.3 / GT-3：deep-research-loop.sh 现在在 seed 前调 `list open` 判断是否已有 open 触发。
+  //   fake runner 需对 `list` 调用返回空数组 "[]"（否则 seed 被跳过，F4/F5 断言不到 put）。
+  //   对 `put` 调用：照常记进 RUNNER_LOG（F4 断言依赖它）。
+  //   对 `drain` 调用：记进 RUNNER_LOG 且输出 drain 摘要 JSON（让驱动脚本正常往下走）。
   writeFileSync(
     runner,
-    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" >> "$RUNNER_LOG"\n`,
+    `#!/usr/bin/env bash\n` +
+      `printf '%s\\n' "$@" >> "$RUNNER_LOG"\n` +
+      `# E0c2: list open ⇒ 返回空数组（store 里没有 open 触发 ⇒ 驱动正常 seed）\n` +
+      `for _a in "$@"; do\n` +
+      `  if [ "$_a" = "list" ]; then printf '%s' '[]'; exit 0; fi\n` +
+      `done\n` +
+      `# drain / 其它调用：不输出（check-drain-failures.mjs 收到空 stdin ⇒ exit 0，不碰真实 runtime）\n` +
+      `exit 0\n`,
   );
   chmodSync(runner, 0o755);
   return { dir, cli, storeCli, runner };
@@ -171,13 +182,17 @@ describe("F4: driver puts a trigger into TRIGGER_STORE_DIR before drain", () => 
     });
     expect(res.code).toBe(0);
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    // 第一次调用：store-cli <dir> put <json>
-    expect(lines[0]).toContain(fake.storeCli);
-    expect(lines[1]).toContain(join(runRoot, "stores", "trigger"));
-    expect(lines[2]).toBe("put");
-    // 最后一次调用：cli drain（用 runner，不是 node）。
-    expect(lines[4]).toContain(fake.cli);
-    expect(lines[5]).toBe("drain");
+    // E0c2 §1.3：驱动现在在 seed 前先调 list open（检查 store 是否已有 open 触发），
+    //   所以 log 里先有 list open 再有 put。用 indexOf 定位 put 调用（位置不再固定）。
+    const putIdx = lines.indexOf("put");
+    expect(putIdx, "runner log must contain a 'put' call").toBeGreaterThan(-1);
+    // put 调用的前两个参数是 storeCli 和 triggerStoreDir。
+    expect(lines[putIdx - 2]).toContain(fake.storeCli);
+    expect(lines[putIdx - 1]).toContain(join(runRoot, "stores", "trigger"));
+    // drain 调用：用 runner，不是 node。
+    const drainIdx = lines.indexOf("drain");
+    expect(drainIdx, "runner log must contain a 'drain' call").toBeGreaterThan(-1);
+    expect(lines[drainIdx - 1]).toContain(fake.cli);
     expect(lines[lines.length - 1]).toBe("deep-research");
     // 没有任何一行以 `node` 开头（绝不回退 node）。
     expect(lines.some((l) => l === "node")).toBe(false);
@@ -200,7 +215,10 @@ describe("F5: trigger record shape {id, status:'open', body} is claimable", () =
       RESEARCH_QUESTION: "test research question",
     });
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    const payload = JSON.parse(lines[3]);
+    // E0c2 §1.3：用 indexOf 定位 put 调用，payload 在 put 的下一行。
+    const putIdx = lines.indexOf("put");
+    expect(putIdx).toBeGreaterThan(-1);
+    const payload = JSON.parse(lines[putIdx + 1]);
     expect(typeof payload.id).toBe("string");
     expect(payload.id.length).toBeGreaterThan(0);
     expect(payload.status).toBe("open");
@@ -262,12 +280,24 @@ function makeFakeTick(values: {
   hasPendingWork: boolean;
   dir: string;
   runnerLog: string;
+  /**
+   * E0c2 §1.2：续投门改为对齐终态判据。
+   *   续投 ⇔ hasPendingWork==true 或 (termination.state==null 且 !capHit)。
+   * 为使「hasPendingWork=false ⇒ 不续投」在新门下仍成立，fakeRunBody 的 termination.state
+   * 必须非 null（否则 state==null && !capHit 会触发续投）。默认用 "converged"。
+   * 需要测试 state==null 行为的用例可显式传入 null。
+   */
+  terminationState?: "converged" | "capped" | "partial" | null;
+  capHit?: boolean;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
   // G4b —— fake tick-entry 的 JSON 输出必须含 termination（tick.md 现在读它写进下一条 trigger body）。
+  const termState = values.terminationState ?? null;
+  const capHit = values.capHit ?? false;
+  const termStateJson = termState === null ? "null" : `"${termState}"`;
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${termStateJson}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": ${capHit}}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -320,11 +350,15 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("hasPendingWork false ⇒ no trigger record written", () => {
+  it("hasPendingWork false AND termination.state non-null ⇒ no trigger record written", () => {
+    // E0c2 §1.2：续投门改为 hasPendingWork==true 或 (state==null 且 !capHit)。
+    //   本用例编码新门的「不续投」侧：hasPendingWork=false 且 termination.state 已收敛（非 null）⇒ 停止续投。
+    //   （把 state 改回 null 会让本用例在新门下变红——正是 GT-4 的判别性。）
     const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
     const log = join(dir, "puts.log");
     const { tickEntry, runner, storeDir } = makeFakeTick({
       hasPendingWork: false,
+      terminationState: "converged",
       dir,
       runnerLog: log,
     });

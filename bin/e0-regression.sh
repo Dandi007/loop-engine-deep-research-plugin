@@ -294,12 +294,165 @@ if [ "$SEED_EXIT" -ne 0 ]; then
 fi
 echo "$SEED_LOG" >&2
 
-# ── 跑现状链路到终态；完整 stdout/stderr 落盘，退出码单独记录。──
-set +e
-bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
-  > "$RECORD_DIR/run.stdout.log" 2> "$RECORD_DIR/run.stderr.log"
-LOOP_EXIT=$?
-set -e
+# ── E0c2 §1.3 / GT-3 —— 跨 drain 循环：重复 drain 直到读到非 null 终态或撞 profile 声明的上限。──
+#   单次 drain 在 worker 返回前就烧完 max_rounds（GT-3：worker ≈ 158s，16 轮 ≈ 17s）。
+#   修法：drain → 按 §1.1 读 termination.state → 非 null 收尾 / 撞上限失败收尾 / 否则退避再来。
+#   ⛔ 退避时长（E0_DRAIN_BACKOFF_SECONDS）、墙钟上限（E0_DRAIN_MAX_WALL_SECONDS）、
+#      drain 次数上限（E0_DRAIN_MAX_ATTEMPTS）三者均由 profile 声明，⛔ 不写死在脚本里。
+#   ⛔ 不得靠改 max_passes（单次 drain 的轮次上限）来"解决"（spec §1.3 明确禁止）。
+if [ -z "${E0_DRAIN_BACKOFF_SECONDS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: E0_DRAIN_BACKOFF_SECONDS is not declared by profile '$PROFILE' (spec §1.3: backoff duration must be profile-declared and commensurate with real worker latency ≈ 158s; ⛔ not zero-interval, not hardcoded)." >&2
+  exit 3
+fi
+if [ -z "${E0_DRAIN_MAX_WALL_SECONDS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: E0_DRAIN_MAX_WALL_SECONDS is not declared by profile '$PROFILE' (spec §1.3: wall-clock limit must be profile-declared; ⛔ not hardcoded)." >&2
+  exit 3
+fi
+if [ -z "${E0_DRAIN_MAX_ATTEMPTS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: E0_DRAIN_MAX_ATTEMPTS is not declared by profile '$PROFILE' (spec §1.3: drain count limit must be profile-declared; ⛔ not hardcoded)." >&2
+  exit 3
+fi
+# 三个值都必须是正整数（⛔ 不得为零/负/非整数——零间隔空转正是 GT-3 禁止的形态）。
+for _limit_var in E0_DRAIN_BACKOFF_SECONDS E0_DRAIN_MAX_WALL_SECONDS E0_DRAIN_MAX_ATTEMPTS; do
+  _limit_val="${!_limit_var}"
+  if ! printf '%s' "$_limit_val" | grep -qE '^[1-9][0-9]*$'; then
+    echo "[e0-regression] REFUSING to start: $_limit_var='$_limit_val' is not a positive integer (spec §1.3: backoff/wall-clock/drain-count limits must be positive integers; zero-interval spinning is forbidden)." >&2
+    exit 3
+  fi
+done
+unset _limit_var _limit_val
+
+DRAIN_BACKOFF="$E0_DRAIN_BACKOFF_SECONDS"
+DRAIN_MAX_WALL="$E0_DRAIN_MAX_WALL_SECONDS"
+DRAIN_MAX_ATTEMPTS="$E0_DRAIN_MAX_ATTEMPTS"
+
+# 跨 drain 运行记录（§1.3：每轮的 runs_root/reason/终态都追加进记录，⛔ 不得只留最后一轮）。
+DRAIN_ATTEMPTS_LOG="$RECORD_DIR/drain-attempts.jsonl"
+: > "$DRAIN_ATTEMPTS_LOG"
+
+# §1.1 —— 终态取真值：从 drain 摘要经 index.jsonl → journal.jsonl → tick result 读 termination.state。
+#   drain 摘要是 deep-research-loop.sh stdout 的最后一个 JSON（含 drain_id）。
+#   本函数接收一段 stdout 文本，抽出 drain 摘要 JSON，调 e0c2-termination-read.ts 读终态。
+#   任一步失败 ⇒ 响亮失败（⛔ 不回退 drain reason，spec §1.1）。
+#   返回 0 且 stdout=termination JSON（state 非 null 或 null）= 成功读到；
+#   返回非 0 = 链路某环断裂（已点名是哪一步）。
+_read_termination_from_drain_stdout() {
+  local _stdout_file="$1"
+  # 从 stdout 文本抽出最后一个含 drain_id 的 JSON 行（deep-research-loop.sh 最后一段 cat 的 drain 摘要）。
+  local _drain_summary
+  _drain_summary="$(grep -oE '\{[^{}]*"drain_id"[^{}]*\}' "$_stdout_file" | tail -1)"
+  if [ -z "$_drain_summary" ]; then
+    echo "[e0-regression] §1.1: no drain summary (JSON with drain_id) found in deep-research-loop.sh stdout. Refusing to fall back to drain reason (spec §1.1)." >&2
+    return 1
+  fi
+  # 调 e0c2-termination-read.ts（GT-2 路径：drain_id → index.jsonl → journal.jsonl → tick result → termination.state）。
+  AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c2-termination-read.ts" "$_drain_summary"
+}
+
+# 读 tick channel 的 head_seq（进度行用；失败时进度行标 N/A，不影响终态判定）。
+_read_tick_head_seq() {
+  local _code
+  set +e
+  _code="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" \
+    "$AGENT_BUS_URL/v1/channels/$TICK_CHANNEL")"
+  set -e
+  if [ "$_code" != "200" ]; then
+    printf 'N/A'
+    return
+  fi
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    "$AGENT_BUS_URL/v1/channels/$TICK_CHANNEL" \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(String(o.head_seq??"N/A"))}catch{process.stdout.write("N/A")}})' 2>/dev/null || printf 'N/A'
+}
+
+_LOOP_WALL_START="$(date +%s)"
+_LOOP_FINAL_EXIT=0
+_TERMINATION_STATE=""
+
+_attempt=0
+while :; do
+  _attempt=$((_attempt + 1))
+  if [ "$_attempt" -gt "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] REFUSING to succeed: hit drain count limit (spec §1.3 / 判据 6: termination.state never reached non-null within the profile-declared drain count). attempts=$_attempt > max=$DRAIN_MAX_ATTEMPTS, last_state=${_TERMINATION_STATE:-<none>}." >&2
+    _LOOP_FINAL_EXIT=3
+    break
+  fi
+  _now="$(date +%s)"
+  _elapsed=$((_now - _LOOP_WALL_START))
+  if [ "$_elapsed" -gt "$DRAIN_MAX_WALL" ]; then
+    echo "[e0-regression] REFUSING to succeed: hit wall-clock limit (spec §1.3 / 判据 6: termination.state never reached non-null within the profile-declared wall-clock). elapsed=${_elapsed}s > max=${DRAIN_MAX_WALL}s, attempts=$_attempt, last_state=${_TERMINATION_STATE:-<none>}." >&2
+    _LOOP_FINAL_EXIT=3
+    break
+  fi
+
+  # 本轮 drain 的 stdout/stderr 落进独立文件（每轮保留，⛔ 不只留最后一轮）。
+  _drain_out="$RECORD_DIR/drain-${_attempt}.stdout.log"
+  _drain_err="$RECORD_DIR/drain-${_attempt}.stderr.log"
+  echo "[e0-regression] drain attempt $_attempt/$DRAIN_MAX_ATTEMPTS (elapsed=${_elapsed}s/${DRAIN_MAX_WALL}s wall) ..." >&2
+  set +e
+  bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
+    > "$_drain_out" 2> "$_drain_err"
+  _drain_exit=$?
+  set -e
+
+  if [ "$_drain_exit" -ne 0 ]; then
+    echo "[e0-regression] drain attempt $_attempt failed (exit=$_drain_exit). stderr:" >&2
+    cat "$_drain_err" >&2
+    _TERMINATION_STATE="DRAIN_FAILED"
+    # 把本轮记进 drain-attempts.jsonl（⛔ 每轮都追加，不只留最后一轮）。
+    printf '%s\n' "{\"attempt\":${_attempt},\"exit\":${_drain_exit},\"reason\":\"drain_failed\",\"termination_state\":null,\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
+    _LOOP_FINAL_EXIT=$_drain_exit
+    break
+  fi
+
+  # 提取 drain reason（drain 摘要的 reason 字段）。
+  _drain_reason="$(grep -oE '\{[^{}]*"drain_id"[^{}]*\}' "$_drain_out" | tail -1 | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(String(o.reason??"unknown"))}catch{process.stdout.write("parse_error")}})' 2>/dev/null || printf 'parse_error')"
+
+  # §1.1 读本轮 termination.state（GT-2 路径）。
+  _term_json=""
+  set +e
+  _term_json="$(_read_termination_from_drain_stdout "$_drain_out" 2>"$RECORD_DIR/drain-${_attempt}.term-read.err")"
+  _term_exit=$?
+  set -e
+  if [ "$_term_exit" -ne 0 ]; then
+    echo "[e0-regression] §1.1: failed to read termination.state from drain $_attempt (exit=$_term_exit). Spec §1.1: read failure is failure (⛔ must not fall back to drain reason)." >&2
+    cat "$RECORD_DIR/drain-${_attempt}.term-read.err" >&2
+    _TERMINATION_STATE="READ_FAILED"
+    printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"termination_state\":null,\"termination_read_error\":true,\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
+    _LOOP_FINAL_EXIT=3
+    break
+  fi
+  # 从 termination JSON 取 state 字段。
+  _TERMINATION_STATE="$(printf '%s' "$_term_json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(o.state===null?"null":String(o.state))}catch{process.stdout.write("parse_error")}})' 2>/dev/null || printf 'parse_error')"
+  _head_seq="$(_read_tick_head_seq)"
+
+  # 进度行（§1.3：第几轮 / 本轮 drain reason / 当前 termination.state / 板面 head_seq）。
+  echo "[e0-regression] drain attempt $_attempt: reason=${_drain_reason} termination.state=${_TERMINATION_STATE} tick_head_seq=${_head_seq}"
+
+  # 把本轮记进 drain-attempts.jsonl（每轮的 reason/终态都留痕）。
+  # termination_state 的 JSON 编码：字面量 "null"（state 为 null）⇒ JSON null（不加引号）；
+  #   其余（converged/capped/partial）⇒ JSON 字符串（加引号）。
+  _term_state_json="null"
+  if [ "$_TERMINATION_STATE" != "null" ] && [ "$_TERMINATION_STATE" != "parse_error" ]; then
+    _term_state_json="\"$_TERMINATION_STATE\""
+  fi
+  printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"termination_state\":${_term_state_json},\"tick_head_seq\":\"${_head_seq}\",\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
+
+  # 非 null 终态 ⇒ 成功收尾。
+  if [ "$_TERMINATION_STATE" != "null" ] && [ "$_TERMINATION_STATE" != "parse_error" ]; then
+    echo "[e0-regression] reached terminal state '$_TERMINATION_STATE' after $_attempt drain attempt(s)."
+    _LOOP_FINAL_EXIT=0
+    break
+  fi
+
+  # null 终态且未撞上限 ⇒ 退避后再来一轮（⛔ 退避量级与 worker 真实耗时相称，spec §1.3）。
+  echo "[e0-regression] termination.state still null after drain $_attempt; backing off ${DRAIN_BACKOFF}s before next drain ..." >&2
+  sleep "$DRAIN_BACKOFF"
+done
+
+LOOP_EXIT="$_LOOP_FINAL_EXIT"
 
 # E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。
 echo "[e0-regression] reading production bus sum(head_seq) AFTER run ($PROD_BUS_URL)" >&2

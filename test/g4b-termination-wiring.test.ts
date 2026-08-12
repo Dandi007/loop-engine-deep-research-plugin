@@ -402,6 +402,9 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
 
   it("tick.md seed body {\"seed\":true} passes no --prev-* (first-round semantics)", () => {
     // 首个 seed trigger body 无计数字段 ⇒ tick.md 不传 --prev-*（tick-entry 缺省 0）。
+    // E0c2 §1.2：续投门改为对齐终态判据。这里 fakeRunBody 用 converged 终态（非 null）⇒
+    //    新门不再续投（拿到非 null 终态必须停止续投），故不会调起 runner（/tmp/r 无需存在），
+    //    使本用例的焦点仍是「首轮不传 --prev-*」而非被续投副作用干扰。
     const dir = mkdtempSync(join(tmpdir(), "g4b-r4-seed-"));
     const argvLog = join(dir, "tick-entry.argv.log");
     const tickEntry = join(dir, "tick-entry");
@@ -409,7 +412,7 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
       tickEntryPath: tickEntry,
       argvLog,
       fakeRunBody:
-        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 2, "capHit": false}}',
     });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl

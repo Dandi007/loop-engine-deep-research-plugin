@@ -15,6 +15,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
@@ -47,6 +48,20 @@ function appendIndexEntry(runtimeRoot: string, drainId: string, runDir: string):
   const existing = existsSync(indexPath) ? readFileSync(indexPath, "utf8") : "";
   writeFileSync(indexPath, existing + entry);
 }
+
+/**
+ * 镜像 bin/e0-regression.sh 的 RUN_SEGMENT 派生（sha256(run_id)[:16]）+ TICK_CHANNEL 拼装
+ * （`research:<RESEARCH_PROFILE_BASE>-<segment>.index`，RESEARCH_PROFILE_BASE=e0 来自 profile）。
+ * 用于让假 bus 知道入口本轮会去读哪个 channel 的 head_seq（列表端点）。
+ */
+const TEST_RUN_ID = "e0c2-entry-test";
+const TEST_TICK_CHANNEL = (() => {
+  const segment = createHash("sha256").update(TEST_RUN_ID).digest("hex").slice(0, 16);
+  return `research:e0-${segment}.index`;
+})();
+// 假 bus 为 tick channel 在列表端点报告的 head_seq。选一个非 0 的真实数值（7），
+// 让断言能区分「真从列表端点读到 7」与「凑合的 0 / 单 channel GET 取不到的 N/A」。
+const TEST_TICK_HEAD_SEQ = 7;
 
 // ── 逻辑层：跨 drain 循环判定 ──────────────────────────────────────────────
 
@@ -209,29 +224,66 @@ describe("§2 判据 5 (GT-3): deep-research-loop.sh puts a seed trigger uncondi
 //   ⇒ §1.1 那个 brace-free 正则 blocker 在该套件下永远不会被发现（正是 §0「用 fixture 证明契约」的形状）。
 //   这里补一组**真跑入口**的判别性测试：用假 bus + 假 loop-engine CLI + 预置 journal 驱动入口真实 bash 循环。
 
-/** 假 bus：接受任意 channel GET/POST（channel 预备 / publish / messages 读），返回最小 200 JSON。 */
-function startFakeBus(): Promise<{ base: string; close: () => void }> {
+/**
+ * 假 bus：接受任意 channel GET/POST（channel 预备 / publish / messages 读），返回最小 200 JSON。
+ *
+ * 评审 major 修复（attempt 2 final REJECT）：原假 bus 对**所有**端点（含单 channel GET）一律返回
+ *   `{ok:true, head_seq:0, messages:[]}`——正是真机该端点不含 head_seq 的那个端点。这掩盖了
+ *   `bin/e0-regression.sh:_read_tick_head_seq` 从单 channel GET 取 head_seq 的 blocker（真机该端点
+ *   根本没有 head_seq，恒 N/A）。判据 5 的入口执行用例又从不断言 head_seq 是真实数值 ⇒
+ *   「head_seq 恒 N/A」全绿通过——与 attempt 1 被驳回的「用 fixture 证明契约、不跑真实取值路径」同族。
+ *
+ * 本假 bus 严格复刻真机两个 channel 端点的字段集（src/bus.ts GT-1 逐字）：
+ *   - `GET /v1/channels`（列表端点）→ 含 head_seq（GT-1：head_seq 只在这里）。
+ *   - `GET /v1/channels/<id>`（单 channel GET）→ ⛔ 不含 head_seq（GT-1：字段集为 channel_id/
+ *     closed_at/created_at/.../visibility，无 head_seq）。
+ * 这样判据 5 的入口执行用例真跑 `_read_tick_head_seq` 时走的是**列表端点**取 head_seq；
+ * 若实现退化为读单 channel GET，会读到 undefined ⇒ 进度行/记录里 head_seq 退化为
+ * HEAD_SEQ_READ_FAILED，断言会变红（判别性）。
+ *
+ * @param tickChannelHeadSeq 列表端点为 tick channel 报告的 head_seq（默认 7，一个非 0 的真实数值，
+ *   让断言能区分「真读到」与「凑合的 0」）。
+ */
+function startFakeBus(tickChannelId: string, tickChannelHeadSeq = 7): Promise<{ base: string; close: () => void }> {
   return new Promise((r) => {
     const server = createServer((req, res) => {
       const url = req.url ?? "";
-      res.writeHead(200, { "Content-Type": "application/json" });
-      // GET /v1/channels（列表端点，prod-read 用）：返回空 channels（sum=0）。
-      if (url === "/v1/channels" || url.startsWith("/v1/channels?")) {
-        res.end(JSON.stringify({ channels: [] }));
+      // GET /v1/channels（列表端点，prod-read 与 tick_head_seq 读取都用它）：列出 tick channel，
+      // 带真实 head_seq（GT-1：列表端点是 head_seq 的唯一来源，连空 channel 也以 head_seq:0 列出）。
+      if ((url === "/v1/channels" || url.startsWith("/v1/channels?")) && req.method !== "POST") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ channels: [{ channel_id: tickChannelId, head_seq: tickChannelHeadSeq }] }));
         return;
       }
       // POST /v1/channels（建 channel）：返回 ok。
       if (url === "/v1/channels" && req.method === "POST") {
+        res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
         return;
       }
       // POST .../publish：返回 publish 形状（seed 用）。
       if (url.endsWith("/publish")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ message_id: "m", channel_seq: 1, deduplicated: false }));
         return;
       }
-      // 其余（GET 单 channel / messages）：返回 head_seq=0、空 messages。
-      res.end(JSON.stringify({ ok: true, head_seq: 0, messages: [] }));
+      // GET 单 channel / messages：⛔ 复刻真机字段集（**不含 head_seq**，GT-1）。
+      //   若实现退化为从单 channel GET 取 head_seq，会读到 undefined（不会得到 0 或 7）。
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          channel_id: tickChannelId,
+          closed_at: null,
+          created_at: "2026-08-12T00:00:00Z",
+          default_lease_ms: 60000,
+          delivery_mode: "fanout",
+          max_attempts: 5,
+          metadata: {},
+          owner_agent_id: "uther",
+          refs_required: 0,
+          visibility: "private",
+        }),
+      );
     });
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
@@ -408,7 +460,7 @@ function entryEnv(opts: {
 
 describe("§2 判据 5 (GT-3) entry-execution: first drain null, second drain non-null ⇒ entry exits 0", () => {
   it("entry's real bash loop runs drain 1 (null), backs off, runs drain 2 (converged) ⇒ exit 0", async () => {
-    const bus = await startFakeBus();
+    const bus = await startFakeBus(TEST_TICK_CHANNEL, TEST_TICK_HEAD_SEQ);
     try {
       // ⛔ 判据 5 核心：真跑 bin/e0-regression.sh 的跨 drain 循环。
       //   states=[null, "converged"]：drain 1 读到 null（继续），drain 2 读到 converged（收尾）。
@@ -444,6 +496,14 @@ describe("§2 判据 5 (GT-3) entry-execution: first drain null, second drain no
       // 真实 drain reason（不是 parse_error）—— 评审 blocker：原 brace-free 正则让 reason 永远 parse_error。
       expect(a1.reason).toBe("drained");
       expect(a2.reason).toBe("drained");
+      // 评审 major（attempt 2 final REJECT）：每轮的 tick_head_seq 必须是真实数值（从列表端点读到），
+      //   不是 N/A / HEAD_SEQ_READ_FAILED。原假 bus 对单 channel GET 返回 head_seq:0 ⇒ 掩盖了
+      //   真机该端点不含 head_seq 的 blocker；本假 bus 复刻真机字段集（单 channel GET 不含 head_seq，
+      //   列表端点含），若实现退化为读单 channel GET，a*.tick_head_seq 会是 HEAD_SEQ_READ_FAILED ⇒ 变红。
+      expect(a1.tick_head_seq).toBe(String(TEST_TICK_HEAD_SEQ));
+      expect(a2.tick_head_seq).toBe(String(TEST_TICK_HEAD_SEQ));
+      // 进度行也带真实 head_seq（不是 N/A）。
+      expect(res.out).toMatch(new RegExp(`tick_head_seq=${TEST_TICK_HEAD_SEQ}`));
     } finally {
       bus.close();
     }
@@ -452,7 +512,7 @@ describe("§2 判据 5 (GT-3) entry-execution: first drain null, second drain no
 
 describe("§2 判据 6 (limits) entry-execution: state never non-null ⇒ entry hits attempt limit, non-zero exit, names the limit", () => {
   it("all drains return null ⇒ entry hits E0_DRAIN_MAX_ATTEMPTS, exits non-zero, names 'drain count limit'", async () => {
-    const bus = await startFakeBus();
+    const bus = await startFakeBus(TEST_TICK_CHANNEL, TEST_TICK_HEAD_SEQ);
     try {
       // ⛔ 判据 6 核心：真跑 bin/e0-regression.sh 的跨 drain 循环，termination.state 永远 null。
       //   maxAttempts=2（小值，让测试在有限时间内撞上限）。退避 1 秒（非零间隔，但测试要快）。
@@ -476,6 +536,14 @@ describe("§2 判据 6 (limits) entry-execution: state never non-null ⇒ entry 
       expect(existsSync(join(recordDir, "drain-2.stdout.log"))).toBe(true);
       // 没有第三轮（撞了 maxAttempts=2 上限就停）。
       expect(existsSync(join(recordDir, "drain-3.stdout.log"))).toBe(false);
+      // 评审 major（attempt 2 final REJECT）：即便撞上限，每轮记录的 tick_head_seq 仍是真实数值
+      //   （从列表端点读到），不是 N/A / HEAD_SEQ_READ_FAILED。本假 bus 复刻真机字段集
+      //   （单 channel GET 不含 head_seq），若实现退化会读到 HEAD_SEQ_READ_FAILED ⇒ 变红。
+      const attempts = readFileSync(join(recordDir, "drain-attempts.jsonl"), "utf8").trim().split("\n");
+      expect(attempts.length).toBe(2);
+      for (const line of attempts) {
+        expect(JSON.parse(line).tick_head_seq).toBe(String(TEST_TICK_HEAD_SEQ));
+      }
     } finally {
       bus.close();
     }

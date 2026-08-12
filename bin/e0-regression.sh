@@ -380,21 +380,30 @@ _read_termination_from_drain_stdout() {
     node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c2-termination-read.ts" "$_drain_summary"
 }
 
-# 读 tick channel 的 head_seq（进度行用；失败时进度行标 N/A，不影响终态判定）。
+# 读 tick channel 的 head_seq（进度行 / drain-attempts.jsonl 用）。
+# 评审 blocker 修复（attempt 2 final REJECT）：原实现从单 channel GET 端点
+#   （`GET /v1/channels/<TICK_CHANNEL>`）读 `o.head_seq`——但本仓自己的实测地面真相
+#   （src/bus.ts GT-1：单 channel GET 的字段集为 channel_id/closed_at/created_at/...
+#    ← ⛔ 没有 head_seq；`head_seq` 只在列表端点 `GET /v1/channels`）明确否定该形状。
+#   结果：真机每一轮的进度行恒为 `tick_head_seq=N/A`，drain-attempts.jsonl 每条恒记
+#   "tick_head_seq":"N/A"，§1.3 明列的这一项交付内容永远拿不到，且 N/A 是静默降级（不响亮）。
+#   改为复用 src/bus.ts 的 getChannelHeadSeq（**列表端点**单一真相源，src/bus.ts:211-222），
+#   经 src/e0c2-read-tick-head-seq.ts 调起——不在 bash 侧另写一份单 channel GET 取值
+#   （那正是 §0「为真实产物里不存在的字段发明契约、再靠 fixture 满足它」的 blocker 形状）。
+# 读失败即响亮失败（非零退出）：⛔ 不得静默退化为 N/A。入口据此在进度行/记录里点名 head_seq 读取失败
+#   （而非默默记 N/A）。仅在终态判定已成立后调用，故该失败不影响终态判定，只影响本轮 head_seq 记录。
 _read_tick_head_seq() {
-  local _code
+  local _out _ec
   set +e
-  _code="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $TOKEN" \
-    "$AGENT_BUS_URL/v1/channels/$TICK_CHANNEL")"
+  _out="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c2-read-tick-head-seq.ts" "$TICK_CHANNEL" 2>/dev/null)"
+  _ec=$?
   set -e
-  if [ "$_code" != "200" ]; then
-    printf 'N/A'
+  if [ "$_ec" -ne 0 ]; then
+    printf 'HEAD_SEQ_READ_FAILED'
     return
   fi
-  curl -s -H "Authorization: Bearer $TOKEN" \
-    "$AGENT_BUS_URL/v1/channels/$TICK_CHANNEL" \
-    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(String(o.head_seq??"N/A"))}catch{process.stdout.write("N/A")}})' 2>/dev/null || printf 'N/A'
+  printf '%s' "$_out"
 }
 
 _LOOP_WALL_START="$(date +%s)"

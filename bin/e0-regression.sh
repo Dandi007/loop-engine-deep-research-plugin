@@ -354,8 +354,10 @@ EOF
   fi
 
   # GT-6 分类：
-  #   拿不到可解析摘要 / 非 max_rounds 的非零退出码 ⇒ 真失败，响亮收尾。
-  #   reason==drained 或 reason==max_rounds ⇒ 继续往下判终态（⛔ max_rounds 的 exit 1 不算失败）。
+  #   拿不到可解析摘要 / 其它非零退出码 ⇒ 真失败，响亮收尾。
+  #   reason==drained 且退出码 0 ⇒ 继续往下判终态。
+  #   reason==max_rounds（退出码 1） ⇒ 继续往下判终态（⛔ max_rounds 的 exit 1 不算失败）。
+  #   ⛔ reason==drained 但退出码非零 ⇒ 真失败（GT-6 表格第三行：真机 tick failure 先 cat 出 reason=drained 的摘要再以 exit 3 收尾）。
   if [ -z "$_drain_summary" ]; then
     echo "[e0-regression] DRAIN FAILED: cannot parse drain summary (exit=$_drain_ec). Aborting (GT-6: unparseable drain is a real failure, not 'not yet converged')." >&2
     _loop_exit_code=3
@@ -363,6 +365,11 @@ EOF
   fi
   if [ "$_drain_reason" != "drained" ] && [ "$_drain_reason" != "max_rounds" ]; then
     echo "[e0-regression] DRAIN FAILED: reason='$_drain_reason', exit=$_drain_ec. Aborting (GT-6: non-drained/non-max_rounds is a real failure)." >&2
+    _loop_exit_code=3
+    break
+  fi
+  if [ "$_drain_reason" = "drained" ] && [ "$_drain_ec" -ne 0 ]; then
+    echo "[e0-regression] DRAIN FAILED: reason='$_drain_reason' but exit code $_drain_ec (GT-6: non-zero exit with 'drained' reason is a real failure, e.g. tick failure). Aborting." >&2
     _loop_exit_code=3
     break
   fi
@@ -388,6 +395,7 @@ EOF
     _term_err="$(cat "$ENTRY_TMP.term-err" 2>/dev/null || true)"
     rm -f "$ENTRY_TMP.term-err" 2>/dev/null || true
     echo "[e0-regression] §1.1 READ FAILURE: read-termination-state.mjs exited $_term_ec: ${_term_err:-<no stderr>}. Aborting (spec §1.1: reading failure is failure, not 'not yet converged')." >&2
+    set -e
     _loop_exit_code=3
     break
   fi
@@ -407,7 +415,7 @@ EOF
   _read_hs=$(_read_tick_head_seq 2>/dev/null) && _head_seq="$_read_hs" || _head_seq="READ_FAILED"
 
   # 每轮 drain 打一行进度（第几轮 / 本轮 drain reason / 当前 termination.state / 板面 head_seq）
-  echo "[e0-regression] attempt=$_drain_count reason=$_drain_reason termination_state=$_termination_state head_seq=$_head_seq" >&2
+  echo "[e0-regression] attempt=$_drain_count reason=$_drain_reason termination_state=$_termination_state head_seq=$_head_seq"
 
   # 每轮的 runs_root/reason/终态追加进运行记录，并保留每轮 drain 的原始输出
   _drain_records="${_drain_records}drain_${_drain_count}_runs_root=${_runs_root:-}
@@ -433,6 +441,12 @@ $_drain_out
     _loop_exit_code=3
     break
   fi
+
+  # 退避后再来一轮（GT-3：退避量与 worker 真实耗时 158 秒相称，≥ 120 秒）。
+  echo "[e0-regression] backoff $_termination_backoff seconds before next drain (state=$_termination_state, attempt=$_drain_count/$_termination_max)" >&2
+  sleep "$_termination_backoff"
+
+  # 墙钟上限检查：在退避之后、下一轮 drain 之前采样（避免退避计入声明上限之外）。
   _now=$(date +%s)
   _wall_elapsed=$((_now - _start_ts))
   if [ "$_wall_elapsed" -ge "$_termination_wall_clock" ]; then
@@ -440,10 +454,6 @@ $_drain_out
     _loop_exit_code=3
     break
   fi
-
-  # 退避后再来一轮（GT-3：退避量与 worker 真实耗时 158 秒相称，≥ 120 秒）。
-  echo "[e0-regression] backoff $_termination_backoff seconds before next drain (state=$_termination_state, attempt=$_drain_count/$_termination_max)" >&2
-  sleep "$_termination_backoff"
 done
 
 # ── 写入运行记录。──

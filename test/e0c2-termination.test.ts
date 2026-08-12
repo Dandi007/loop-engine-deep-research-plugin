@@ -441,6 +441,143 @@ describe("判据 3: no identity==tick in journal ⇒ loud failure", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("entry-level: drain summary without drain_id ⇒ DRAIN FAILED (GT-7 parse rejects, loud failure)", async () => {
+    const bus = await startFakeBus();
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c2-rec-no-did-"));
+    const tokFile = makeTokenFile();
+    const runId = "e0c2-nodid-001";
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "e0c2-fake-loop-nodid-"));
+      const script = join(dir, "deep-research-loop.sh");
+      writeFileSync(
+        script,
+        `#!/usr/bin/env bash
+echo '{"id":"a9-test","status":"open","body":{"seed":true}}'
+echo '[deep-research-loop] mode=deep-research'
+echo '{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"/tmp/foo"}'
+exit 0
+`,
+      );
+      chmodSync(script, 0o755);
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AGENT_BUS_URL: bus.base,
+        AGENT_BUS_TOKEN_FILE: tokFile,
+        E0C1_PROD_BUS_URL: bus.base,
+        E0C1_PROD_BUS_TOKEN_FILE: tokFile,
+        E0_RECORD_ROOT: recRoot,
+        DD_RUN_ID: runId,
+        DEEP_RESEARCH_LOOP_BIN: script,
+        TERMINATION_BACKOFF_SECONDS: "0",
+        TERMINATION_MAX_DRAINS: "3",
+        TERMINATION_WALL_CLOCK_SECONDS: "60",
+      };
+      const res = await runEntryDetached(env);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/DRAIN FAILED/);
+      expect(res.stderr).toMatch(/cannot parse drain summary/);
+    } finally {
+      bus.close();
+      rmSync(recRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  it("entry-level: drain summary without runs_root ⇒ §1.1 READ FAILURE (loud failure, not null-default)", async () => {
+    const bus = await startFakeBus();
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c2-rec-no-rr-"));
+    const tokFile = makeTokenFile();
+    const runId = "e0c2-norr-001";
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "e0c2-fake-loop-norr-"));
+      const script = join(dir, "deep-research-loop.sh");
+      const drainId = "drain-norr";
+      writeFileSync(
+        script,
+        `#!/usr/bin/env bash
+echo '{"id":"a9-test","status":"open","body":{"seed":true}}'
+echo '[deep-research-loop] mode=deep-research'
+echo '{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"drain_id":"${drainId}"}'
+exit 0
+`,
+      );
+      chmodSync(script, 0o755);
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AGENT_BUS_URL: bus.base,
+        AGENT_BUS_TOKEN_FILE: tokFile,
+        E0C1_PROD_BUS_URL: bus.base,
+        E0C1_PROD_BUS_TOKEN_FILE: tokFile,
+        E0_RECORD_ROOT: recRoot,
+        DD_RUN_ID: runId,
+        DEEP_RESEARCH_LOOP_BIN: script,
+        TERMINATION_BACKOFF_SECONDS: "0",
+        TERMINATION_MAX_DRAINS: "3",
+        TERMINATION_WALL_CLOCK_SECONDS: "60",
+      };
+      const res = await runEntryDetached(env);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/READ FAILURE/);
+      expect(res.stderr).toMatch(/no runs_root/);
+    } finally {
+      bus.close();
+      rmSync(recRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  it("entry-level: read-termination-state.mjs exits non-zero (no tick in journal) ⇒ §1.1 READ FAILURE (loud failure, not null-default)", async () => {
+    const bus = await startFakeBus();
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c2-rec-notick-"));
+    const tokFile = makeTokenFile();
+    const runId = "e0c2-notick-001";
+    try {
+      const engineRoot = setupEngineRoot();
+      const drainId = "drain-notick-entry";
+      const runDir = join(engineRoot, "run-" + drainId);
+      mkdirSync(runDir, { recursive: true });
+
+      writeFileSync(
+        join(engineRoot, "index.jsonl"),
+        JSON.stringify({ drain_id: drainId, lane: "deep-research", run_dir: runDir }) + "\n",
+      );
+      writeFileSync(
+        join(runDir, "journal.jsonl"),
+        JSON.stringify({
+          run_id: "run~1",
+          identity: "other",
+          result: "{}",
+          effects: [],
+        }) + "\n",
+      );
+
+      const fakeLoop = makeFakeLoopDir([
+        { drainId, runsRoot: engineRoot, reason: "drained", exitCode: 0 },
+      ]);
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AGENT_BUS_URL: bus.base,
+        AGENT_BUS_TOKEN_FILE: tokFile,
+        E0C1_PROD_BUS_URL: bus.base,
+        E0C1_PROD_BUS_TOKEN_FILE: tokFile,
+        E0_RECORD_ROOT: recRoot,
+        DD_RUN_ID: runId,
+        DEEP_RESEARCH_LOOP_BIN: fakeLoop,
+        TERMINATION_BACKOFF_SECONDS: "0",
+        TERMINATION_MAX_DRAINS: "3",
+        TERMINATION_WALL_CLOCK_SECONDS: "60",
+        LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      };
+      const res = await runEntryDetached(env);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/READ FAILURE/);
+    } finally {
+      bus.close();
+      rmSync(recRoot, { recursive: true, force: true });
+    }
+  }, 45000);
 });
 
 // ── 判据 6c (GT-7): 嵌套 JSON 摘要 ⇒ 正确抽取 ──
@@ -1181,7 +1318,7 @@ describe("判据 5/6/6b (GT-3/GT-6): drain loop, entry-level with stub injection
     }
   }, 45000);
 
-  it("判据 6b (GT-6) DISCRIMINATING: non-max_rounds non-zero exit (e.g. 3) ⇒ fail immediately", async () => {
+  it("判据 6b (GT-6) DISCRIMINATING: reason=drained but non-zero exit (e.g. 3) ⇒ fail immediately (real tick failure shape)", async () => {
     const bus = await startFakeBus();
     const recRoot = mkdtempSync(join(tmpdir(), "e0c2-rec-6bd-"));
     const tokFile = makeTokenFile();
@@ -1193,7 +1330,7 @@ describe("判据 5/6/6b (GT-3/GT-6): drain loop, entry-level with stub injection
       setupDrainJournal(engineRoot, drainId, { state: null, coverage: 0, zeroGrowthRounds: 1, capHit: false });
 
       const fakeLoop = makeFakeLoopDir([
-        { drainId, runsRoot: engineRoot, reason: "error", exitCode: 3 },
+        { drainId, runsRoot: engineRoot, reason: "drained", exitCode: 3 },
       ]);
 
       const env: NodeJS.ProcessEnv = {
@@ -1211,7 +1348,8 @@ describe("判据 5/6/6b (GT-3/GT-6): drain loop, entry-level with stub injection
         LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
       };
       const res = await runEntryDetached(env);
-      // ⛔ 判据 6b discriminant: 非 max_rounds/drained 的 reason 是真失败，应立即退出
+      // ⛔ 判据 6b discriminant: reason=drained + exitCode 3 is a real failure (tick failure),
+      // not 'not yet converged'. The entry must fail immediately, not retry.
       expect(res.code).toBe(3);
       expect(res.stderr).toMatch(/DRAIN FAILED/);
     } finally {

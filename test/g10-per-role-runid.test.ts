@@ -24,7 +24,7 @@ const ROLES = [
 ] as const;
 
 function termState(): TerminationState {
-  return { state: "converged", capHit: false, coverage: 0, zeroGrowthRounds: 0 };
+  return { state: "converged", capHit: false, coverage: 0, zeroGrowthRounds: 0, boardComposition: { proposed: 0, open: 0, inFlight: 0, explored: 0, blocked: 0 } };
 }
 
 function boardState(): BoardState {

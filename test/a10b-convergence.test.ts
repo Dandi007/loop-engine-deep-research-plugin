@@ -128,32 +128,53 @@ function renderFleet(env: NodeJS.ProcessEnv = {}): { triggerStoreDir: string; fl
   return { triggerStoreDir, fleetDir };
 }
 
-async function startFakeBus(port: number, seedPath?: string): Promise<void> {
+async function startFakeBus(seedPath?: string): Promise<number> {
   const fixture = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+  let stdout = "";
   const child = spawn(
     process.execPath,
     [fixture],
     {
       env: {
         ...process.env,
-        A10B_BUS_PORT: String(port),
+        A10B_BUS_PORT: "0",
         ...(seedPath ? { A10B_SEED: seedPath } : {}),
       },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "ignore"],
     },
   );
   runningBuses.push(child.pid as number);
-  // 等待端口就绪。
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/v1/channels/_probe`);
-      if (r) break;
-    } catch {
-      /* not up yet */
-    }
-    if (Date.now() > deadline) throw new Error(`fake bus did not come up on ${port}`);
-  }
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + 5000;
+    const check = (port: number) => {
+      fetch(`http://127.0.0.1:${port}/v1/channels/_probe`)
+        .then((r) => { if (r) resolve(port); })
+        .catch(() => {
+          if (Date.now() > deadline) reject(new Error("fake bus did not come up (kernel-assigned port)"));
+          else setTimeout(() => check(port), 50);
+        });
+    };
+    child.on("error", (err) => reject(err));
+    const parsePort = () => {
+      const m = stdout.match(/fakebus listening on (\d+)/);
+      if (m) {
+        const port = Number(m[1]);
+        if (port > 0) {
+          check(port);
+          return;
+        }
+      }
+      if (Date.now() > deadline) {
+        reject(new Error("fake bus did not output listening port"));
+        return;
+      }
+      setTimeout(parsePort, 50);
+    };
+    setTimeout(parsePort, 50);
+  });
 }
 
 async function readChannel(port: number, channelId: string): Promise<unknown[]> {
@@ -163,15 +184,10 @@ async function readChannel(port: number, channelId: string): Promise<unknown[]> 
 }
 
 async function runRealE2E(opts: {
-  port: number;
   seedPath?: string;
   env?: NodeJS.ProcessEnv;
-}): Promise<{ code: number; out: string; err: string }> {
-  // ⛔ 必须 await startFakeBus：其就绪循环是异步轮询（内部 await fetch 端口探测）。若丢弃该
-  //    promise，紧接着的阻塞 execFileSync 会让就绪循环永远得不到事件循环机会（B1/B2 竞争 bus
-  //    启动，重新引入 §0.2 的验收命令不确定性）；bus 绑定失败也会变成 unhandled rejection 而非
-  //    响亮测试失败（§3.2 静默零结果）。
-  await startFakeBus(opts.port, opts.seedPath);
+}): Promise<{ code: number; out: string; err: string; port: number }> {
+  const port = await startFakeBus(opts.seedPath);
   const runRoot = mkdtempSync(join(tmpdir(), "a10b-e2e-"));
   const bun = resolveBun()!;
   let code = 0;
@@ -183,7 +199,7 @@ async function runRealE2E(opts: {
       encoding: "utf8",
       env: {
         ...process.env,
-        AGENT_BUS_URL: `http://127.0.0.1:${opts.port}`,
+        AGENT_BUS_URL: `http://127.0.0.1:${port}`,
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
         DD_RUN_ROOT: runRoot,
@@ -203,7 +219,7 @@ async function runRealE2E(opts: {
     err = String(ee.stderr ?? "");
   }
   rmSync(runRoot, { recursive: true, force: true });
-  return { code, out, err };
+  return { code, out, err, port };
 }
 
 function drainResult(out: string): unknown {
@@ -240,8 +256,7 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       return;
     }
     it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
-      const port = 18000 + Math.floor(Math.random() * 1000);
-      const { code, out } = await runRealE2E({ port });
+      const { code, out } = await runRealE2E({});
       expect(code).toBe(0);
       const result = drainResult(out) as { reason?: string };
       expect(result.reason).toBe("drained");
@@ -322,15 +337,13 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
           "research:p02-smoke-1dce60.evidence": [],
         }),
       );
-      const port = 18000 + Math.floor(Math.random() * 1000);
       const res = await runRealE2E({
-        port,
         seedPath: seed,
         env: { EVIDENCE_CHANNEL: "research:p02-smoke-1dce60.evidence" },
       });
       rmSync(dir, { recursive: true, force: true });
       expect(res.out).toContain("drained");
-      const msgs = await readChannel(port, "research:p02-smoke-1dce60.evidence");
+      const msgs = await readChannel(res.port, "research:p02-smoke-1dce60.evidence");
       const evidence = msgs.filter((m) => (m as { kind?: string }).kind === "research.evidence.v2");
       expect(evidence.length).toBeGreaterThan(0);
       // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），

@@ -309,6 +309,56 @@ if [ -z "${DRAIN_WALL_CLOCK_SECONDS:-}" ]; then
   exit 3
 fi
 
+# ── E0c3b §1.2 —— 板面构成辅助函数：从最后 drain 的 termination JSON 提取板面构成与 triage 阈值，
+#   并输出诊断行（含 triage 门限死锁点名）。$1 = termination JSON（含 boardComposition/triageThreshold）。
+_print_board_composition() {
+  local term_json="$1"
+  local bc prop open inflight expl blocked threshold
+  local extracted
+  if ! extracted="$(printf '%s' "$term_json" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      try {
+        const o=JSON.parse(s.trim());
+        const bc=o.boardComposition||{};
+        const t=o.triageThreshold;
+        process.stdout.write(JSON.stringify({bc,t}));
+      } catch { process.stdout.write('{}'); }
+    });
+  " 2>/dev/null)"; then
+    echo "[e0-regression] board composition unavailable" >&2
+    return
+  fi
+  bc="$(printf '%s' "$extracted" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      const o=JSON.parse(s.trim());
+      const bc=o.bc||{};
+      process.stdout.write('proposed='+(bc.proposed||0)+' open='+(bc.open||0)+' in_flight='+(bc.inFlight||0)+' explored='+(bc.explored||0)+' blocked='+(bc.blocked||0));
+    });
+  " 2>/dev/null)" || bc="composition unavailable"
+  threshold="$(printf '%s' "$extracted" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      const o=JSON.parse(s.trim());
+      process.stdout.write(String(o.t||''));
+    });
+  " 2>/dev/null)" || threshold=""
+  echo "[e0-regression] board: ${bc}" >&2
+  if [ -n "$threshold" ]; then
+    prop="$(printf '%s' "$extracted" | node -e "
+      let s='';
+      process.stdin.on('data',d=>s+=d).on('end',()=>{
+        const o=JSON.parse(s.trim());
+        process.stdout.write(String((o.bc||{}).proposed||0));
+      });
+    " 2>/dev/null)" || prop=""
+    if [ -n "$prop" ] && [ "$prop" -gt 0 ] && [ "$prop" -lt "$threshold" ]; then
+      echo "[e0-regression] TRIAGE THRESHOLD DEADLOCK: proposed=${prop} < triageThreshold=${threshold} — triage will never trigger, board can never drain (spec GT-11)." >&2
+    fi
+  fi
+}
+
 # ── E0c2 §1.3 —— 跨 drain 循环：反复跑 deep-research-loop.sh 直到终态收敛。──
 # 每轮：跑 drain → 分类退出码（GT-6）→ 读 termination.state（§1.1）→ 判终态或退避重来。
 WALL_START=$(date +%s)
@@ -329,6 +379,20 @@ _drain_fail_echo() {
 }
 
 while true; do
+  # 次数上限检查（先于增量，使 drain_attempts 反映实际执行次数而非 off-by-one）
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+    if [ -f "$_last_stdout" ]; then
+      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+      if [ -n "$_last_term" ]; then
+        _print_board_composition "$_last_term"
+      fi
+    fi
+    LOOP_EXIT=4
+    break
+  fi
+
   DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
 
   # 墙钟上限检查
@@ -336,13 +400,15 @@ while true; do
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
     echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    LOOP_EXIT=4
-    break
-  fi
-
-  # 次数上限检查
-  if [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    if [ "$DRAIN_ATTEMPT" -gt 0 ]; then
+      _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+      if [ -f "$_last_stdout" ]; then
+        _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+        if [ -n "$_last_term" ]; then
+          _print_board_composition "$_last_term"
+        fi
+      fi
+    fi
     LOOP_EXIT=4
     break
   fi

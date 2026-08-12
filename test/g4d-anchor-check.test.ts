@@ -49,6 +49,7 @@ function term(over: Partial<TerminationState> = {}): TerminationState {
     coverage: 0,
     zeroGrowthRounds: 3,
     capHit: false,
+    boardComposition: { proposed: 0, open: 0, inFlight: 0, explored: 0, blocked: 0 },
     ...over,
   };
 }

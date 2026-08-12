@@ -144,5 +144,6 @@ if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`fakebus listening on ${PORT}`);
+  const actualPort = server.address().port;
+  console.log(`fakebus listening on ${actualPort}`);
 });

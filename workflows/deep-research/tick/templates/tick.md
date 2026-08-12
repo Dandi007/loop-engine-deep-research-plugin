@@ -52,6 +52,8 @@ if [ -n "$tick_channel" ]; then
   # G4c —— research origin 与 doc channel 可选注入 tick-entry --run。
   if [ -n "$research_origin" ]; then tick_args+=(--origin "$research_origin"); fi
   if [ -n "$doc_channel" ]; then tick_args+=(--doc-channel "$doc_channel"); fi
+  # E0c3b §1.1 —— triage 触发阈值：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），直接使用 env var。
+  if [ -n "${TRIAGE_THRESHOLD:-}" ]; then tick_args+=(--triage-threshold "${TRIAGE_THRESHOLD}"); fi
   # G4b —— 从 trigger_body 解析上一轮的 coverage / zeroGrowthRounds 并传给 tick-entry。
   #   ⛔ body 一旦非空就必须是合法 JSON。首轮判定基于 **seed 标记**（{"seed":true}）：
   #      seed body ⇒ 不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。

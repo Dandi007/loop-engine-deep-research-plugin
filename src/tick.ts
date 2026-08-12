@@ -340,6 +340,17 @@ export interface TerminationState {
    * （spec §3 line 37），待全部排空后才正式报 capped。
    */
   capHit: boolean;
+  /**
+   * E0c3b §1.2 —— 板面构成（proposed/open/in_flight/explored/blocked 各状态计数）。
+   * 供撞上限时打印板面构成、诊断 triage 门限死锁。
+   */
+  boardComposition: {
+    proposed: number;
+    open: number;
+    inFlight: number;
+    explored: number;
+    blocked: number;
+  };
 }
 
 /** 覆盖度 = 有至少一条 evidence 的 clue_id 的集合大小（spec §2，非 evidence 条数）。 */
@@ -368,6 +379,7 @@ export function decideTermination(
   const open = input.cards.filter((c) => c.status === "open").length;
   const proposed = input.cards.filter((c) => c.status === "proposed").length;
   const blocked = input.cards.filter((c) => c.status === "blocked").length;
+  const explored = input.cards.filter((c) => c.status === "explored").length;
 
   // 条件 2/3：触顶 → 终态 capped（触顶 ≠ 收敛，报告不得宣称完备，§3.1）。
   // 条件 3 只拦新 clue，已 open 的跑完（spec §3 line 37）：触顶后并不立即终止，
@@ -389,7 +401,7 @@ export function decideTermination(
     state = blocked > 0 ? "partial" : "converged";
   }
 
-  return { state, coverage, zeroGrowthRounds, capHit };
+  return { state, coverage, zeroGrowthRounds, capHit, boardComposition: { proposed, open, inFlight, explored, blocked } };
 }
 
 /**

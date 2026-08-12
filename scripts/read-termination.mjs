@@ -178,7 +178,9 @@ function main() {
     fail("termination", "first JSON document in result has no termination object");
   }
 
-  process.stdout.write(JSON.stringify(termination));
+  const triageThreshold = firstDoc.triageThreshold;
+
+  process.stdout.write(JSON.stringify({ ...termination, triageThreshold }));
   return 0;
 }
 

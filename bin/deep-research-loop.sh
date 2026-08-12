@@ -121,6 +121,8 @@ export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
 # 可用 DOC_CHANNEL 覆盖。⛔ 无内置缺省：不得静默回退到板 channel（research.doc.v2 发进 clue 板是 append-only
 # 不可回退的错误落点）。未配置时留空，tick.md 不传 --doc-channel ⇒ writeDoc 抛 MissingDocChannelError。
 export DOC_CHANNEL="${DOC_CHANNEL:-}"
+# E0c3b §1.1 —— triage 触发阈值（profile 声明，缺省 3；⛔ 不得改 DEFAULT_TICK_CONFIG 缺省）。
+export TRIAGE_THRESHOLD="${TRIAGE_THRESHOLD:-3}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

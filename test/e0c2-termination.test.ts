@@ -35,24 +35,45 @@ afterEach(() => {
   }
 });
 
-function startFakeBus(port: number): Promise<void> {
+function startFakeBus(): Promise<number> {
   return new Promise((resolve, reject) => {
     const fixture = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+    let stdout = "";
     const child = spawn(process.execPath, [fixture], {
-      env: { ...process.env, A10B_BUS_PORT: String(port) },
-      stdio: "ignore",
+      env: { ...process.env, A10B_BUS_PORT: "0" },
+      stdio: ["ignore", "pipe", "ignore"],
     });
     runningBuses.push(child.pid as number);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
     const deadline = Date.now() + 5000;
-    const check = () => {
+    const check = (port: number) => {
       fetch(`http://127.0.0.1:${port}/v1/channels/_probe`)
-        .then(() => resolve())
+        .then(() => resolve(port))
         .catch(() => {
-          if (Date.now() > deadline) reject(new Error(`fake bus did not come up on ${port}`));
-          else setTimeout(check, 50);
+          if (Date.now() > deadline) reject(new Error("fake bus did not come up (kernel-assigned port)"));
+          else setTimeout(() => check(port), 50);
         });
     };
-    check();
+    child.on("error", (err) => reject(err));
+    // Wait for the fake bus to print its listening port
+    const parsePort = () => {
+      const m = stdout.match(/fakebus listening on (\d+)/);
+      if (m) {
+        const port = Number(m[1]);
+        if (port > 0) {
+          check(port);
+          return;
+        }
+      }
+      if (Date.now() > deadline) {
+        reject(new Error("fake bus did not output listening port"));
+        return;
+      }
+      setTimeout(parsePort, 50);
+    };
+    setTimeout(parsePort, 50);
   });
 }
 
@@ -179,10 +200,6 @@ function setupE0RegressionEnv(
 ): {
   dir: string;
   env: Record<string, string>;
-  busPort: number;
-  prodBusPort: number;
-  busUrl: string;
-  prodBusUrl: string;
   attemptFile: string;
   e0regression: string;
   recordRoot: string;
@@ -255,16 +272,9 @@ function setupE0RegressionEnv(
     }
   }
 
-  const busPort = 18000 + Math.floor(Math.random() * 1000);
-  const busUrl = `http://127.0.0.1:${busPort}`;
-  const prodBusPort = 19000 + Math.floor(Math.random() * 1000);
-  const prodBusUrl = `http://127.0.0.1:${prodBusPort}`;
-
   const env: Record<string, string> = {
-    AGENT_BUS_URL: busUrl,
     AGENT_BUS_TOKEN_FILE: tokenFile,
     E0_RECORD_ROOT: recordRoot,
-    E0C1_PROD_BUS_URL: prodBusUrl,
     E0C1_PROD_BUS_TOKEN_FILE: tokenFile,
     DD_RUN_ID: `test-e0c2-${Date.now()}-${Math.random().toString(36).slice(2)}`,
     PATH: process.env.PATH ?? "/usr/bin",
@@ -277,10 +287,6 @@ function setupE0RegressionEnv(
   return {
     dir,
     env,
-    busPort,
-    prodBusPort,
-    busUrl,
-    prodBusUrl,
     attemptFile,
     e0regression: join(binDir, "e0-regression.sh"),
     recordRoot,
@@ -717,7 +723,7 @@ describe("判据 6d (GT-8): head_seq read from list endpoint only", () => {
   });
 
   it("e0-regression.sh progress line contains numeric head_seq (not '?')", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression } = setupE0RegressionEnv(
+    const { dir, env, e0regression } = setupE0RegressionEnv(
       "null-then-converge",
       {
         terminationStates: [
@@ -726,7 +732,9 @@ describe("判据 6d (GT-8): head_seq read from list endpoint only", () => {
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).toBe(0);
@@ -782,7 +790,7 @@ describe("判据 6d (GT-8): head_seq read from list endpoint only", () => {
 
 describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regression.sh)", () => {
   it("max_rounds + exit 1 first drain, then converges ⇒ exit 0, both attempts made", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "maxrounds-then-converge",
       {
         terminationStates: [
@@ -791,7 +799,9 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regre
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).toBe(0);
@@ -807,7 +817,7 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regre
   });
 
   it("other non-zero exit code (e.g. 3) ⇒ immediate failure, non-zero exit, does not retry", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "other-exit-code",
       {
         terminationStates: [
@@ -815,7 +825,9 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regre
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
@@ -829,13 +841,15 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regre
   });
 
   it("unparseable drain output ⇒ immediate failure, non-zero exit, does not retry", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "unparseable",
       {
         terminationStates: [],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
@@ -974,7 +988,7 @@ describe("判据 4 (GT-4): empty board with null termination ⇒ still triggers 
 
 describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regression.sh)", () => {
   it("first drain null, second drain converged ⇒ runs both, exits 0", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "null-then-converge",
       {
         terminationStates: [
@@ -983,7 +997,9 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).toBe(0);
@@ -998,7 +1014,7 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
   });
 
   it("discriminant: if the implementation only ran one drain, null termination would NOT exit 0", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "null-then-converge",
       {
         terminationStates: [
@@ -1007,7 +1023,9 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).toBe(0);
@@ -1026,7 +1044,7 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
 
 describe("判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh)", () => {
   it("always null ⇒ hits attempt limit, non-zero exit naming the limit", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
@@ -1038,7 +1056,9 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
@@ -1051,7 +1071,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
   });
 
   it("always null ⇒ hits wall clock limit, non-zero exit naming the limit", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 10,
@@ -1062,7 +1082,9 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
@@ -1073,7 +1095,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
   });
 
   it("discriminant: never infinite loops (test completes in finite time)", async () => {
-    const { dir, env, busPort, prodBusPort, e0regression } = setupE0RegressionEnv(
+    const { dir, env, e0regression } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
@@ -1085,7 +1107,9 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
         ],
       },
     );
-    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);

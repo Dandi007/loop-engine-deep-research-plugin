@@ -1016,6 +1016,10 @@ export interface RunWriteOptions {
    * 注入后 `assembleGenerateDeps` 不执行。
    */
   generateDeps?: GenerateDeps;
+  /**
+   * E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。
+   */
+  triageThreshold?: number;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -1041,6 +1045,10 @@ export interface RunWriteOutcome {
    * `termination.coverage` / `termination.zeroGrowthRounds` 写进下一条 trigger 的 body。
    */
   termination: TerminationState;
+  /**
+   * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
+   */
+  triageThreshold: number;
 }
 
 /**
@@ -1514,7 +1522,11 @@ export async function runChannelWrite(
     }
   }
   const state = assembled.state;
-  const decisions = decideTick(state, DEFAULT_TICK_CONFIG);
+  const tickConfig = {
+    ...DEFAULT_TICK_CONFIG,
+    ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
+  };
+  const decisions = decideTick(state, tickConfig);
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
   const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
   const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
@@ -1654,7 +1666,7 @@ export async function runChannelWrite(
       prevCoverage: opts.prevCoverage ?? 0,
       prevZeroGrowthRounds: opts.prevZeroGrowthRounds ?? 0,
     },
-    DEFAULT_TICK_CONFIG,
+    tickConfig,
   );
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
@@ -1684,6 +1696,7 @@ export async function runChannelWrite(
     triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
+    triageThreshold: tickConfig.triageThreshold,
   };
 }
 
@@ -1774,6 +1787,8 @@ export interface RunCliOptions {
   docChannelId?: string;
   /** G4c —— 一次性标记文件目录（--one-shot-dir）；跨进程持久。 */
   oneShotDir?: string;
+  /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
+  triageThreshold?: number;
 }
 
 /**
@@ -1796,6 +1811,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let origin: string | undefined;
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
+  let triageThreshold: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1870,6 +1886,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
         );
       }
       i += 1;
+    } else if (args[i] === "--triage-threshold") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c3b: invalid --triage-threshold (must be a positive integer).",
+        );
+      }
+      triageThreshold = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1884,6 +1909,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     origin,
     docChannelId,
     oneShotDir,
+    triageThreshold,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

@@ -16,6 +16,8 @@ pipelines:
       research_origin: ${RESEARCH_ORIGIN}
       # G4c —— doc channel（--doc-channel）一路注入到 tick.md：由 bin 导出 DOC_CHANNEL（无缺省）。
       doc_channel: ${DOC_CHANNEL}
+      # E0c3 —— triage 门限（--triage-threshold）一路注入到 tick.md：由 bin 导出 TICK_TRIAGE_THRESHOLD（缺省 3）。
+      triage_threshold: ${TICK_TRIAGE_THRESHOLD}
       # A9 —— 触发存储一路注入到 tick.md：tick 依 hasPendingWork 决定是否续投下一条触发。
       trigger_store_dir: ${TRIGGER_STORE_DIR}
       loop_store_cli: ${LOOP_STORE_CLI}

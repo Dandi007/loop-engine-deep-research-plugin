@@ -113,6 +113,8 @@ export MAX_WRITES="${MAX_WRITES:-64}"
 # D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
 # 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
 export EXPORT_ROOT="${EXPORT_ROOT:-}"
+# E0c3 —— triage 门限由 profile 声明（缺省 3，回归 profile 设 1 以解 GT-11 死锁）。
+export TICK_TRIAGE_THRESHOLD="${TICK_TRIAGE_THRESHOLD:-3}"
 # G4c —— 研究 origin（report 的 origin 字段）：从 pipeline input namespace 注入 tick.md 供 `--run --origin` 使用。
 # 可用 RESEARCH_ORIGIN 覆盖。⛔ 无内置缺省：编造的 origin 会让整场研究报告的溯源信息出错，
 # 且 bus 写入 append-only 不可回退。未配置时留空，tick.md 不传 --origin ⇒ 生成段不执行。

@@ -319,6 +319,56 @@ DRAIN_RECORDS=""
 
 mkdir -p "$RECORD_DIR/drain-rounds"
 
+# E0c3 §1.2 —— 读板面构成（用于撞上限时打印 board composition + triage 门限死锁点名）。
+# 返回值：换行分隔的 "proposed=<n>\nopen=<m>\nin_flight=<k>\nexplored=<x>\nblocked=<y>"。
+# 失败时返回空串（板面不可读不阻断上限诊断）。
+_board_composition() {
+  local _inspect_out _inspect_code
+  set +e
+  _inspect_out="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" node "$PLUGIN_ROOT/node_modules/.bin/vite-node" \
+    "$PLUGIN_ROOT/src/tick-entry.ts" -- \
+    --inspect "$TICK_CHANNEL" 2>/dev/null)"
+  _inspect_code=$?
+  set -e
+  if [ "$_inspect_code" -ne 0 ] || [ -z "$_inspect_out" ]; then
+    return 0
+  fi
+  printf '%s' "$_inspect_out" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      try {
+        const o=JSON.parse(s);
+        const d=o.statusDistribution||{};
+        const p=d.proposed||0, op=d.open||0, inf=d['in_flight']||0, ex=d.explored||0, bl=d.blocked||0;
+        process.stdout.write('proposed='+p+'\\nopen='+op+'\\nin_flight='+inf+'\\nexplored='+ex+'\\nblocked='+bl+'\\n');
+      } catch(e) { process.stdout.write(''); }
+    });
+  " 2>/dev/null || true
+}
+
+# E0c3 §1.2 —— 在撞上限时打印板面构成与 triage 门限死锁（GT-11 诊断）。
+# 调用 _board_composition 读板面，若 proposed>0 且 proposed<triageThreshold 则点名死锁。
+_print_limit_hit() {
+  local _limit_label="$1"
+  local _board
+  _board="$(_board_composition)"
+  if [ -n "$_board" ]; then
+    echo "[e0-regression] board composition at limit hit: ${_board//$'\n'/, }" >&2
+    local _proposed _op _inf _ex _bl
+    _proposed=$(echo "$_board" | sed -n 's/^proposed=//p')
+    _op=$(echo "$_board" | sed -n 's/^open=//p')
+    _inf=$(echo "$_board" | sed -n 's/^in_flight=//p')
+    _ex=$(echo "$_board" | sed -n 's/^explored=//p')
+    _bl=$(echo "$_board" | sed -n 's/^blocked=//p')
+    if [ -n "$_proposed" ] && [ "$_proposed" -gt 0 ]; then
+      local _threshold="${TICK_TRIAGE_THRESHOLD:-3}"
+      if [ "$_proposed" -lt "$_threshold" ]; then
+        echo "[e0-regression] TRIAGE THRESHOLD DEADLOCK: proposed=${_proposed} < triageThreshold=${_threshold} (triage never triggers ⇒ proposed never cleared ⇒ terminal state unreachable, GT-11)" >&2
+      fi
+    fi
+  fi
+}
+
 _drain_fail_echo() {
   local attempt="$1" exit_code="$2" reason="$3"
   echo "[e0-regression] DRAIN FAILED (attempt ${attempt}): reason=${reason} exit=${exit_code}" >&2
@@ -329,23 +379,25 @@ _drain_fail_echo() {
 }
 
 while true; do
-  DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
-
-  # 墙钟上限检查
+  # 墙钟上限检查（E0c3 §1.3：在 drain 之前检查，使 DRAIN_ATTEMPT 反映实际已跑轮数）
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
     echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _print_limit_hit "wall_clock"
     LOOP_EXIT=4
     break
   fi
 
-  # 次数上限检查
-  if [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ]; then
+  # 次数上限检查（E0c3 §1.3：在 drain 之前检查，用 >= 使 drain_attempts 不超上限）
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
     echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _print_limit_hit "attempt_limit"
     LOOP_EXIT=4
     break
   fi
+
+  DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
 
   # ── 跑一次 drain ──
   set +e

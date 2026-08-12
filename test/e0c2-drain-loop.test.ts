@@ -6,13 +6,18 @@
  * 判据 6（上限判别性）：termination.state 永远为 null ⇒ 撞到 profile 声明的上限时非零退出，
  *   且点名撞的是哪个上限（drain 次数或墙钟）；⛔ 不得无限循环。
  *
- * 测试分两层：
+ * 测试分三层：
  *   A. 逻辑层：用 readTerminationFromDrain 模拟跨 drain 的循环判定（判别性在于循环本身）。
- *   B. 入口层：验证 bin/e0-regression.sh 真的包含循环结构、上限检查、退避、每轮记录，
- *      且 deep-research-loop.sh 在跨 drain 时跳过 seed（GT-3 续投链不断）。
+ *   B. 源码层：验证 bin/e0-regression.sh 真的包含循环结构、上限检查、退避、每轮记录。
+ *   C. 入口执行层（评审 blocker 修复）：真跑 bin/e0-regression.sh 的跨 drain 循环——
+ *      用假 bus / 假 loop-engine CLI / 预置 journal 驱动入口的真实 bash 循环，
+ *      断言判据 5（第二轮后非 null ⇒ 退出 0）与判据 6（永远 null ⇒ 撞上限非零退出并点名）。
  */
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,13 +180,304 @@ describe("§2 判据 5,6 entry-level: e0-regression.sh contains cross-drain loop
   });
 });
 
-describe("§2 判据 5 (GT-3): deep-research-loop.sh skips seed when open triggers exist", () => {
-  it("driver checks list open before seeding and skips seed when triggers already exist", () => {
-    // GT-3 跨 drain 续投链：deep-research-loop.sh 在 store 已有 open 触发时跳过 seed。
-    // ⛔ 没有这个跳过 ⇒ 第二次 drain 再投 seed（body={"seed":true}）⇒ tick 以 firstRound 重置计数器。
+describe("§2 判据 5 (GT-3): deep-research-loop.sh puts a seed trigger unconditionally (no unevidenced `list open` contract)", () => {
+  it("driver does NOT depend on an unevidenced `list open` store-cli subcommand (judging 8: E0c1 behavior preserved)", () => {
+    // 评审 major 修复（attempt 1 final REJECT）：上一版在 put 前加了 `loop-store list open` 门，
+    //   但 `list` 子命令在 spec §0 GT 与 dev-notes 里都无实测依据（只有 put 与 claim open done tick
+    //   被记录为已测量）。若真实 store-cli 无 list，每次调用（含生产 agent-harness 路径）都会 exit 3，
+    //   regress E0c1 行为（判据 8）。该门只被返回 "[]" 的假 runner 满足——正是 §0「为观察不到的产物
+    //   发明契约、再写 fixture 满足它」的形状。
+    //   判别性：把 list 门加回来 ⇒ 这两个断言变红（list open / REFUSING 重新出现）。
     const driver = readFileSync(DRIVER_SCRIPT, "utf8");
-    expect(driver).toMatch(/list open/);
-    expect(driver).toMatch(/skipping seed/);
-    // 判别性：删掉跳过逻辑 ⇒ seed 总被执行 ⇒ 续投链断裂 ⇒ 变红
+    // ⛔ 驱动不得调 list 子命令（unevidenced contract）。匹配实际调用形态（runner 调 store-cli 时带 list），
+    //   而非注释文字。
+    expect(driver).not.toMatch(/\$LOOP_STORE_CLI.*\blist\b/);
+    expect(driver).not.toMatch(/"\$TRIGGER_STORE_DIR"\s+(list|open)/);
+    expect(driver).not.toMatch(/failed to (list|enumerate) open triggers/);
+    expect(driver).not.toMatch(/skipping seed/);
+    // ✅ 驱动无条件 put 一条 open seed 触发（E0c1 单一证据源契约）。
+    expect(driver).toMatch(/"\$LOOP_ENGINE_RUNNER" "\$LOOP_STORE_CLI" "\$TRIGGER_STORE_DIR" put/);
+    // put payload 含 status:open + body:{seed:true}（bash 转义引号，故用宽松匹配）。
+    expect(driver).toMatch(/status.*open.*body.*\{.*seed.*true.*\}/);
   });
+});
+
+// ── 入口执行层（评审 blocker 修复：真跑 bin/e0-regression.sh 的跨 drain 循环）──────────
+//
+// 评审 blocker（attempt 1 final REJECT）：原判据 5/6 测试在测试内部 for-loop 调
+//   readTerminationFromDrain，从不执行 bin/e0-regression.sh 的 bash 循环。入口层只做源码 grep。
+//   ⇒ §1.1 那个 brace-free 正则 blocker 在该套件下永远不会被发现（正是 §0「用 fixture 证明契约」的形状）。
+//   这里补一组**真跑入口**的判别性测试：用假 bus + 假 loop-engine CLI + 预置 journal 驱动入口真实 bash 循环。
+
+/** 假 bus：接受任意 channel GET/POST（channel 预备 / publish / messages 读），返回最小 200 JSON。 */
+function startFakeBus(): Promise<{ base: string; close: () => void }> {
+  return new Promise((r) => {
+    const server = createServer((req, res) => {
+      const url = req.url ?? "";
+      res.writeHead(200, { "Content-Type": "application/json" });
+      // GET /v1/channels（列表端点，prod-read 用）：返回空 channels（sum=0）。
+      if (url === "/v1/channels" || url.startsWith("/v1/channels?")) {
+        res.end(JSON.stringify({ channels: [] }));
+        return;
+      }
+      // POST /v1/channels（建 channel）：返回 ok。
+      if (url === "/v1/channels" && req.method === "POST") {
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // POST .../publish：返回 publish 形状（seed 用）。
+      if (url.endsWith("/publish")) {
+        res.end(JSON.stringify({ message_id: "m", channel_seq: 1, deduplicated: false }));
+        return;
+      }
+      // 其余（GET 单 channel / messages）：返回 head_seq=0、空 messages。
+      res.end(JSON.stringify({ ok: true, head_seq: 0, messages: [] }));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      r({ base: `http://127.0.0.1:${port}`, close: () => server.close() });
+    });
+  });
+}
+
+/**
+ * 搭一套驱动入口跑到 drain 循环所需的假环境：
+ *   - 假 loop-engine CLI：每次被 drain 调用时打印一条 drain 摘要 JSON（drain_id 按 invocation 递增）。
+ *   - 假 store-cli：no-op（put 落盘无关紧要；deep-research-loop.sh 只检查它存在）。
+ *   - 假 runner：bash，直接 exec node 跑假 CLI（让 deep-research-loop.sh 的 put/drain 都走 runner）。
+ *   - LOOP_ENGINE_RUNTIME_ROOT：预置 index.jsonl + 每个 drain_id 对应的 journal.jsonl，
+ *     让 src/e0c2-termination-read.ts 按 states 序列读出每轮的 termination.state。
+ *
+ * states: 每一轮 drain 对应的 termination.state（null 或 converged/capped/partial）。
+ *   假 CLI 第 i 次被调打印 drain_id=`drain-<i>`；预置 journal 让该 drain_id 读到 states[i-1]。
+ */
+function setupEntryEnv(opts: {
+  states: (string | null)[];
+  busBase: string;
+  /** 覆盖默认上限（判据 6 用小值让测试在有限时间内撞上限）。 */
+  maxAttempts?: number;
+  maxWall?: number;
+  backoff?: number;
+}): {
+  dir: string;
+  cli: string;
+  storeCli: string;
+  runner: string;
+  runtimeRoot: string;
+  tokenFile: string;
+  recordRoot: string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "e0c2-entry-"));
+  mkdirSync(join(dir, "dist", "lib"), { recursive: true });
+  const cli = join(dir, "dist", "cli.js");
+  const storeCli = join(dir, "dist", "lib", "store-cli.js");
+
+  // 假 loop-engine CLI：argv 形如 `<runner> <cli> drain <fleet> --label deep-research`。
+  // 每次被调（drain）打印第 N 条 drain 摘要，drain_id=drain-<N>（N 由文件计数）。
+  // 摘要形状照抄 spec §0 GT-1（含嵌套 ticksByLabel 对象——正是上一版 brace-free 正则匹配不到的形状）。
+  const counterFile = join(dir, "drain-counter");
+  writeFileSync(counterFile, "0");
+  writeFileSync(
+    cli,
+    `#!/usr/bin/env node\n` +
+      `const fs = require("fs");\n` +
+      `// 仅在 drain 调用时打印摘要（put 由 store-cli 处理；这里只处理 cli.js 的 drain）。\n` +
+      `const n = parseInt(fs.readFileSync(${JSON.stringify(counterFile)}, "utf8"), 10) + 1;\n` +
+      `fs.writeFileSync(${JSON.stringify(counterFile)}, String(n));\n` +
+      `const drainId = "drain-" + n;\n` +
+      `// 照抄 GT-1 的嵌套形状：ticksByLabel 是嵌套对象，drain_id 在其后。\n` +
+      `console.log(JSON.stringify({ reason: "drained", rounds: 1, ticksByLabel: { tick: 1 }, runs_root: ${JSON.stringify(join(dir, "runs"))}, drain_id: drainId }));\n` +
+      `process.exit(0);\n`,
+  );
+  chmodSync(cli, 0o755);
+
+  // 假 store-cli：no-op（deep-research-loop.sh 的 put 只需 exit 0）。
+  writeFileSync(storeCli, "#!/usr/bin/env node\n// no-op\n");
+  chmodSync(storeCli, 0o755);
+
+  // 假 runner：直接用 node 跑被给的 CLI 脚本（让 put/drain 都经 runner，F4 同款）。
+  const runner = join(dir, "runner");
+  writeFileSync(
+    runner,
+    `#!/usr/bin/env bash\n` +
+      `exec node "$@"\n`,
+  );
+  chmodSync(runner, 0o755);
+
+  // 预置 runtime root：index.jsonl 列出每个 drain_id 的 lane 条目；每个 run_dir 下 journal.jsonl
+  // 含一条 identity=="tick" 的 result（termination.state = states[i]）。
+  const runtimeRoot = join(dir, "runtime");
+  mkdirSync(join(runtimeRoot, "runs"), { recursive: true });
+  const indexLines: string[] = [];
+  opts.states.forEach((state, i) => {
+    const drainId = `drain-${i + 1}`;
+    const runDir = join(runtimeRoot, "runs", drainId);
+    mkdirSync(runDir, { recursive: true });
+    const termJson = JSON.stringify({
+      hasPendingWork: false,
+      termination: {
+        state,
+        coverage: state === null ? 0 : 1,
+        zeroGrowthRounds: state === null ? 1 : 2,
+        capHit: false,
+      },
+    });
+    writeFileSync(
+      join(runDir, "journal.jsonl"),
+      JSON.stringify({ run_id: "tick~1", identity: "tick", result: termJson }) + "\n",
+    );
+    indexLines.push(JSON.stringify({ drain_id: drainId, lane: "tick", run_dir: runDir }));
+  });
+  writeFileSync(join(runtimeRoot, "index.jsonl"), indexLines.join("\n") + "\n");
+
+  // 测试 token 文件（入口 AGENT_BUS_TOKEN_FILE 读它；不能落 /data/agent-bus/ 下，否则护栏拒）。
+  const tokenFile = join(dir, "token");
+  writeFileSync(tokenFile, "FAKE_TEST_TOKEN");
+
+  const recordRoot = join(dir, "e0-records");
+  mkdirSync(recordRoot, { recursive: true });
+
+  return { dir, cli, storeCli, runner, runtimeRoot, tokenFile, recordRoot };
+}
+
+function runEntry(env: NodeJS.ProcessEnv): Promise<{ code: number; out: string; err: string }> {
+  // 用 spawn（异步）而非 execFileSync：入口会 curl 假 bus，node 的 http server 只在事件循环里处理请求，
+  // execFileSync/spawnSync 会阻塞事件循环 ⇒ curl 永远收不到响应 ⇒ 死锁。
+  return new Promise((resolvePromise) => {
+    const child = spawn("bash", [E0_SCRIPT], {
+      cwd: ROOT,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolvePromise({ code: -1, out, err: err + "\n<timeout: killed>" });
+    }, 60000);
+    // 用 close（不是 exit）：入口用 `exec 1> >(tee ...)` 把 fd 喂给后台 tee 子进程，
+    // bash 退出后 tee 还在刷缓冲；close 事件在所有 stdio 流关闭后才触发，确保收齐全部输出。
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolvePromise({ code: code ?? -1, out, err });
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolvePromise({ code: -1, out, err });
+    });
+  });
+}
+
+/** 组装跑入口所需的完整 env（profile 默认 e0-regression，但用小上限覆盖 E0_DRAIN_*）。 */
+function entryEnv(opts: {
+  states: (string | null)[];
+  busBase: string;
+  maxAttempts: number;
+  maxWall: number;
+  backoff: number;
+}): NodeJS.ProcessEnv {
+  const setup = setupEntryEnv({ states: opts.states, busBase: opts.busBase });
+  return {
+    // 保留 PATH / HOME（node / vite-node / bash 可解析）。
+    PATH: process.env.PATH ?? "",
+    HOME: process.env.HOME ?? "",
+    // 测试总线（假 bus）：护栏放行（不指向 7490，token 不在 /data/agent-bus/ 下）。
+    AGENT_BUS_URL: opts.busBase,
+    AGENT_BUS_TOKEN_FILE: setup.tokenFile,
+    // 生产总线读数也指向假 bus（返回 head_seq=0 的最小 JSON，sum=0）。
+    E0C1_PROD_BUS_URL: opts.busBase,
+    E0C1_PROD_BUS_TOKEN_FILE: setup.tokenFile,
+    // 记录根 → 临时目录（不在 /data/loop-engine/e0-runs 下留垃圾）。
+    E0_RECORD_ROOT: setup.recordRoot,
+    // loop-engine 假 CLI / 假 store-cli / 假 runner。
+    LOOP_ENGINE_CLI: setup.cli,
+    LOOP_STORE_CLI: setup.storeCli,
+    LOOP_ENGINE_RUNNER: setup.runner,
+    // 终态读取的 runtime root（预置了 index.jsonl + journal.jsonl）。
+    LOOP_ENGINE_RUNTIME_ROOT: setup.runtimeRoot,
+    // 跨 drain 上限（用小值，让判据 6 在有限时间内撞上限；判据 5 用 2 轮就够）。
+    E0_DRAIN_BACKOFF_SECONDS: String(opts.backoff),
+    E0_DRAIN_MAX_WALL_SECONDS: String(opts.maxWall),
+    E0_DRAIN_MAX_ATTEMPTS: String(opts.maxAttempts),
+    // 固定 run id（便于断言记录目录里的文件名）。
+    DD_RUN_ID: "e0c2-entry-test",
+  };
+}
+
+describe("§2 判据 5 (GT-3) entry-execution: first drain null, second drain non-null ⇒ entry exits 0", () => {
+  it("entry's real bash loop runs drain 1 (null), backs off, runs drain 2 (converged) ⇒ exit 0", async () => {
+    const bus = await startFakeBus();
+    try {
+      // ⛔ 判据 5 核心：真跑 bin/e0-regression.sh 的跨 drain 循环。
+      //   states=[null, "converged"]：drain 1 读到 null（继续），drain 2 读到 converged（收尾）。
+      //   评审 blocker：原测试只在测试里 for-loop 调 readTerminationFromDrain，从不执行入口的 bash 循环；
+      //   这里真跑，断言入口确实跑了两轮 drain（drain-1 与 drain-2 的 stdout 落盘文件都存在）且退出 0。
+      const env = entryEnv({
+        states: [null, "converged"],
+        busBase: bus.base,
+        maxAttempts: 5,
+        maxWall: 120,
+        backoff: 1,
+      });
+      const res = await runEntry(env);
+      expect(res.code, `stdout: ${res.out}\nstderr: ${res.err}`).toBe(0);
+
+      // 入口确实跑了第二轮 drain（判据 5 判别性核心：改回只跑一次 drain ⇒ drain-2 文件不存在 ⇒ 变红）。
+      const recordDir = join(env.E0_RECORD_ROOT!, "e0c2-entry-test");
+      expect(existsSync(join(recordDir, "drain-1.stdout.log"))).toBe(true);
+      expect(existsSync(join(recordDir, "drain-2.stdout.log"))).toBe(true);
+
+      // 进度行点名 converged（第二轮的 termination.state）。
+      expect(res.out).toMatch(/termination\.state=converged/);
+      // drain-attempts.jsonl 记了两轮（不只最后一轮）。
+      const attempts = readFileSync(join(recordDir, "drain-attempts.jsonl"), "utf8").trim().split("\n");
+      expect(attempts.length).toBe(2);
+      const a1 = JSON.parse(attempts[0]);
+      const a2 = JSON.parse(attempts[1]);
+      expect(a1.termination_state).toBeNull();
+      expect(a2.termination_state).toBe("converged");
+      // §1.3 minor：每轮的 runs_root 都进了记录。
+      expect(typeof a1.runs_root).toBe("string");
+      expect(typeof a2.runs_root).toBe("string");
+      // 真实 drain reason（不是 parse_error）—— 评审 blocker：原 brace-free 正则让 reason 永远 parse_error。
+      expect(a1.reason).toBe("drained");
+      expect(a2.reason).toBe("drained");
+    } finally {
+      bus.close();
+    }
+  }, 90000);
+});
+
+describe("§2 判据 6 (limits) entry-execution: state never non-null ⇒ entry hits attempt limit, non-zero exit, names the limit", () => {
+  it("all drains return null ⇒ entry hits E0_DRAIN_MAX_ATTEMPTS, exits non-zero, names 'drain count limit'", async () => {
+    const bus = await startFakeBus();
+    try {
+      // ⛔ 判据 6 核心：真跑 bin/e0-regression.sh 的跨 drain 循环，termination.state 永远 null。
+      //   maxAttempts=2（小值，让测试在有限时间内撞上限）。退避 1 秒（非零间隔，但测试要快）。
+      //   评审 blocker：原测试只在测试里 for-loop，从不执行入口的上限检查；这里真跑，断言入口
+      //   确实在 maxAttempts 停（不是无限循环）、非零退出、且点名「drain count limit」。
+      const env = entryEnv({
+        states: [null, null, null, null, null],
+        busBase: bus.base,
+        maxAttempts: 2,
+        maxWall: 120,
+        backoff: 1,
+      });
+      const res = await runEntry(env);
+      expect(res.code, `stdout: ${res.out}\nstderr: ${res.err}`).not.toBe(0);
+
+      // 入口点名撞的是 drain count 上限（判据 6 判别性：点名是哪个上限）。
+      expect(res.err).toMatch(/hit drain count limit/);
+      // 入口确实跑了 maxAttempts 轮就停（不是无限循环，不是遍历全部 5 个预置 drain）。
+      const recordDir = join(env.E0_RECORD_ROOT!, "e0c2-entry-test");
+      expect(existsSync(join(recordDir, "drain-1.stdout.log"))).toBe(true);
+      expect(existsSync(join(recordDir, "drain-2.stdout.log"))).toBe(true);
+      // 没有第三轮（撞了 maxAttempts=2 上限就停）。
+      expect(existsSync(join(recordDir, "drain-3.stdout.log"))).toBe(false);
+    } finally {
+      bus.close();
+    }
+  }, 90000);
 });

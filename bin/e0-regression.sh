@@ -68,9 +68,9 @@ fi
 
 # §2.3.5 —— 归档入口命令自身的 stdout/stderr（profile-load、channel 预备等诊断行）。
 # 从入口一开始就把脚本自身的 stdout/stderr tee 进一个临时缓冲（同时回显到原终端），
-# 到记录目录就绪后由 EXIT trap 整体落入 run.entry.log；连同 loop 的 run.stdout.log /
-# run.stderr.log 共同构成「入口命令的完整 stdout/stderr」。护栏拒绝（exit 3）或更早的
-# 用法错误不建记录目录，缓冲随 trap 清理，不在仓内/记录根留下脏目录。
+# 到记录目录就绪后由 EXIT trap 整体落入 run.entry.log；连同每轮 drain 的 drain-<n>.stdout.log /
+# drain-<n>.stderr.log 共同构成「入口命令与每次 drain 的完整 stdout/stderr」。护栏拒绝（exit 3）
+# 或更早的用法错误不建记录目录，缓冲随 trap 清理，不在仓内/记录根留下脏目录。
 ENTRY_TMP="$(mktemp)"
 exec 1> >(tee -a "$ENTRY_TMP")
 exec 2> >(tee -a "$ENTRY_TMP" >&2)
@@ -336,12 +336,42 @@ DRAIN_ATTEMPTS_LOG="$RECORD_DIR/drain-attempts.jsonl"
 #   任一步失败 ⇒ 响亮失败（⛔ 不回退 drain reason，spec §1.1）。
 #   返回 0 且 stdout=termination JSON（state 非 null 或 null）= 成功读到；
 #   返回非 0 = 链路某环断裂（已点名是哪一步）。
+
+# 评审 blocker 修复（attempt 1 final REJECT）：原实现用 `grep -oE '\{[^{}]*"drain_id"[^{}]*\}'`
+#   抽 drain 摘要——这是 brace-free 正则。真机摘要（spec §0 GT-1）是
+#   `{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"…","drain_id":"…"}`，
+#   在 drain_id 之前有嵌套对象（ticksByLabel），`[^{}]*` 会在到达 drain_id 前撞上嵌套 `{` ⇒ 永远匹配不到。
+#   改为逐行 JSON.parse（与 scripts/check-drain-failures.mjs 同款正确构造法）：把 stdout 按行切开，
+#   对每行尝试 JSON.parse，取最后一个解析成功且含字符串 drain_id 的对象。这能正确处理嵌套花括号，
+#   因为 JSON.parse 知道花括号配对，而正则不知道。
+#   stdout 传文件路径（$_stdout_file）；返回 0 且 stdout=抽出的 drain 摘要 JSON 原文，或返回 1。
+_extract_drain_summary_from_file() {
+  local _stdout_file="$1"
+  node -e '
+    const fs = require("fs");
+    const content = fs.readFileSync(process.argv[1], "utf8");
+    let last = null;
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const o = JSON.parse(trimmed);
+        if (o && typeof o === "object" && !Array.isArray(o) &&
+            typeof o.drain_id === "string" && o.drain_id.length > 0) {
+          last = trimmed;
+        }
+      } catch {}
+    }
+    if (last === null) process.exit(1);
+    process.stdout.write(last);
+  ' "$_stdout_file"
+}
+
 _read_termination_from_drain_stdout() {
   local _stdout_file="$1"
   # 从 stdout 文本抽出最后一个含 drain_id 的 JSON 行（deep-research-loop.sh 最后一段 cat 的 drain 摘要）。
   local _drain_summary
-  _drain_summary="$(grep -oE '\{[^{}]*"drain_id"[^{}]*\}' "$_stdout_file" | tail -1)"
-  if [ -z "$_drain_summary" ]; then
+  if ! _drain_summary="$(_extract_drain_summary_from_file "$_stdout_file")"; then
     echo "[e0-regression] §1.1: no drain summary (JSON with drain_id) found in deep-research-loop.sh stdout. Refusing to fall back to drain reason (spec §1.1)." >&2
     return 1
   fi
@@ -407,8 +437,20 @@ while :; do
     break
   fi
 
-  # 提取 drain reason（drain 摘要的 reason 字段）。
-  _drain_reason="$(grep -oE '\{[^{}]*"drain_id"[^{}]*\}' "$_drain_out" | tail -1 | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(String(o.reason??"unknown"))}catch{process.stdout.write("parse_error")}})' 2>/dev/null || printf 'parse_error')"
+  # 提取 drain reason（drain 摘要的 reason 字段）与 runs_root（§1.3 minor：每轮 runs_root 须进记录）。
+  # 评审 blocker 修复（attempt 1 final REJECT）：原用与 §1.1 同款 brace-free 正则抽摘要再取 reason，
+  #   在真机摘要（含嵌套 ticksByLabel 对象）上永远匹配不到 ⇒ reason 退化为 "parse_error"。
+  #   改为复用 _extract_drain_summary_from_file（逐行 JSON.parse，正确处理嵌套花括号）抽出摘要，
+  #   再 JSON.parse 取 reason / runs_root 字段。
+  _drain_reason="unknown"
+  _drain_runs_root=""
+  if _drain_summary_for_reason="$(_extract_drain_summary_from_file "$_drain_out" 2>/dev/null)"; then
+    _drain_reason="$(printf '%s' "$_drain_summary_for_reason" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);process.stdout.write(typeof o.reason==="string"&&o.reason.length>0?o.reason:"unknown")}catch{process.stdout.write("parse_error")}})' 2>/dev/null || printf 'parse_error')"
+    # §1.3 minor：runs_root 是真机摘要（GT-1）里的字段；解析不到时留空（不阻断终态判定）。
+    _drain_runs_root="$(printf '%s' "$_drain_summary_for_reason" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);if(typeof o.runs_root==="string")process.stdout.write(o.runs_root)}catch{}})' 2>/dev/null || true)"
+  fi
+  # runs_root 的 JSON 安全编码（含路径分隔符/空格等）：用 node 经 JSON.stringify 产出安全的 JSON 字符串字面量（含引号）。
+  _drain_runs_root_json="$(printf '%s' "$_drain_runs_root" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{process.stdout.write(JSON.stringify(s))})' 2>/dev/null || printf '""')"
 
   # §1.1 读本轮 termination.state（GT-2 路径）。
   _term_json=""
@@ -420,7 +462,7 @@ while :; do
     echo "[e0-regression] §1.1: failed to read termination.state from drain $_attempt (exit=$_term_exit). Spec §1.1: read failure is failure (⛔ must not fall back to drain reason)." >&2
     cat "$RECORD_DIR/drain-${_attempt}.term-read.err" >&2
     _TERMINATION_STATE="READ_FAILED"
-    printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"termination_state\":null,\"termination_read_error\":true,\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
+    printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"runs_root\":${_drain_runs_root_json},\"termination_state\":null,\"termination_read_error\":true,\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
     _LOOP_FINAL_EXIT=3
     break
   fi
@@ -438,7 +480,7 @@ while :; do
   if [ "$_TERMINATION_STATE" != "null" ] && [ "$_TERMINATION_STATE" != "parse_error" ]; then
     _term_state_json="\"$_TERMINATION_STATE\""
   fi
-  printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"termination_state\":${_term_state_json},\"tick_head_seq\":\"${_head_seq}\",\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
+  printf '%s\n' "{\"attempt\":${_attempt},\"exit\":0,\"reason\":\"${_drain_reason}\",\"runs_root\":${_drain_runs_root_json},\"termination_state\":${_term_state_json},\"tick_head_seq\":\"${_head_seq}\",\"elapsed_seconds\":${_elapsed}}" >> "$DRAIN_ATTEMPTS_LOG"
 
   # 非 null 终态 ⇒ 成功收尾。
   if [ "$_TERMINATION_STATE" != "null" ] && [ "$_TERMINATION_STATE" != "parse_error" ]; then

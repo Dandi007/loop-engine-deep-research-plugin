@@ -367,9 +367,17 @@ async function cliMain(): Promise<number> {
 // ⛔ 仅在作为 CLI 入口直接执行时才跑（被 import 时不跑——否则 vitest 导入本模块会因
 //    cliMain 读 stdin 而挂起）。与 e0c1-prod-read.ts / e0c1-runs-channel.ts 的区别：
 //    那两个从不被测试 import；本模块的纯函数被单测 import，故必须 guard。
+//
+// 评审 blocker（attempt 1 final REJECT，由 entry-execution 测试暴露）：原 guard 用
+//    `process.argv[1].includes("e0c2-termination-read")`。但 bash 入口经 vite-node 调起本模块时
+//    （`node vite-node src/e0c2-termination-read.ts "<summary>"`），vite-node 把脚本路径从 argv 消费掉、
+//    用自身二进制路径占 argv[1] ⇒ `argv[1]` 永远是 `.../vite-node`，不含模块名 ⇒ guard 永假 ⇒
+//    cliMain 从不跑 ⇒ 入口拿到的 termination JSON 恒空 ⇒ termination.state 恒 parse_error ⇒
+//    入口永远读不到非 null 终态 ⇒ 判据 5/6/9 永远过不了。
+//    改用 `argv[2]` 判定：bash 入口传入 drain 摘要 JSON 作为 argv[2]（非空字符串）⇒ CLI 模式；
+//    vitest 导入本模块时 argv[2] 恒为 undefined（实测 tinypool entry 无第三参数）⇒ 不跑 cliMain（不挂起）。
 const _isMainEntry =
-  process.argv[1] !== undefined &&
-  process.argv[1].includes("e0c2-termination-read");
+  process.argv[2] !== undefined && process.argv[2].length > 0;
 if (_isMainEntry) {
   process.exitCode = await cliMain();
 }

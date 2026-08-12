@@ -190,27 +190,19 @@ fi
 
 # A9 —— drain 之前投下首个触发（status:"open"），否则 claimableCount() 恒 0 ⇒ 0 tick。
 # 实测 loop-store 契约：put '{"id":"...","status":"open","body":{...}}' → 落盘 <id>.json。
-# E0c2 §1.3 / GT-3 —— 跨 drain 循环支持：若 store 里已有 open 触发（上一轮 drain 的续投 trigger
-#   仍在），**不再投新 seed**（新 seed body={"seed":true} 会让 tick 以 firstRound 语义重置
-#   zeroGrowthRounds 计数器，正是 GT-4 要修的计数丢失）。只有 store 为空（首次 drain）才投 seed。
-#   判据用 loop-store list open：返回非空数组 ⇒ 已有待处理触发 ⇒ 跳过 seed。
+#
+# 评审 major 修复（attempt 1 final REJECT）：上一版在 put 前加了 store-cli 的 `list`+`open` 查询门，
+#   想在跨 drain 续投时跳过 seed。但 `list` 子命令在 spec §0 GT 与 docs/dev-notes 里都**无实测依据**
+#   （只有 put 与 claim open done tick 被记录为已测量）。若真实 store-cli 无 list 子命令或输出形状不同，
+#   驱动会在每次调用（含生产 agent-harness profile 路径）上 exit 3，regress E0c1 行为（判据 8）。
+#   该门只被一个返回 "[]" 的假 runner 满足（test/a9-tick-trigger.test.ts），正是 §0「为观察不到的产物
+#   发明契约、再写 fixture 满足它」的形状。
+#   ⇒ 移除 list 门，恢复 E0c1 的无条件 put（单一证据源契约）。跨 drain 续投链由 bin/e0-regression.sh
+#   的外层循环（§1.3）+ tick.md 的续投 put（§1.2）共同保证；本驱动每次被调起就投一条 open seed 触发，
+#   `claim open` 会认领任意 open 触发（含上一轮 tick.md 投下的续投触发），无需 list。
 TRIGGER_ID="a9-$(date +%s%N)-$$"
-_EXISTING_OPEN=""
-set +e
-_EXISTING_OPEN="$("$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" list open 2>/dev/null)"
-_LIST_EC=$?
-set -e
-if [ "$_LIST_EC" -ne 0 ]; then
-  echo "[deep-research-loop] REFUSING to continue: failed to list open triggers (store-cli list exit=$_LIST_EC). Cannot determine whether to seed." >&2
-  exit 3
-fi
-# loop-store list 返回 JSON 数组；空数组 "[]" ⇒ 无 open 触发 ⇒ 投 seed。
-if printf '%s' "$_EXISTING_OPEN" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=JSON.parse(s);process.exit(Array.isArray(a)&&a.length===0?0:1)}catch{process.exit(2)}})'; then
-  "$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
-    "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
-else
-  echo "[deep-research-loop] skipping seed: open triggers already in store (cross-drain continuation; spec §1.3 / GT-3)." >&2
-fi
+"$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
+  "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"

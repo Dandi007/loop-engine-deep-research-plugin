@@ -120,19 +120,15 @@ function makeFakeEngine(): { dir: string; cli: string; storeCli: string; runner:
   const runner = join(dir, "runner");
   writeFileSync(cli, "// fake cli");
   writeFileSync(storeCli, "// fake store-cli");
-  // E0c2 §1.3 / GT-3：deep-research-loop.sh 现在在 seed 前调 `list open` 判断是否已有 open 触发。
-  //   fake runner 需对 `list` 调用返回空数组 "[]"（否则 seed 被跳过，F4/F5 断言不到 put）。
-  //   对 `put` 调用：照常记进 RUNNER_LOG（F4 断言依赖它）。
-  //   对 `drain` 调用：记进 RUNNER_LOG 且输出 drain 摘要 JSON（让驱动脚本正常往下走）。
+  // E0c2 §1.3 / GT-3（attempt 2 评审 major 修复）：deep-research-loop.sh 不再调 `list open`
+  //   （该子命令在 spec §0 GT 与 dev-notes 里都无实测依据，只在假 runner 里被满足——正是 §0
+  //   「为观察不到的产物发明契约」的形状）。现恢复 E0c1 的无条件 put（单一证据源契约）。
+  //   fake runner：记 argv 进 RUNNER_LOG（F4 断言 put/drain 调用形状）；drain 输出空（check-drain-failures
+  //   收到空 stdin ⇒ exit 0，不碰真实 runtime）。
   writeFileSync(
     runner,
     `#!/usr/bin/env bash\n` +
       `printf '%s\\n' "$@" >> "$RUNNER_LOG"\n` +
-      `# E0c2: list open ⇒ 返回空数组（store 里没有 open 触发 ⇒ 驱动正常 seed）\n` +
-      `for _a in "$@"; do\n` +
-      `  if [ "$_a" = "list" ]; then printf '%s' '[]'; exit 0; fi\n` +
-      `done\n` +
-      `# drain / 其它调用：不输出（check-drain-failures.mjs 收到空 stdin ⇒ exit 0，不碰真实 runtime）\n` +
       `exit 0\n`,
   );
   chmodSync(runner, 0o755);
@@ -182,13 +178,12 @@ describe("F4: driver puts a trigger into TRIGGER_STORE_DIR before drain", () => 
     });
     expect(res.code).toBe(0);
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    // E0c2 §1.3：驱动现在在 seed 前先调 list open（检查 store 是否已有 open 触发），
-    //   所以 log 里先有 list open 再有 put。用 indexOf 定位 put 调用（位置不再固定）。
-    const putIdx = lines.indexOf("put");
-    expect(putIdx, "runner log must contain a 'put' call").toBeGreaterThan(-1);
-    // put 调用的前两个参数是 storeCli 和 triggerStoreDir。
-    expect(lines[putIdx - 2]).toContain(fake.storeCli);
-    expect(lines[putIdx - 1]).toContain(join(runRoot, "stores", "trigger"));
+    // E0c2 §1.3（attempt 2 评审 major 修复）：驱动不再先调 list open，put 是第一条 runner 调用。
+    //   位置恢复固定：lines[0..2] = storeCli, triggerStoreDir, put；payload 在 put 的下一行。
+    //   判别性：若有人再把 list open 加回来，lines[2] 不再是 put ⇒ 变红。
+    expect(lines[0]).toBe(fake.storeCli);
+    expect(lines[1]).toContain(join(runRoot, "stores", "trigger"));
+    expect(lines[2]).toBe("put");
     // drain 调用：用 runner，不是 node。
     const drainIdx = lines.indexOf("drain");
     expect(drainIdx, "runner log must contain a 'drain' call").toBeGreaterThan(-1);
@@ -215,10 +210,10 @@ describe("F5: trigger record shape {id, status:'open', body} is claimable", () =
       RESEARCH_QUESTION: "test research question",
     });
     const lines = readFileSync(log, "utf8").trim().split("\n");
-    // E0c2 §1.3：用 indexOf 定位 put 调用，payload 在 put 的下一行。
-    const putIdx = lines.indexOf("put");
-    expect(putIdx).toBeGreaterThan(-1);
-    const payload = JSON.parse(lines[putIdx + 1]);
+    // E0c2 §1.3（attempt 2 评审 major 修复）：put 是第一条 runner 调用，payload 在 lines[3]。
+    //   判别性：若有人再把 list open 加回来，lines[3] 不再是 payload ⇒ JSON.parse 变红。
+    expect(lines[2]).toBe("put");
+    const payload = JSON.parse(lines[3]);
     expect(typeof payload.id).toBe("string");
     expect(payload.id.length).toBeGreaterThan(0);
     expect(payload.status).toBe("open");

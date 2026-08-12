@@ -68,8 +68,8 @@ fi
 
 # §2.3.5 —— 归档入口命令自身的 stdout/stderr（profile-load、channel 预备等诊断行）。
 # 从入口一开始就把脚本自身的 stdout/stderr tee 进一个临时缓冲（同时回显到原终端），
-# 到记录目录就绪后由 EXIT trap 整体落入 run.entry.log；连同 loop 的 run.stdout.log /
-# run.stderr.log 共同构成「入口命令的完整 stdout/stderr」。护栏拒绝（exit 3）或更早的
+# 到记录目录就绪后由 EXIT trap 整体落入 run.entry.log；连同 loop 的 drain-rounds/drain-N.{stdout,stderr}.log
+# 共同构成「入口命令的完整 stdout/stderr」。护栏拒绝（exit 3）或更早的
 # 用法错误不建记录目录，缓冲随 trap 清理，不在仓内/记录根留下脏目录。
 ENTRY_TMP="$(mktemp)"
 exec 1> >(tee -a "$ENTRY_TMP")
@@ -397,32 +397,42 @@ while true; do
   TERM_JSON=""
   if ! TERM_JSON="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>&1)"; then
     echo "[e0-regression] FAILED to read termination.state (attempt ${DRAIN_ATTEMPT}): ${TERM_JSON}" >&2
+    _drain_fail_echo "$DRAIN_ATTEMPT" "$DRAIN_EXIT" "read_termination_failed"
     LOOP_EXIT=5
     break
   fi
 
-  TERMINATION_STATE="$(printf '%s' "$TERM_JSON" | node -e "
+  if ! TERMINATION_STATE="$(printf '%s' "$TERM_JSON" | node -e "
     let s='';
     process.stdin.on('data',d=>s+=d).on('end',()=>{
       try { const o=JSON.parse(s.trim()); process.stdout.write(String(o.state||'null')); }
-      catch { process.stdout.write('null'); }
+      catch { process.stderr.write('E0c2: failed to parse termination JSON from read-termination output\n'); process.exit(1); }
     });
-  " 2>/dev/null)" || TERMINATION_STATE="null"
+  " 2>/dev/null)"; then
+    echo "[e0-regression] FAILED to extract termination.state from read-termination output (attempt ${DRAIN_ATTEMPT})" >&2
+    _drain_fail_echo "$DRAIN_ATTEMPT" "$DRAIN_EXIT" "termination_parse_failed"
+    LOOP_EXIT=5
+    break
+  fi
 
   # 读板面 head_seq（复用 E0c1 已交付的列表端点读法，GT-8）
   HEAD_SEQ="?"
-  HEAD_SEQ="$(curl -s -H "Authorization: Bearer $TOKEN" "$AGENT_BUS_URL/v1/channels" 2>/dev/null | node -e "
+  if HEAD_SEQ="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c2-head-seq.ts" "$TICK_CHANNEL" 2>/dev/null)"; then
+    : # HEAD_SEQ 已赋值
+  else
+    HEAD_SEQ="?"
+  fi
+
+  # 从摘要取 runs_root
+  DRAIN_RUNS_ROOT=""
+  DRAIN_RUNS_ROOT="$(printf '%s' "$DRAIN_SUMMARY" | node -e "
     let s='';
     process.stdin.on('data',d=>s+=d).on('end',()=>{
-      try {
-        const data=JSON.parse(s);
-        const channels=Array.isArray(data.channels)?data.channels:[];
-        const found=channels.find(c=>c.channel_id===process.argv[2]);
-        if(found&&typeof found.head_seq==='number') process.stdout.write(String(found.head_seq));
-        else process.stdout.write('?');
-      } catch { process.stdout.write('?'); }
+      try { const o=JSON.parse(s.trim()); process.stdout.write(String(o.runs_root||'')); }
+      catch { process.stdout.write(''); }
     });
-  " "$TICK_CHANNEL" 2>/dev/null)" || HEAD_SEQ="?"
+  " 2>/dev/null)" || DRAIN_RUNS_ROOT=""
 
   # 进度行
   echo "[e0-regression] drain #${DRAIN_ATTEMPT}: reason=${DRAIN_REASON} termination.state=${TERMINATION_STATE} head_seq=${HEAD_SEQ}"
@@ -431,6 +441,7 @@ while true; do
   DRAIN_RECORDS="${DRAIN_RECORDS}drain_attempt_${DRAIN_ATTEMPT}_reason=${DRAIN_REASON} "
   DRAIN_RECORDS="${DRAIN_RECORDS}termination_state=${TERMINATION_STATE} "
   DRAIN_RECORDS="${DRAIN_RECORDS}head_seq=${HEAD_SEQ} "
+  DRAIN_RECORDS="${DRAIN_RECORDS}runs_root=${DRAIN_RUNS_ROOT} "
   DRAIN_RECORDS="${DRAIN_RECORDS}exit=${DRAIN_EXIT}\n"
 
   # 终态非 null ⇒ 成功收尾

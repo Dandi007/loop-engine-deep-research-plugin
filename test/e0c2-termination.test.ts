@@ -680,24 +680,22 @@ describe("判据 7 (GT-5): tick.md continuation runs under zsh -c", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 6d (GT-8): 单 channel GET 不返回 head_seq
+// 判据 6d (GT-8): 单 channel GET 不返回 head_seq；head_seq 只能从列表端点读
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 6d (GT-8): single channel GET does not return head_seq", () => {
+describe("判据 6d (GT-8): head_seq read from list endpoint only", () => {
   it("fake-bus.mjs single channel GET handler response body excludes head_seq", () => {
     const fakeBusPath = join(ROOT, "test", "fixtures", "fake-bus.mjs");
     const busCode = readFileSync(fakeBusPath, "utf8");
     // The response body for single channel GET should not include head_seq
     // (GT-8: head_seq is only on the list endpoint).
     // Check the send(200, {...}) block for the handler.
-    // Find the first send(200, { after the single-channel GET handler pattern
     const handlerIdx = busCode.indexOf("if (req.method === \"GET\" && /^\\/v1\\/channels\\/[^/]+$/.test(path))");
     if (handlerIdx >= 0) {
       const handlerBlock = busCode.slice(handlerIdx);
       const sendIdx = handlerBlock.indexOf("return send(200, {");
       if (sendIdx >= 0) {
         const afterSend = handlerBlock.slice(sendIdx + 17);
-        // Find the matching closing brace
         let depth = 1;
         let endIdx = 0;
         for (let i = 0; i < afterSend.length; i++) {
@@ -708,7 +706,6 @@ describe("判据 6d (GT-8): single channel GET does not return head_seq", () => 
           }
         }
         const bodyBlock = afterSend.slice(0, endIdx);
-        // Check that head_seq is not a key in the body (comments are fine)
         const nonComment = bodyBlock.split("\n").filter(l => !l.trim().startsWith("//") && !l.trim().startsWith("*"));
         const hasHeadSeqKey = nonComment.some(l => /\bhead_seq\s*:/.test(l));
         expect(hasHeadSeqKey).toBe(false);
@@ -717,6 +714,64 @@ describe("判据 6d (GT-8): single channel GET does not return head_seq", () => 
     expect(busCode).toMatch(/channel_id/);
     expect(busCode).toMatch(/delivery_mode/);
     expect(busCode).toMatch(/owner_agent_id/);
+  });
+
+  it("e0-regression.sh progress line contains numeric head_seq (not '?')", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression } = setupE0RegressionEnv(
+      "null-then-converge",
+      {
+        terminationStates: [
+          { drainId: "fake-drain-attempt-1", state: null },
+          { drainId: "fake-drain-attempt-2", state: "converged" },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).toBe(0);
+      // The progress line should contain a numeric head_seq (not "?"),
+      // because the implementation reads from the list endpoint via src/e0c2-head-seq.ts.
+      // The fake-bus list endpoint returns head_seq correctly.
+      expect(res.out).toMatch(/head_seq=\d+/);
+      // Also verify head_seq is not "?"
+      expect(res.out).not.toMatch(/head_seq=\?/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discriminant: if implementation used single-channel GET, head_seq would be '?'", async () => {
+    // The fake-bus single-channel GET handler does NOT return head_seq.
+    // If the implementation bypassed the list endpoint and read from
+    // single-channel GET, head_seq would be "?" (the fallback).
+    // This test verifies the fixture condition: single-channel GET has no head_seq.
+    const fakeBusPath = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+    const busCode = readFileSync(fakeBusPath, "utf8");
+    // Verify the single-channel GET response body explicitly excludes head_seq
+    const handlerIdx = busCode.indexOf("if (req.method === \"GET\" && /^\\/v1\\/channels\\/[^/]+$/.test(path))");
+    expect(handlerIdx).toBeGreaterThanOrEqual(0);
+    const handlerBlock = busCode.slice(handlerIdx);
+    const sendIdx = handlerBlock.indexOf("return send(200, {");
+    expect(sendIdx).toBeGreaterThanOrEqual(0);
+    const afterSend = handlerBlock.slice(sendIdx + 17);
+    let depth = 1;
+    let endIdx = 0;
+    for (let i = 0; i < afterSend.length; i++) {
+      if (afterSend[i] === "{") depth++;
+      if (afterSend[i] === "}") {
+        depth--;
+        if (depth === 0) { endIdx = i; break; }
+      }
+    }
+    const bodyBlock = afterSend.slice(0, endIdx);
+    // Check that head_seq is NOT in the single-channel GET response body
+    expect(bodyBlock).not.toMatch(/\bhead_seq\s*:/);
+    // But the list endpoint handler DOES return head_seq
+    const listHandlerIdx = busCode.indexOf("if (req.method === \"GET\" && path === \"/v1/channels\")");
+    expect(listHandlerIdx).toBeGreaterThanOrEqual(0);
+    const listBlock = busCode.slice(listHandlerIdx);
+    expect(listBlock).toMatch(/head_seq/);
   });
 });
 
@@ -794,9 +849,123 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regre
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 4: 板面已排空但 termination.state 仍为 null 且未触顶 ⇒ 仍然续投
-// （已在 a9-tick-trigger.test.ts 和 a10b-convergence.test.ts 中验证）
+// 判据 4 (GT-4): 板面已排空但 termination.state 仍为 null 且未触顶 ⇒ 仍然续投
+// 判别性：把续投门改回只看 hasPendingWork ⇒ 测试变红
 // ══════════════════════════════════════════════════════════════════════
+
+describe("判据 4 (GT-4): empty board with null termination ⇒ still triggers continuation", () => {
+  it("hasPendingWork=false, state=null, capHit=false ⇒ continuation triggered", () => {
+    const dir = mkdtempSync(join(tmpdir(), "e0c2-c4-"));
+    const tickEntry = join(dir, "tick-entry");
+    const realEntry = join(ROOT, "src", "tick-entry.ts");
+    const viteNode = join(ROOT, "node_modules", ".bin", "vite-node");
+    writeFileSync(
+      tickEntry,
+      `#!/usr/bin/env bash\nset -euo pipefail\nif [ "\${1:-}" = "--parse-trigger-body" ]; then\n  exec "${viteNode}" "${realEntry}" --parse-trigger-body "$2"\nfi\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 5, "zeroGrowthRounds": 2, "capHit": false}}'\n`,
+    );
+    chmodSync(tickEntry, 0o755);
+    const runner = join(dir, "runner");
+    writeFileSync(runner, `#!/usr/bin/env bash\nprintf '%s\\n' "$4" >> "${dir}/puts.log"\n`);
+    chmodSync(runner, 0o755);
+    const storeDir = join(dir, "store");
+    mkdirSync(storeDir, { recursive: true });
+    writeFileSync(join(dir, "puts.log"), "");
+
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, "research:test-c4")
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{research_origin\}\}/g, "")
+      .replace(/\{\{doc_channel\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, storeDir)
+      .replace(/\{\{loop_store_cli\}\}/g, join(dir, "store-cli.js"))
+      .replace(/\{\{loop_engine_runner\}\}/g, runner)
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":4,"zeroGrowthRounds":1}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+
+    let code = 0;
+    let err = "";
+    try {
+      execFileSync("zsh", [outShell], {
+        cwd: dir,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      const ee = e as { status?: number; stderr?: string | Buffer };
+      code = ee.status ?? -1;
+      err = String(ee.stderr ?? "");
+    }
+    expect(code).toBe(0);
+    const puts = readFileSync(join(dir, "puts.log"), "utf8").trim();
+    expect(puts).toBeTruthy();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("discriminant: changing gate to hw-only stops continuation when hasPendingWork=false", () => {
+    const dir = mkdtempSync(join(tmpdir(), "e0c2-c4-disc-"));
+    const tickEntry = join(dir, "tick-entry");
+    const realEntry = join(ROOT, "src", "tick-entry.ts");
+    const viteNode = join(ROOT, "node_modules", ".bin", "vite-node");
+    writeFileSync(
+      tickEntry,
+      `#!/usr/bin/env bash\nset -euo pipefail\nif [ "\${1:-}" = "--parse-trigger-body" ]; then\n  exec "${viteNode}" "${realEntry}" --parse-trigger-body "$2"\nfi\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 5, "zeroGrowthRounds": 2, "capHit": false}}'\n`,
+    );
+    chmodSync(tickEntry, 0o755);
+    const runner = join(dir, "runner");
+    writeFileSync(runner, `#!/usr/bin/env bash\nprintf '%s\\n' "$4" >> "${dir}/puts.log"\n`);
+    chmodSync(runner, 0o755);
+    const storeDir = join(dir, "store");
+    mkdirSync(storeDir, { recursive: true });
+    writeFileSync(join(dir, "puts.log"), "");
+
+    const tpl = readFileSync(TICK_MD, "utf8");
+    // Discriminant: change the continuation gate from hw || (stateIsNull && !capHit) to just hw
+    const modifiedTpl = tpl.replace(
+      "const shouldContinue = hw || (stateIsNull && !capHit);",
+      "const shouldContinue = hw;",
+    );
+    const script = modifiedTpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, "research:test-c4-disc")
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{research_origin\}\}/g, "")
+      .replace(/\{\{doc_channel\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, storeDir)
+      .replace(/\{\{loop_store_cli\}\}/g, join(dir, "store-cli.js"))
+      .replace(/\{\{loop_engine_runner\}\}/g, runner)
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":4,"zeroGrowthRounds":1}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+
+    let code = 0;
+    try {
+      execFileSync("zsh", [outShell], {
+        cwd: dir,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      const ee = e as { status?: number; stderr?: string | Buffer };
+      code = ee.status ?? -1;
+    }
+    expect(code).toBe(0);
+    const puts = readFileSync(join(dir, "puts.log"), "utf8").trim();
+    // With hw-only gate and hasPendingWork=false, no trigger should be put
+    expect(puts).toBeFalsy();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 // ══════════════════════════════════════════════════════════════════════
 // 判据 5 (GT-3): 跨 drain 循环直到终态收敛

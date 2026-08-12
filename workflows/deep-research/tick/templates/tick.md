@@ -65,6 +65,9 @@ if [ -n "$tick_channel" ]; then
   #      两份解析器会静默发散，且原内嵌脚本用 fixed-name scratch file trigger_body_err.txt
   #      写入 tick 节点 CWD，CWD 不可写时 redirect 失败被误归因为「trigger body 坏」。
   #      现改为直接捕获子进程 stderr（command substitution 内 2>&1 不可靠，故用临时文件经 mktemp）。
+  #   ⛔ GT-5（E0c2b §1.2）：tick.md 由 loop-engine 用 `zsh -c` 执行，原 `IFS=$'\t' read -r -a prev_arr`
+  #      是 bash-only 语法（zsh 的 read 无 -a，从第二轮起必死）。改为 `tr '\t' '\n'` + while read 的
+  #      **zsh/bash 通吃**写法（不依赖任一 shell 的数组 read），把 tab 分隔的 prev_line 拆成 argv。
   prev_args=()
   if [ -n "$trigger_body" ]; then
     parse_err="$(mktemp -t g4b_parse_err.XXXXXX)" || { echo "[tick] mktemp failed for trigger_body parse stderr" >&2; exit 1; }
@@ -75,53 +78,84 @@ if [ -n "$tick_channel" ]; then
     fi
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
-      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"。
+      # GT-5：⛔ 不用 `read -a`（bash-only，zsh 第二轮起必死）；改用 tr 把 tab 换成换行，
+      #       逐行 read 进数组 —— bash 与 zsh 通吃，无 shell-only 数组 read。
+      while IFS= read -r _tok; do
+        [ -n "$_tok" ] || continue
+        prev_args+=("$_tok")
+      done <<EOF_PREV
+$(printf '%s' "$prev_line" | tr '\t' '\n')
+EOF_PREV
+      unset _tok
     fi
   fi
   tick_args+=("${prev_args[@]}")
   run_output="$("${tick_args[@]}")"
   printf '%s\n' "$run_output"
-  # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
-  #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
-  # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在 hasPendingWork=true 时
-  #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
-  # G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
-  #    从 run_output 的 JSON 解析 termination.coverage / termination.zeroGrowthRounds，写进下一条 body。
-  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+  # A9 / G4b / GT-4（E0c2b §1.2）—— 续投门与终态判据对齐：
+  #   旧门：`grep -q '"hasPendingWork": *true'`（正则，且只看板面是否有非终态 clue）。
+  #   新门（GT-4）：hasPendingWork=true **或** (termination.state 仍为 null 且未触顶 capHit)。
+  #     板面排空那一刻 hasPendingWork 立即 false，但 zeroGrowthRounds 往往才 1（攒不到阈值 2）
+  #     ⇒ 旧门那一刻就停 ⇒ 终态结构性永不可达。新门让「排空但未收敛」继续续投直到终态。
+  #   ⛔ 拿到非 null 终态后**必须停止续投**（不得无限空转）。
+  #   ⛔ 触顶 capHit=true 时按既有语义走（capped 需等在途排空）；不得因本改动绕过熔断：
+  #      capHit && termination.state != null ⇒ 已正式 capped，停投；
+  #      capHit && termination.state == null ⇒ 已触顶仍在排空，**继续续投**让在途跑完（既有语义不变）。
+  #   ⛔ GT-5：判定用**真 JSON 解析**（node），⛔ 不得用 grep 正则（既有正则既漏嵌套 JSON 又是 bash-only 心智）。
+  #   单次 node 调用一次性产出：continue(1/0)<TAB>coverage<TAB>zeroGrowthRounds。
+  #   ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 在决定续投时必须全部就绪；
+  #      任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
+  #   G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
+  cont_line="$(node - "$run_output" <<'G4B_NEXT_EOF'
+    const s = process.argv[2];
+    let o;
+    try { o = JSON.parse(s); } catch (e) {
+      console.error("G4b: run output is not valid JSON: " + e.message);
+      process.exit(1);
+    }
+    const t = o && typeof o === "object" ? o.termination : null;
+    if (!t || typeof t !== "object") {
+      console.error("G4b: run output missing termination object");
+      process.exit(1);
+    }
+    const cov = t.coverage, zgr = t.zeroGrowthRounds, cap = t.capHit, st = t.state;
+    if (typeof cov !== "number" || typeof zgr !== "number" || typeof cap !== "boolean") {
+      console.error("G4b: termination.coverage/zeroGrowthRounds/capHit missing or wrong type");
+      process.exit(1);
+    }
+    const hpw = o.hasPendingWork === true;
+    // GT-4 续投门：termination.state 是权威续投判据。
+    //   state === null（未终态）⇒ 继续续投（无论 hasPendingWork / capHit）：
+    //     - hasPendingWork=true ⇒ 板面仍有非终态卡 ⇒ 续投（被 state===null 覆盖）。
+    //     - hasPendingWork=false 但 state=null ⇒ 排空但未收敛（GT-4 根因：旧门那一刻就停 ⇒ 终态永不可达）⇒ 续投。
+    //     - capHit=true 但 state=null ⇒ 已触顶、仍在排空（既有语义：capped 需等在途排空）⇒ 续投。
+    //   state 非 null（含 capped/converged/partial）⇒ 已终态，⛔ 必须停止续投（不得无限空转）；
+    //     即便 hasPendingWork=true 也不续投（终态权威，spec §1.2：拿到非 null 终态后必须停止）。
+    void hpw; // hasPendingWork 不再单独参与续投门（state===null 已覆盖其语义）。
+    const cont = st === null;
+    process.stdout.write((cont ? 1 : 0) + "\t" + cov + "\t" + zgr);
+G4B_NEXT_EOF
+  )"
+  # GT-5：⛔ 不用 `read -a`（bash-only）；用参数展开切字段（`${v%%$'\t'*}` / `${v#*$'\t'}`），
+  #       bash 与 zsh 行为一致。cont_line 形如 "<cont>\t<cov>\t<zgr>"。
+  _should_continue="${cont_line%%$'\t'*}"
+  if [ "$_should_continue" = "1" ]; then
     if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
-      echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
+      echo "[tick] continuation gate open (hasPendingWork or termination.state==null && !capHit) but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
       exit 1
     fi
-    # G4b —— 解析本轮 termination 计数写进下一条 trigger body。run_output 必含 termination（tick-entry --run 输出）。
-    #   JS 经 heredoc 喂 node stdin，避免引号冲突（同上 G4B_PARSE_EOF 块的理由）。
-    next_term=$(node - "$run_output" <<'G4B_NEXT_EOF'
-      const s = process.argv[2];
-      let o;
-      try { o = JSON.parse(s); } catch (e) {
-        console.error("G4b: run output is not valid JSON: " + e.message);
-        process.exit(1);
-      }
-      const t = o && typeof o === "object" ? o.termination : null;
-      if (!t || typeof t !== "object") {
-        console.error("G4b: run output missing termination object");
-        process.exit(1);
-      }
-      const cov = t.coverage, zgr = t.zeroGrowthRounds;
-      if (typeof cov !== "number" || typeof zgr !== "number") {
-        console.error("G4b: termination.coverage/zeroGrowthRounds missing");
-        process.exit(1);
-      }
-      process.stdout.write(cov + "\t" + zgr);
-G4B_NEXT_EOF
-    )
-    next_cov="${next_term%$'\t'*}"
-    next_zgr="${next_term#*$'\t'}"
+    # G4b —— 把本轮 termination 计数写进下一条 trigger body。
+    _body_rest="${cont_line#*$'\t'}"
+    _body_cov="${_body_rest%%$'\t'*}"
+    _body_zgr="${_body_rest#*$'\t'}"
     next_id="a9-$(date +%s%N)-$$"
-    next_body="{\"tick\":true,\"coverage\":${next_cov},\"zeroGrowthRounds\":${next_zgr}}"
+    next_body="{\"tick\":true,\"coverage\":${_body_cov},\"zeroGrowthRounds\":${_body_zgr}}"
+    unset _should_continue _body_rest _body_cov _body_zgr
     "$loop_engine_runner" "$loop_store_cli" "$trigger_store_dir" put \
       "{\"id\":\"${next_id}\",\"status\":\"open\",\"body\":${next_body}}"
+  else
+    unset _should_continue
   fi
 else
   "$tick_entry" --selfcheck

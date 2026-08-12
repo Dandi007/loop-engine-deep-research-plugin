@@ -260,14 +260,19 @@ function renderTickMd(values: Record<string, string>): string {
 
 function makeFakeTick(values: {
   hasPendingWork: boolean;
+  /** E0c2b GT-4：续投门改为 termination.state===null ⇒ 续投。缺省 "converged" 让不测续投的用例不触发。 */
+  state?: string;
   dir: string;
   runnerLog: string;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
   // G4b —— fake tick-entry 的 JSON 输出必须含 termination（tick.md 现在读它写进下一条 trigger body）。
+  // E0c2b GT-4 —— 续投门改为看 termination.state（state===null ⇒ 续投，与 hasPendingWork 无关）。
+  //   测续投的用例显式传 state:null；不测续投的用例缺省 state:"converged"（终态 ⇒ 不续投）。
+  const state = values.state ?? "converged";
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${state === "null" ? "null" : `"${state}"`}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -295,8 +300,10 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
   it("hasPendingWork true ⇒ one trigger record written", () => {
     const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
     const log = join(dir, "puts.log");
+    // E0c2b GT-4：state=null 触发续投（与 hasPendingWork=true 等价触发续投门）。
     const { tickEntry, runner, storeDir } = makeFakeTick({
       hasPendingWork: true,
+      state: "null",
       dir,
       runnerLog: log,
     });
@@ -320,11 +327,14 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("hasPendingWork false ⇒ no trigger record written", () => {
+  it("terminal state (converged) ⇒ no trigger record written (E0c2b GT-4: gate is state, not hasPendingWork)", () => {
+    // E0c2b GT-4：续投门改为 termination.state===null ⇒ 续投。终态（state="converged"）⇒ 不续投。
+    // 注：hasPendingWork 在此默认 false；即便 true，终态也不会续投（state 权威）。
     const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
     const log = join(dir, "puts.log");
     const { tickEntry, runner, storeDir } = makeFakeTick({
       hasPendingWork: false,
+      state: "converged",
       dir,
       runnerLog: log,
     });
@@ -345,14 +355,46 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
     expect(puts).toHaveLength(0);
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it("E0c2b GT-4 DISCRIMINATING: state=null AND hasPendingWork=false ⇒ trigger IS written (drained but not converged)", () => {
+    // 变异：把续投门改回只看 hasPendingWork ⇒ 此测试变红（hasPendingWork=false ⇒ 不投）。
+    // 正确实现（GT-4）：state=null ⇒ 续投（排空但未收敛）。
+    const dir = mkdtempSync(join(tmpdir(), "a9-tick-gt4-"));
+    const log = join(dir, "puts.log");
+    const { tickEntry, runner, storeDir } = makeFakeTick({
+      hasPendingWork: false,
+      state: "null",
+      dir,
+      runnerLog: log,
+    });
+    writeFileSync(log, "");
+    runRenderedTick(
+      {
+        tick_entry: tickEntry,
+        tick_channel: "research:p02-smoke-1dce60",
+        evidence_channel: "",
+        allowed_root: "",
+        trigger_store_dir: storeDir,
+        loop_store_cli: join(dir, "store-cli.js"),
+        loop_engine_runner: runner,
+      },
+      join(dir, "tick.sh"),
+    );
+    const puts = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    // ⛔ GT-4 核心：hasPendingWork=false 但 state=null ⇒ 续投门仍开 ⇒ 投了下一条 trigger。
+    expect(puts).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe("F10: trigger id is unique across rounds", () => {
   it("two consecutive puts produce two distinct ids", () => {
     const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
     const log = join(dir, "puts.log");
+    // E0c2b GT-4：state=null 触发续投（让本用例真能投两条 trigger 测 id 唯一性）。
     const { tickEntry, runner, storeDir } = makeFakeTick({
       hasPendingWork: true,
+      state: "null",
       dir,
       runnerLog: log,
     });

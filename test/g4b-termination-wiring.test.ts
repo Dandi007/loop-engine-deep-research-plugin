@@ -18,7 +18,7 @@
  *  - R6 capped 与 converged 仍然可区分：触顶路径产出 capped，零增长路径产出 converged。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -402,6 +402,8 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
 
   it("tick.md seed body {\"seed\":true} passes no --prev-* (first-round semantics)", () => {
     // 首个 seed trigger body 无计数字段 ⇒ tick.md 不传 --prev-*（tick-entry 缺省 0）。
+    // E0c2b：fakeRunBody 用 state=converged（终态）避免新续投门（state===null ⇒ 续投）触发对
+    //   占位 runner /tmp/r 的调用——本用例只验证 --prev-* 解析，不测续投。
     const dir = mkdtempSync(join(tmpdir(), "g4b-r4-seed-"));
     const argvLog = join(dir, "tick-entry.argv.log");
     const tickEntry = join(dir, "tick-entry");
@@ -409,7 +411,7 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
       tickEntryPath: tickEntry,
       argvLog,
       fakeRunBody:
-        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 2, "capHit": false}}',
     });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl
@@ -829,6 +831,224 @@ describe("R9 (attempt 2 minor): continuation body that lost its counters fails l
     }
     expect(errCode).not.toBe(0);
     expect(errText).toMatch(/G4b.*trigger_body/i);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ── R10 (E0c2b §1.2 / GT-4)：续投门对齐终态判据 —— 排空但未收敛仍续投 ──
+// 评审根因（spec §0 GT-4）：旧门只看 hasPendingWork；板面排空那一刻 hasPendingWork 立即 false，
+//   而 zeroGrowthRounds 往往才 1（攒不到阈值 2）⇒ 旧门那一刻就停 ⇒ 终态结构性永不可达。
+//   新门（GT-4）：hasPendingWork=true 或 (termination.state 仍 null 且未触顶 capHit)。
+// 判别性：构造「板面已排空（hasPendingWork=false）但 termination.state=null 且 capHit=false」⇒ **仍然续投**；
+//   把续投门改回只看 hasPendingWork ⇒ 该测试变红（不投下一条 trigger）。
+
+describe("R10 (E0c2b GT-4): continuation gate aligned with termination — drained but not converged ⇒ still continue", () => {
+  it("hasPendingWork=false AND state=null AND capHit=false ⇒ puts next trigger (gate NOT hasPendingWork-only)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "g4b-r10-drained-"));
+    const argvLog = join(dir, "tick-entry.argv.log");
+    const runnerLog = join(dir, "puts.log");
+    const tickEntry = join(dir, "tick-entry");
+    // 假 tick-entry：输出 hasPendingWork=false（板面排空）+ termination.state=null（未收敛）+ capHit=false。
+    // 旧门（只看 hasPendingWork）⇒ 不续投 ⇒ runnerLog 空。
+    // 新门（GT-4）⇒ state==null && !capHit ⇒ 续投 ⇒ runnerLog 有一条。
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 1, "capHit": false}}',
+    });
+    const runner = join(dir, "runner");
+    writeFileSync(
+      runner,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$4" >> "${runnerLog}"\n`,
+    );
+    chmodSync(runner, 0o755);
+    const storeDir = join(dir, "store");
+    writeFileSync(runnerLog, "");
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, CHANNEL)
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, storeDir)
+      .replace(/\{\{loop_store_cli\}\}/g, join(dir, "store-cli.js"))
+      .replace(/\{\{loop_engine_runner\}\}/g, runner)
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":0,"zeroGrowthRounds":0}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+    execFileSync("bash", [outShell], { cwd: dir, encoding: "utf8" });
+
+    // ⛔ R10 核心：板面排空但未收敛 ⇒ 续投门仍开 ⇒ 投了下一条 trigger。
+    const puts = readFileSync(runnerLog, "utf8").trim().split("\n").filter(Boolean);
+    expect(puts).toHaveLength(1);
+    const body = JSON.parse(puts[0]);
+    expect(body.body.coverage).toBe(0);
+    expect(body.body.zeroGrowthRounds).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("discriminates: state=converged (non-null terminal) ⇒ does NOT put next trigger (must stop on terminal)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "g4b-r10-term-"));
+    const argvLog = join(dir, "tick-entry.argv.log");
+    const runnerLog = join(dir, "puts.log");
+    const tickEntry = join(dir, "tick-entry");
+    // 终态已收敛 ⇒ 即使 hasPendingWork=true 也不得续投（拿到非 null 终态后必须停止）。
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": true, "decisions": [], "termination": {"state": "converged", "coverage": 1, "zeroGrowthRounds": 2, "capHit": false}}',
+    });
+    const runner = join(dir, "runner");
+    writeFileSync(
+      runner,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$4" >> "${runnerLog}"\n`,
+    );
+    chmodSync(runner, 0o755);
+    const storeDir = join(dir, "store");
+    writeFileSync(runnerLog, "");
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, CHANNEL)
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, storeDir)
+      .replace(/\{\{loop_store_cli\}\}/g, join(dir, "store-cli.js"))
+      .replace(/\{\{loop_engine_runner\}\}/g, runner)
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":1,"zeroGrowthRounds":1}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+    execFileSync("bash", [outShell], { cwd: dir, encoding: "utf8" });
+
+    // ⛔ 终态非 null ⇒ 必须停止续投（不投下一条 trigger）。
+    const puts = readFileSync(runnerLog, "utf8").trim().split("\n").filter(Boolean);
+    expect(puts).toHaveLength(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("discriminates: capHit=true && state=null ⇒ still continue (capped needs to drain in-flight; existing semantics)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "g4b-r10-cap-"));
+    const argvLog = join(dir, "tick-entry.argv.log");
+    const runnerLog = join(dir, "puts.log");
+    const tickEntry = join(dir, "tick-entry");
+    // 触顶但仍排空 ⇒ capHit=true && state=null ⇒ 继续续投（既有语义：capped 需等在途排空）。
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 1, "zeroGrowthRounds": 0, "capHit": true}}',
+    });
+    const runner = join(dir, "runner");
+    writeFileSync(
+      runner,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$4" >> "${runnerLog}"\n`,
+    );
+    chmodSync(runner, 0o755);
+    const storeDir = join(dir, "store");
+    writeFileSync(runnerLog, "");
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, CHANNEL)
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, storeDir)
+      .replace(/\{\{loop_store_cli\}\}/g, join(dir, "store-cli.js"))
+      .replace(/\{\{loop_engine_runner\}\}/g, runner)
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":1,"zeroGrowthRounds":0}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+    execFileSync("bash", [outShell], { cwd: dir, encoding: "utf8" });
+
+    // capHit && state==null ⇒ 继续续投（让在途排空；既有语义不变）。
+    const puts = readFileSync(runnerLog, "utf8").trim().split("\n").filter(Boolean);
+    expect(puts).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ── R11 (E0c2b §1.2 / GT-5)：tick.md 改动段必须在 zsh -c 下真能跑（第二轮带续投 body） ──
+// 评审根因（spec §0 GT-5）：loop-engine 的 bash 叶子实际用 `zsh -c` 执行（exec.ts:runScript）；
+//   tick.md 原 `IFS=$'\t' read -r -a prev_arr` 是 bash-only（zsh read 无 -a），第二轮起必死。
+// 判别性：用 `zsh -c` 跑渲染后的 tick.md，喂带计数的 trigger_body（第二轮），断言成功 +
+//   假 tick-entry 收到 --prev-coverage/--prev-zero-growth；
+//   把任一处换回 bash-only 语法（如 read -r -a）⇒ 该测试变红（zsh 第二轮必死）。
+//   ⛔ 不得用「在 bash 下跑通」替代这条。
+
+describe("R11 (E0c2b GT-5): tick.md changed section runs under zsh -c on round 2 (continuation body)", () => {
+  it("zsh -c renders tick.md with a continuation trigger_body ⇒ succeeds, --prev-* received", () => {
+    // 仅当系统装了 zsh 才跑（真机必有；CI 缺 zsh 时 skip 而非绿）。
+    let zshPath = "";
+    try {
+      zshPath = execFileSync("which", ["zsh"], { encoding: "utf8" }).trim();
+    } catch {
+      zshPath = "/usr/bin/zsh";
+    }
+    if (!zshPath || !existsSync(zshPath)) {
+      console.warn("R11 (GT-5): zsh not found on PATH; skipping (spec requires zsh on real machine).");
+      return;
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), "g4b-r11-zsh-"));
+    const argvLog = join(dir, "tick-entry.argv.log");
+    const tickEntry = join(dir, "tick-entry");
+    writeFakeTickEntry({
+      tickEntryPath: tickEntry,
+      argvLog,
+      fakeRunBody:
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 1, "zeroGrowthRounds": 2, "capHit": false}}',
+    });
+    const tpl = readFileSync(TICK_MD, "utf8");
+    const script = tpl
+      .replace(/\{\{tick_entry\}\}/g, tickEntry)
+      .replace(/\{\{tick_channel\}\}/g, CHANNEL)
+      .replace(/\{\{evidence_channel\}\}/g, "")
+      .replace(/\{\{allowed_root\}\}/g, "")
+      .replace(/\{\{max_writes\}\}/g, "64")
+      .replace(/\{\{research_question\}\}/g, "")
+      .replace(/\{\{trigger_store_dir\}\}/g, "/tmp/x")
+      .replace(/\{\{loop_store_cli\}\}/g, "/tmp/c")
+      .replace(/\{\{loop_engine_runner\}\}/g, "/tmp/r")
+      .replace(/\{\{trigger_body\}\}/g, '{"tick":true,"coverage":4,"zeroGrowthRounds":1}');
+    const outShell = join(dir, "tick.sh");
+    writeFileSync(outShell, script);
+    chmodSync(outShell, 0o755);
+
+    // ⛔ 用 zsh 真跑（不是 bash、不是 sh）。loop-engine 的 bash 叶子恒用 `zsh -c <script>`（GT-5）。
+    // 第二轮（trigger_body 带 coverage/zeroGrowthRounds）走 prev_args 切分路径。
+    // 旧实现 `read -r -a`（bash-only）⇒ zsh 第二轮必死（read: bad option: -a）。
+    // 这里用 `zsh script` 让 zsh 直接解释脚本文件（与 loop-engine 的 `zsh -c "<script body>"` 等价：
+    //   都是用 zsh 解析同一份脚本文本）。
+    let errCode = 0;
+    let errText = "";
+    try {
+      execFileSync(zshPath, [outShell], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      const ee = e as { status?: number; stderr?: string | Buffer };
+      errCode = ee.status ?? -1;
+      errText = String(ee.stderr ?? "");
+    }
+    // ⛔ R11 核心：zsh -c 下第二轮成功（exit 0，不是「bad option: -a」）。
+    expect(errCode, `zsh stderr: ${errText}`).toBe(0);
+    expect(errText).not.toMatch(/bad option/i);
+    expect(errText).not.toMatch(/read:.+-a/);
+    // 假 tick-entry 收到从 trigger_body 解析出的 --prev-*（prev_args 切分在 zsh 下也工作）。
+    const argv = readFileSync(argvLog, "utf8").trim().split("\n");
+    expect(argv).toContain("--prev-coverage");
+    expect(argv[argv.indexOf("--prev-coverage") + 1]).toBe("4");
+    expect(argv).toContain("--prev-zero-growth");
+    expect(argv[argv.indexOf("--prev-zero-growth") + 1]).toBe("1");
     rmSync(dir, { recursive: true, force: true });
   });
 });

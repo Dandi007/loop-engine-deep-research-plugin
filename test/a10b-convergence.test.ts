@@ -341,13 +341,17 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
 
 function makeFakeTick(values: {
   hasPendingWork: boolean;
+  /** E0c2b GT-4：续投门看 termination.state（state===null ⇒ 续投）。缺省 "converged"。 */
+  state?: string;
   dir: string;
   runnerLog: string;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
+  // E0c2b GT-4：续投门改为看 termination.state。测续投的用例传 state:"null"；其余缺省 "converged"。
+  const state = values.state ?? "converged";
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${state === "null" ? "null" : `"${state}"`}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -372,7 +376,8 @@ describe("B3: board has a non-terminal clue ⇒ still invests a next trigger", (
     expect(hasPendingWork(state({ cards: [card({ status: "open" })] }))).toBe(true);
     const dir = mkdtempSync(join(tmpdir(), "a10b-b3-"));
     const log = join(dir, "puts.log");
-    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: true, dir, runnerLog: log });
+    // E0c2b GT-4：state=null 触发续投（hasPendingWork=true 等价触发）。
+    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: true, state: "null", dir, runnerLog: log });
     writeFileSync(log, "");
     renderTickMd(
       {
@@ -394,14 +399,15 @@ describe("B3: board has a non-terminal clue ⇒ still invests a next trigger", (
 });
 
 describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)", () => {
-  it("hasPendingWork false ⇒ tick.md writes no trigger", () => {
+  it("terminal state (converged) ⇒ tick.md writes no trigger (E0c2b GT-4: gate is state, not hasPendingWork)", () => {
     const s = state({
       cards: [card({ status: "explored" }), card({ status: "dropped" }), card({ status: "blocked" })],
     });
     expect(hasPendingWork(s)).toBe(false);
     const dir = mkdtempSync(join(tmpdir(), "a10b-b4-"));
     const log = join(dir, "puts.log");
-    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, dir, runnerLog: log });
+    // E0c2b GT-4：state="converged"（终态）⇒ 不续投（即使 hasPendingWork=false 也是因 state 终态）。
+    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, state: "converged", dir, runnerLog: log });
     writeFileSync(log, "");
     renderTickMd(
       {

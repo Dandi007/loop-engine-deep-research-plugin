@@ -7,15 +7,13 @@
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
 #
-# E0c5 §1.1 —— node_timeout 是引擎真正读取的 tick 上界（不是 profile 里的 TICK_TIMEOUT_MS）。
-#   一次 tick 的合理耗时：bus 分页读（2–4 次 HTTP）+ CAS 写（1–N 次 HTTP）+ spawn worker
-#   （子进程启动）+ triage 等待（轮询 board:agent-runs）。在真实部署环境下，单次 HTTP 往返
-#   1–5 秒，spawn 2 秒，triage 轮询可在 10–30 秒内返回结果。300 秒（5 分钟）是够用的下界：
-#   覆盖正常 bus I/O 抖动 + 1–2 次 triage 轮询，同时仍远小于墙钟预算（60 秒墙钟由
-#   fleet.yaml.tpl 的 max_passes 控制，本引擎的 wall_clock:60 作用在另一个维度）。
-#   ⛔ 不得把 node_timeout 调回 30（旧值）—— 那会让单次 tick 的 bus I/O 就吃掉全部预算，
-#      tick 永远在第一个 triage 轮询前就被引擎砍掉（GT-15 真机实录）。
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 300, max_retries: 0, concurrency: 1 }
+# E0c5 §1.1 —— node_timeout:30 是引擎真正读取的 tick 上界（不是 profile 里的 TICK_TIMEOUT_MS）。
+#   GT-15/GT-16 要求：在种子板（2 条消息）上，一次 tick 必须稳定远低于 30 秒。
+#   ⛔ 不得靠调大 node_timeout 掩盖（那只是把闸刀往后挪）。
+#   真实 tick 在种子板上的耗时：bus 分页读（2-4 次 HTTP，< 2s）+ CAS 写（1-N 次 HTTP，< 1s）
+#   + spawn worker（子进程启动，< 2s）+ 无 triage/无 harvest（种子板仅 1 条 open clue），
+#   总耗时应 < 10s。node_timeout:30 是安全的上界，远大于种子板实际耗时。
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

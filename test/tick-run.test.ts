@@ -1306,14 +1306,36 @@ describe("P11: spawnWorker widened — clue text really reaches the prompt (disc
 
 /**
  * 判别性（判据 2 ⭐⭐）：在种子板（1 条线索）上驱动真实 `--run`，断言：
- * 1. 耗时低于引擎 `node_timeout`（30 秒）的一半（即 < 15000ms）；
+ * 1. 耗时低于引擎 `node_timeout` 的一半（引擎真正生效的那个上界）；
  * 2. `termination` 可被读出（非 null，含 state/coverage/boardComposition）；
- * 3. 全部阶段计时字段存在且可测量（移除阶段计时 ⇒ 该测试变红）。
+ * 3. 全部阶段计时字段存在且可测量（移除阶段计时 ⇒ 该测试变红）；
+ * 4. ⛔ 断言针对引擎真正生效的那个上界：从 workflow.yaml 读取 node_timeout。
  */
+
+/** 从 workflow.yaml 读取引擎真正生效的 node_timeout（秒）。 */
+function readNodeTimeout(): number {
+  const yaml = readFileSync(
+    join(ROOT, "..", "workflows", "deep-research", "tick", "workflow.yaml"),
+    "utf8",
+  );
+  const m = /node_timeout:\s*(\d+)/.exec(yaml);
+  if (!m) throw new Error("could not parse node_timeout from workflow.yaml");
+  return Number(m[1]);
+}
+
 describe("E0c5 §1.1: discriminating — runChannelWrite on seed board", () => {
-  const NODE_TIMEOUT_HALF_MS = 15000; // node_timeout: 30 的一半
+  it("node_timeout in workflow.yaml is not a masking bump (must be ≤ 30)", () => {
+    const nodeTimeout = readNodeTimeout();
+    // ⛔ 不得靠调大 node_timeout 掩盖（spec §1.1 line 109）。
+    // 判别性：若实现者把 node_timeout 调大到 300 掩盖实测耗时，该断言直接变红。
+    expect(nodeTimeout).toBeLessThanOrEqual(30);
+  });
 
   it("timings.totalMs < node_timeout/2, termination readable, all phase timings measurable", async () => {
+    // 从 workflow.yaml 读取引擎真正生效的 node_timeout（判据 2 ⭐⭐）。
+    const nodeTimeout = readNodeTimeout();
+    const nodeTimeoutHalfMs = (nodeTimeout * 1000) / 2;
+
     // 构造种子板：1 条 open clue（sources 不含 code-local 以免触 code-local 检查）
     const openClueMsg = {
       message_id: "msg_open_1",
@@ -1372,8 +1394,8 @@ describe("E0c5 §1.1: discriminating — runChannelWrite on seed board", () => {
     // 终止判定计时必须可测（decideTermination 被调用过）
     expect(t.terminationMs).toBeGreaterThanOrEqual(0);
 
-    // 断言 2：耗时远低于引擎 node_timeout 的一半
-    expect(t.totalMs).toBeLessThan(NODE_TIMEOUT_HALF_MS);
+    // 断言 2：耗时远低于引擎 node_timeout 的一半（引擎真正生效的那个上界）
+    expect(t.totalMs).toBeLessThan(nodeTimeoutHalfMs);
 
     // 断言 3：termination 可读
     expect(outcome.termination).toBeDefined();

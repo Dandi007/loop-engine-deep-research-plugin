@@ -1300,3 +1300,89 @@ describe("P11: spawnWorker widened — clue text really reaches the prompt (disc
     }
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// E0c3 判据 2: --triage-threshold flows through runChannelWrite to decideTick
+// ══════════════════════════════════════════════════════════════════════
+
+describe("E0c3 判据 2: triageThreshold wiring through runChannelWrite", () => {
+  it("runChannelWrite{triageThreshold:1} produces triage decision on 1-proposed board", async () => {
+    const proposedMsg = {
+      message_id: "msg_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "proposed", text: "t", depth: 1, sources: ["code-local"] },
+      entity_id: "clue_p",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [proposedMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      triageThreshold: 1,
+      question: "test question",
+      spawnTriage: vi.fn(async () => ({ decisions: [], runId: "triage-run-1" })),
+    });
+
+    const triageDecisions = outcome.decisions.filter((d) => d.kind === "triage");
+    expect(triageDecisions).toHaveLength(1);
+  });
+
+  it("runChannelWrite{triageThreshold:3} produces no triage on 1-proposed board (discriminant)", async () => {
+    const proposedMsg = {
+      message_id: "msg_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "proposed", text: "t", depth: 1, sources: ["code-local"] },
+      entity_id: "clue_p",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown) => {
+        const u = String(url);
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [proposedMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      triageThreshold: 3,
+      question: "test question",
+      spawnTriage: vi.fn(async () => ({ decisions: [], runId: "triage-run-1" })),
+    });
+
+    const triageDecisions = outcome.decisions.filter((d) => d.kind === "triage");
+    expect(triageDecisions).toHaveLength(0);
+  });
+});

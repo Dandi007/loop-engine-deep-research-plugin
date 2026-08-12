@@ -4,6 +4,7 @@
  * 覆盖 spec §2 判据 2–7（判别性单测）。
  */
 import { describe, it, expect, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
@@ -310,6 +311,25 @@ function runE0Regression(
       err: String(ee.stderr ?? ""),
     };
   }
+}
+
+function computeTickChannel(runId: string, profileBase: string): string {
+  const seg = createHash("sha256").update(runId).digest("hex").slice(0, 16);
+  return `research:${profileBase}-${seg}.index`;
+}
+
+async function publishBusMessage(
+  busUrl: string,
+  channelId: string,
+  kind: string,
+  payload: Record<string, unknown>,
+  entityId: string,
+): Promise<void> {
+  await fetch(`${busUrl}/v1/channels/${encodeURIComponent(channelId)}/publish`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer test-token" },
+    body: JSON.stringify({ kind, payload, entity_id: entityId }),
+  });
 }
 
 function runNodeScript(scriptPath: string, input: string, env?: Record<string, string>): { code: number; out: string; err: string } {
@@ -1093,4 +1113,164 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
       rmSync(dir, { recursive: true, force: true });
     }
   }, { timeout: 15000 });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// E0c3 判据 4: limit hit with proposed>0 prints board composition and deadlock naming
+// ══════════════════════════════════════════════════════════════════════
+
+describe("E0c3 判据 4: limit hit prints board composition and triage deadlock", () => {
+  it("limit hit with proposed>0 (below default threshold) names deadlock", async () => {
+    const { dir, env, busPort, prodBusPort, busUrl, e0regression } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const tickChannel = computeTickChannel(env.DD_RUN_ID, "e0c2-test");
+      await publishBusMessage(busUrl, tickChannel, "research.clue.v2", {
+        status: "proposed",
+        text: "test clue proposed",
+        depth: 1,
+        sources: ["code-local"],
+      }, "clue-p1");
+      await publishBusMessage(busUrl, tickChannel, "research.clue.v2", {
+        status: "proposed",
+        text: "test clue proposed 2",
+        depth: 1,
+        sources: ["code-local"],
+      }, "clue-p2");
+
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      expect(res.err).toMatch(/HIT ATTEMPT LIMIT/i);
+      expect(res.err).toMatch(/board composition at limit hit/i);
+      expect(res.err).toMatch(/TRIAGE THRESHOLD DEADLOCK/i);
+      expect(res.err).toMatch(/proposed=2.*triageThreshold=3/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discriminant: removing board composition line would make test red", async () => {
+    const { dir, env, busPort, prodBusPort, busUrl, e0regression } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const tickChannel = computeTickChannel(env.DD_RUN_ID, "e0c2-test");
+      await publishBusMessage(busUrl, tickChannel, "research.clue.v2", {
+        status: "proposed",
+        text: "test clue proposed",
+        depth: 1,
+        sources: ["code-local"],
+      }, "clue-p1");
+
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      expect(res.err).toMatch(/board composition at limit hit/i);
+      // With proposed=1 < default threshold=3, deadlock should be named
+      expect(res.err).toMatch(/TRIAGE THRESHOLD DEADLOCK/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// E0c3 判据 5: drain_attempts in run.meta matches actual drains executed
+// ══════════════════════════════════════════════════════════════════════
+
+describe("E0c3 判据 5: drain_attempts matches actual drain count", () => {
+  it("limit hit with maxAttempts=2 ⇒ run.meta drain_attempts ≤ 2", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, recordRoot } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      const metaPath = join(recordRoot, env.DD_RUN_ID, "run.meta");
+      if (!existsSync(metaPath)) {
+        throw new Error(`run.meta not found at ${metaPath}`);
+      }
+      const meta = readFileSync(metaPath, "utf8");
+      const match = /^drain_attempts=(\d+)$/m.exec(meta);
+      if (!match) {
+        throw new Error("drain_attempts field not found in run.meta");
+      }
+      const drainAttempts = Number(match[1]);
+      expect(drainAttempts).toBeGreaterThanOrEqual(1);
+      expect(drainAttempts).toBeLessThanOrEqual(2);
+      // The HIT ATTEMPT LIMIT line in stderr should report the same count
+      const limitMatch = /HIT ATTEMPT LIMIT:.*drain_attempts=(\d+)/.exec(res.err);
+      if (limitMatch) {
+        expect(Number(limitMatch[1])).toBe(drainAttempts);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("discriminant: drain_attempts 13 on maxAttempts=12 would be a regression", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, recordRoot } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 3,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+          { drainId: "fake-drain-null-3", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      const metaPath = join(recordRoot, env.DD_RUN_ID, "run.meta");
+      if (!existsSync(metaPath)) {
+        throw new Error(`run.meta not found at ${metaPath}`);
+      }
+      const meta = readFileSync(metaPath, "utf8");
+      const match = /^drain_attempts=(\d+)$/m.exec(meta);
+      if (!match) {
+        throw new Error("drain_attempts field not found in run.meta");
+      }
+      const drainAttempts = Number(match[1]);
+      // drain_attempts must never exceed maxAttempts (the off-by-one bug was 13 on 12)
+      expect(drainAttempts).toBeLessThanOrEqual(3);
+      expect(drainAttempts).toBeGreaterThanOrEqual(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -393,9 +393,7 @@ while true; do
     break
   fi
 
-  DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
-
-  # 墙钟上限检查
+  # 墙钟上限检查（先于自增，使 drain_attempts 反映实际执行次数而非 off-by-one）
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
@@ -412,6 +410,8 @@ while true; do
     LOOP_EXIT=4
     break
   fi
+
+  DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
 
   # ── 跑一次 drain ──
   set +e

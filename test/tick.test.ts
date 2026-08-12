@@ -270,6 +270,47 @@ describe("B11: parameters are not hardcoded", () => {
   });
 });
 
+describe("E0c3b 判据 2: e0-regression profile TRIAGE_THRESHOLD=1 makes 1 proposed ⇒ triage", () => {
+  function readProfileThreshold(): number {
+    const profilePath = fileURLToPath(new URL("../profiles/deploy/e0-regression.env", import.meta.url));
+    const text = readFileSync(profilePath, "utf8");
+    for (const line of text.split("\n")) {
+      const m = line.match(/^TRIAGE_THRESHOLD=(\d+)$/);
+      if (m) return Number(m[1]);
+    }
+    return -1;
+  }
+
+  it("e0-regression profile declares TRIAGE_THRESHOLD=1", () => {
+    const t = readProfileThreshold();
+    expect(t).toBe(1);
+  });
+
+  it("with threshold=1 (from profile), board with 1 proposed clue triggers triage", () => {
+    const t = readProfileThreshold();
+    expect(t).toBe(1);
+    const custom: TickConfig = { ...cfg, triageThreshold: t };
+    const s = state({ cards: [card({ clueId: "p", status: "proposed" })] });
+    expect(decideTick(s, custom).filter((x) => x.kind === "triage")).toHaveLength(1);
+  });
+
+  it("DISCRIMINATING: with default threshold=3, 1 proposed clue does NOT trigger triage", () => {
+    const s = state({ cards: [card({ clueId: "p", status: "proposed" })] });
+    expect(decideTick(s, cfg).filter((x) => x.kind === "triage")).toHaveLength(0);
+  });
+
+  it("DISCRIMINATING: 3 proposed with default threshold=3 DOES trigger triage", () => {
+    const s = state({
+      cards: [
+        card({ clueId: "p1", status: "proposed" }),
+        card({ clueId: "p2", status: "proposed" }),
+        card({ clueId: "p3", status: "proposed" }),
+      ],
+    });
+    expect(decideTick(s, cfg).filter((x) => x.kind === "triage")).toHaveLength(1);
+  });
+});
+
 describe("source enum sanity", () => {
   it("isValidSources accepts only closed enum members", () => {
     expect(isValidSources(["code-local", "web-search"])).toBe(true);

@@ -20,6 +20,9 @@ pipelines:
       trigger_store_dir: ${TRIGGER_STORE_DIR}
       loop_store_cli: ${LOOP_STORE_CLI}
       loop_engine_runner: ${LOOP_ENGINE_RUNNER}
+      # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），
+      # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
+      triage_threshold: ${TRIAGE_THRESHOLD}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

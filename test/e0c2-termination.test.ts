@@ -84,17 +84,21 @@ function setupRuntimeDir(
   terminationState: string | null,
   coverage?: number,
   zeroGrowthRounds?: number,
+  boardComposition?: { proposed: number; open: number; inFlight: number; explored: number; blocked: number },
+  triageThreshold?: number,
 ): string {
   const runDir = join(runsRoot, `run-${drainId}`, "tick-run");
   mkdirSync(runDir, { recursive: true });
   const tickOutput = JSON.stringify({
     hasPendingWork: false,
     decisions: [],
+    ...(triageThreshold !== undefined ? { triageThreshold } : {}),
     termination: {
       state: terminationState,
       coverage: coverage ?? 0,
       zeroGrowthRounds: zeroGrowthRounds ?? 0,
       capHit: false,
+      boardComposition: boardComposition ?? { proposed: 0, open: 0, inFlight: 0, explored: 0, blocked: 0 },
     },
   });
   const journalFile = join(runDir, "journal.jsonl");
@@ -1063,6 +1067,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
       expect(res.err).toMatch(/HIT ATTEMPT LIMIT|HIT WALL CLOCK LIMIT/i);
+      expect(res.err).toMatch(/drain_attempts=2\b/);
       const attempts = Number(readFileSync(attemptFile, "utf8").trim());
       expect(attempts).toBe(2);
     } finally {
@@ -1117,4 +1122,117 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
       rmSync(dir, { recursive: true, force: true });
     }
   }, { timeout: 15000 });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// E0c3b 判据 4: board composition + triage deadlock naming in stderr
+// ══════════════════════════════════════════════════════════════════════
+
+describe("E0c3b 判据 4: board composition and triage deadlock naming on limit hit", () => {
+  it("HIT ATTEMPT LIMIT with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
+    const { dir, env, e0regression } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    setupRuntimeDir(
+      join(dir, "engine-root"),
+      join(dir, "engine-root", "runs"),
+      "fake-drain-null-1",
+      null,
+      undefined,
+      undefined,
+      { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+      3,
+    );
+    setupRuntimeDir(
+      join(dir, "engine-root"),
+      join(dir, "engine-root", "runs"),
+      "fake-drain-null-2",
+      null,
+      undefined,
+      undefined,
+      { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+      3,
+    );
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.err).toMatch(/board:\s*proposed=1/);
+      expect(res.err).toMatch(/TRIAGE THRESHOLD DEADLOCK/);
+      expect(res.err).toMatch(/proposed=1\s*<\s*triageThreshold=3/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("DISCRIMINATING: if board composition were removed, this test would fail", () => {
+    const script = readFileSync(
+      join(ROOT, "bin", "e0-regression.sh"),
+      "utf8",
+    );
+    expect(script).toContain("_print_board_composition");
+    expect(script).toContain("TRIAGE THRESHOLD DEADLOCK");
+    expect(script).toContain("board: ${bc}");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// E0c3b 判据 5b: no Math.random() in fake bus port assignment
+// ══════════════════════════════════════════════════════════════════════
+
+describe("E0c3b 判据 5b (GT-12): no Math.random() in fake bus port assignment", () => {
+  const fakeBusFixtures = [
+    "test/fixtures/fake-bus.mjs",
+    "test/e0c2-termination.test.ts",
+    "test/a10b-convergence.test.ts",
+    "test/e0c1-board-credentials.test.ts",
+    "test/e0-regression.test.ts",
+  ];
+
+  it("fake-bus.mjs uses kernel-assigned port (A10B_BUS_PORT=0)", () => {
+    const code = readFileSync(join(ROOT, "test", "fixtures", "fake-bus.mjs"), "utf8");
+    expect(code).toContain("A10B_BUS_PORT");
+    expect(code).toMatch(/A10B_BUS_PORT\s*\?\?\s*0/);
+    expect(code).not.toMatch(/18000\s*\+\s*Math\.floor/);
+    expect(code).not.toMatch(/19000\s*\+\s*Math\.floor/);
+  });
+
+  for (const f of fakeBusFixtures) {
+    it(`test file ${f} has no Math.random() in bus port assignment`, () => {
+      const code = readFileSync(join(ROOT, f), "utf8");
+      const lines = code.split("\n");
+      const offenders: string[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
+        if (trimmed.startsWith("it(") || trimmed.startsWith("describe(")) continue;
+        if (/\d+\s*\+\s*Math\.(floor|random)/.test(line)) {
+          offenders.push(`${f}:${i + 1}: ${line.trim()}`);
+        }
+      }
+      expect(offenders, `Math.random() found in bus port assignment patterns in ${f}`).toEqual([]);
+    });
+  }
+
+  it("DISCRIMINATING: kernel-assigned port pattern is present in all startFakeBus callers", () => {
+    for (const f of ["test/e0c2-termination.test.ts", "test/a10b-convergence.test.ts"]) {
+      const code = readFileSync(join(ROOT, f), "utf8");
+      expect(code, `${f}: startFakeBus must use kernel-assigned port`).toMatch(/A10B_BUS_PORT.*"0"/);
+    }
+    const e0c1Code = readFileSync(join(ROOT, "test", "e0c1-board-credentials.test.ts"), "utf8");
+    expect(e0c1Code, "e0c1-board-credentials must use listen(0)").toMatch(/listen\(0/);
+    const e0Code = readFileSync(join(ROOT, "test", "e0-regression.test.ts"), "utf8");
+    expect(e0Code, "e0-regression must use listen(0)").toMatch(/listen\(0/);
+  });
 });

@@ -24,6 +24,7 @@ import type { RunWriteOptions, WriteCasInput } from "../src/tick-run";
 import {
   readTriageResult,
   readGenerateResult,
+  readChannelMessages,
   type InspectMessage,
   type TriageResultDecision,
 } from "../src/tick-inspect";
@@ -677,5 +678,174 @@ describe("R6: assertions drive production-assembled deps", () => {
     const body = await deps.spawnRuntime!.readBody(generateRunId);
     expect(body).toBe(generateBody);
     expect(agentRunsReads).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ── E0c5 §1.2: run exited without result ⇒ stop immediately ───────────────────
+
+function exitedRunMsg(runId: string, seq: number): InspectMessage {
+  return {
+    message_id: `msg_exited_${runId}`,
+    channel_id: "board:agent-runs",
+    channel_seq: seq,
+    kind: "agent.run.exited.v1",
+    payload: { run_id: runId, exit_code: 1 },
+    entity_id: runId,
+    supersedes: null,
+    created_at: "2026-08-01T00:00:01Z",
+  };
+}
+
+describe("E0c5 §1.2: run exited without result ⇒ immediate stop with diagnostic", () => {
+  it("triage readResult: run exited without dr-triage.result.v1 ⇒ throws immediately naming runId", async () => {
+    capturedTriageRunId = "";
+    setEnv(TIMEOUT_ENV, "5000");
+    setEnv(POLL_ENV, "100");
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        if (capturedTriageRunId) {
+          return messagesResponse([exitedRunMsg(capturedTriageRunId, 100)]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    try {
+      await runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 10,
+      });
+      expect.fail("expected E0c5 §1.2 error");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toMatch(/E0c5 §1\.2/);
+      expect(msg).toContain("dr-triage");
+      expect(msg).toContain("exited without producing");
+      expect(capturedTriageRunId).not.toBe("");
+      expect(msg).toContain(capturedTriageRunId);
+    }
+  });
+
+  it("generate readBody: run exited without dr-doc.result.v1 ⇒ throws immediately naming runId", async () => {
+    setEnv(TIMEOUT_ENV, "5000");
+    setEnv(POLL_ENV, "100");
+
+    const generateRunId = "g6-e0c5-gen-001";
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        return messagesResponse([exitedRunMsg(generateRunId, 100)]);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const deps = assembleGenerateDeps(
+      { channelId: CHANNEL, workerCmd: "/fake/agent-run" },
+      termState(),
+      boardState(),
+    );
+
+    try {
+      await deps.spawnRuntime!.readBody(generateRunId);
+      expect.fail("expected E0c5 §1.2 error");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toMatch(/E0c5 §1\.2/);
+      expect(msg).toContain("generate");
+      expect(msg).toContain("exited without producing");
+      expect(msg).toContain(generateRunId);
+    }
+  });
+
+  it("discriminant: without exited check, the same scenario would wait full timeout", async () => {
+    capturedTriageRunId = "";
+    setEnv(TIMEOUT_ENV, "5000");
+    setEnv(POLL_ENV, "100");
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    let reads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        reads += 1;
+        if (capturedTriageRunId) {
+          return messagesResponse([exitedRunMsg(capturedTriageRunId, 100)]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    try {
+      await runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 10,
+      });
+      expect.fail("expected E0c5 §1.2 error");
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toMatch(/E0c5 §1\.2/);
+      // The exited check should stop after the first poll that sees the exited event,
+      // not after the full timeout. With timeout=5000ms and poll=100ms, the old code
+      // would wait the full 5000ms. The new code should stop after 1-2 reads.
+      // reads includes the first read that returns empty (before triage spawn) +
+      // the read that sees the exited event. So total reads should be small.
+      expect(reads).toBeLessThan(10);
+    }
   });
 });

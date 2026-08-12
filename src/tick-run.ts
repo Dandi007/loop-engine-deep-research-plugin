@@ -18,6 +18,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, rmSync, writeFileSync, openSync, closeSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { ClueV2, DocV2 } from "./protocol";
 import {
   decideTick,
@@ -33,8 +34,10 @@ import {
 import {
   assembleBoard,
   buildRunsFromMessages,
+  findGenerateResult,
   findTriageResult,
   findWorkerResult,
+  isRunExited,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
@@ -533,6 +536,14 @@ export interface WriteResult {
   harvestReports: HarvestReport[];
   /** G2b——triage 收割报告（一次 triage 一条；含整批预算跳过/校验拒绝计数）。 */
   triageReports: TriageReport[];
+  /** E0c5 §1.1 —— CAS 操作总耗时（ms）。 */
+  casMs: number;
+  /** E0c5 §1.1 —— spawn worker 总耗时（ms）。 */
+  spawnMs: number;
+  /** E0c5 §1.1 —— harvest 总耗时（ms）。 */
+  harvestMs: number;
+  /** E0c5 §1.1 —— triage 总耗时（ms）。 */
+  triageMs: number;
 }
 
 function generateRunId(): string {
@@ -639,11 +650,20 @@ export async function runWrite(
     await deps.spawnWorker(clueId, role, runId, input);
   };
 
+  // 用于决策的 extends 子句（trackTime 用）
+  const startTime = performance.now();
+  let casTime = 0;
+  let spawnTime = 0;
+  let harvestTime = 0;
+  let triageTime = 0;
+
   const perform = async (input: WriteCasInput): Promise<CasDecision> => {
     if (writes >= maxWrites) {
       throw new MaxWritesExceededError(maxWrites);
     }
+    const t0 = performance.now();
     const result = await deps.cas(input);
+    casTime += performance.now() - t0;
     writes += 1;
     return result;
   };
@@ -700,6 +720,7 @@ export async function runWrite(
             writes += n;
           },
         };
+        const t0h = performance.now();
         const report = await harvestCard(
           hd,
           {
@@ -710,6 +731,7 @@ export async function runWrite(
           decision.runId,
           budget,
         );
+        harvestTime += performance.now() - t0h;
         harvestReports.push(report);
         if (report.casExplored) {
           // 全部发布成功 ⇒ 最后 CAS 到 explored（§1.1 / H6）。
@@ -752,7 +774,9 @@ export async function runWrite(
             decision.sources ?? [],
           );
           try {
+            const t0 = performance.now();
             await spawnWorker(decision.clueId, decision.role, runId, input);
+            spawnTime += performance.now() - t0;
             spawns.push({
               clueId: decision.clueId,
               role: decision.role,
@@ -847,7 +871,9 @@ export async function runWrite(
               (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
             );
           });
+        const t0t = performance.now();
         const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
+        triageTime += performance.now() - t0t;
         const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
         const applied = await applyTriageBatch(
           deps,
@@ -871,6 +897,10 @@ export async function runWrite(
     spawnCalls,
     harvestReports,
     triageReports,
+    casMs: casTime,
+    spawnMs: spawnTime,
+    harvestMs: harvestTime,
+    triageMs: triageTime,
   };
 }
 
@@ -1022,6 +1052,37 @@ export interface RunWriteOptions {
   triageThreshold?: number;
 }
 
+/**
+ * E0c5 §1.1 —— 一次 `--run` 的各阶段耗时（毫秒）。用于诊断 tick 在引擎
+ * `node_timeout` 之内被砍掉时，时间花在哪一步。
+ */
+export interface PhaseTimings {
+  /** 从入口到退出（整次 `--run` 的总耗时，ms）。 */
+  totalMs: number;
+  /** 读取板 channel 消息（含分页，ms）。 */
+  boardReadMs: number;
+  /** 读取 board:agent-runs 消息（含分页，ms）。 */
+  agentRunsReadMs: number;
+  /** 板面组装（assembleBoard，ms）。 */
+  assembleMs: number;
+  /** 决策计算（decideTick，ms）。 */
+  decisionMs: number;
+  /** 写侧执行（runWrite，含 CAS + spawn + harvest + triage，ms）。 */
+  writeMs: number;
+  /** 写侧执行中 CAS 操作的总耗时（ms）。 */
+  casMs: number;
+  /** 写侧执行中 spawn worker 的总耗时（ms）。 */
+  spawnMs: number;
+  /** 写侧执行中 harvest 的总耗时（ms）。 */
+  harvestMs: number;
+  /** 写侧执行中 triage 的总耗时（ms）。 */
+  triageMs: number;
+  /** 终止判定（decideTermination，ms）。 */
+  terminationMs: number;
+  /** 生成段（runGenerate，若有，ms）。 */
+  generateMs: number;
+}
+
 /** runChannelWrite 的观察输出。 */
 export interface RunWriteOutcome {
   channelId: string;
@@ -1049,6 +1110,8 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /** E0c5 §1.1 —— 各阶段耗时（ms），用于诊断 tick 在引擎 node_timeout 之内被砍掉时的时间分布。 */
+  timings: PhaseTimings;
 }
 
 /**
@@ -1322,9 +1385,16 @@ export function assembleGenerateDeps(
       readBody: async (runId: string) => {
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
         const deadline = Date.now() + timeoutMs;
+        const start = Date.now();
         while (Date.now() < deadline) {
-          const result = await readGenerateResult(runId);
-          if (result) return result.body;
+          const msgs = await readChannelMessages(RUNS_CHANNEL_ID);
+          const genResult = findGenerateResult(runId, msgs);
+          if (genResult) return genResult.body;
+          if (isRunExited(runId, msgs)) {
+            throw new Error(
+              `E0c5 §1.2: run ${runId} (generate) exited without producing a dr-doc.result.v1 after ${Date.now() - start}ms — refusing to wait the full timeout`,
+            );
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1491,18 +1561,24 @@ export function assembleGenerateDeps(
 export async function runChannelWrite(
   opts: RunWriteOptions,
 ): Promise<RunWriteOutcome> {
+  const totalStart = performance.now();
+
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
   const nonce = randomUUID();
   const runsChannelId = opts.runsChannelId ?? RUNS_CHANNEL_ID;
+
+  const t0Board = performance.now();
   const messages = await readChannelMessages(opts.channelId);
-  // A8e——`board:agent-runs` 只分页读一次，同时喂给 runs 归集与每张卡的 worker.result
-  //   查询（评审 note：readWorkerResult 原先每张 harvest 卡把整个 channel 再分页一遍，
-  //   这是 O(cards x channel) 的读放大；这里复用同一份已读消息列表）。
+  const t1Board = performance.now();
+
   const runsMessages = await readChannelMessages(runsChannelId);
+  const t2Runs = performance.now();
+
   const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
+  const t3Assemble = performance.now();
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
   //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
   //   （profiles/deploy/agent-harness.env: research:agent-harness.evidence，与板 channel
@@ -1526,7 +1602,9 @@ export async function runChannelWrite(
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
   };
+  const t4DecisionStart = performance.now();
   const decisions = decideTick(state, tickConfig);
+  const t5Decision = performance.now();
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
   const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
   const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
@@ -1599,9 +1677,16 @@ export async function runChannelWrite(
             readResult: async (runId) => {
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
               const deadline = Date.now() + timeoutMs;
+              const start = Date.now();
               while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
-                if (result !== null) return result;
+                const msgs = await readChannelMessages(RUNS_CHANNEL_ID);
+                const triageResult = findTriageResult(runId, msgs);
+                if (triageResult !== null) return triageResult;
+                if (isRunExited(runId, msgs)) {
+                  throw new Error(
+                    `E0c5 §1.2: run ${runId} (dr-triage) exited without producing a dr-triage.result.v1 after ${Date.now() - start}ms — refusing to wait the full timeout`,
+                  );
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(
@@ -1614,11 +1699,13 @@ export async function runChannelWrite(
           );
       }),
   };
+  const t6WriteStart = performance.now();
   const result = await runWrite(
     deps,
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  const t7Write = performance.now();
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1659,6 +1746,7 @@ export async function runChannelWrite(
       : postWriteState.cards;
   //   coverage 取本轮 evidence 已覆盖的 clue_id 集合大小（coveredClueIds 已并入证据 channel
   //      的覆盖；经 Set 去重后的大小，与 decideTermination 内部 computeCoverage 一致）。
+  const t8TermStart = performance.now();
   const termination = decideTermination(
     {
       cards: termCards,
@@ -1668,10 +1756,13 @@ export async function runChannelWrite(
     },
     tickConfig,
   );
+  const t9Term = performance.now();
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  let generateMs = 0;
   if (opts.origin) {
     if (decideGenerate(termination)) {
+      const tGenStart = performance.now();
       const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
       const markerKey = `${opts.origin}:${opts.channelId}`;
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
@@ -1682,8 +1773,11 @@ export async function runChannelWrite(
         mkdirSync(oneShotDir, { recursive: true });
         writeFileSync(markerPath, "");
       }
+      generateMs = performance.now() - tGenStart;
     }
   }
+
+  const totalMs = performance.now() - totalStart;
 
   return {
     channelId: opts.channelId,
@@ -1697,6 +1791,20 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    timings: {
+      totalMs,
+      boardReadMs: t1Board - t0Board,
+      agentRunsReadMs: t2Runs - t1Board,
+      assembleMs: t3Assemble - t2Runs,
+      decisionMs: t5Decision - t4DecisionStart,
+      writeMs: t7Write - t6WriteStart,
+      casMs: result.casMs,
+      spawnMs: result.spawnMs,
+      harvestMs: result.harvestMs,
+      triageMs: result.triageMs,
+      terminationMs: t9Term - t8TermStart,
+      generateMs,
+    },
   };
 }
 

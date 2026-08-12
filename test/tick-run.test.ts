@@ -30,6 +30,7 @@ import {
   buildAgentRunArgv,
   buildWorkerInput,
   writeWorkerInputFile,
+  type PhaseTimings,
 } from "../src/tick-run";
 import type { WriteDeps, WriteCasInput, WorkerInputPayload } from "../src/tick-run";
 import { readAgentRuns } from "../src/tick-inspect";
@@ -1298,5 +1299,111 @@ describe("P11: spawnWorker widened — clue text really reaches the prompt (disc
       if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
       else process.env.AGENT_RUN_BIN = prevBin;
     }
+  });
+});
+
+// ── E0c5 §1.1: 阶段耗时 instrumentation ──────────────────────────────────────
+
+describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
+  it("timings field exists and all sub-fields are non-negative numbers", async () => {
+    const openClueMsg = {
+      message_id: "msg_open_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      entity_id: "clue_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: openClueMsg });
+        }
+        if (u.includes("/publish")) {
+          return jsonResponse({ message_id: `p_${Math.random()}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const spawnWorker = vi.fn(async () => {});
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      spawnWorker,
+    });
+
+    const t = outcome.timings;
+    expect(t).toBeDefined();
+    const keys: (keyof PhaseTimings)[] = [
+      "totalMs", "boardReadMs", "agentRunsReadMs", "assembleMs",
+      "decisionMs", "writeMs", "casMs", "spawnMs", "harvestMs",
+      "triageMs", "terminationMs", "generateMs",
+    ];
+    for (const k of keys) {
+      expect(typeof t[k], `timings.${k} should be a number`).toBe("number");
+      expect(t[k], `timings.${k} should be >= 0`).toBeGreaterThanOrEqual(0);
+    }
+    expect(t.totalMs).toBeGreaterThan(0);
+  });
+
+  it("timings totalMs is approximately the sum of major phases", async () => {
+    const openClueMsg = {
+      message_id: "msg_open_1",
+      channel_id: WIRE_CLUE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      entity_id: "clue_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let clueCalls = 0;
+    let runsCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        if (u.includes("/entities/")) {
+          return jsonResponse({ head: openClueMsg });
+        }
+        if (u.includes("/publish")) {
+          return jsonResponse({ message_id: `p_${Math.random()}`, channel_seq: 99 });
+        }
+        if (u.includes(`/v1/channels/${WIRE_CLUE_CHANNEL}/messages`)) {
+          clueCalls += 1;
+          return jsonResponse({ messages: clueCalls === 1 ? [openClueMsg] : [] });
+        }
+        if (u.includes("/v1/channels/board:agent-runs/messages")) {
+          runsCalls += 1;
+          return jsonResponse({ messages: [] });
+        }
+        return jsonResponse({ messages: [] });
+      }),
+    );
+
+    const spawnWorker = vi.fn(async () => {});
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CLUE_CHANNEL,
+      spawnWorker,
+    });
+
+    const t = outcome.timings;
+    const majorSum = t.boardReadMs + t.agentRunsReadMs + t.assembleMs +
+      t.decisionMs + t.writeMs + t.terminationMs + t.generateMs;
+    expect(majorSum).toBeLessThanOrEqual(t.totalMs);
   });
 });

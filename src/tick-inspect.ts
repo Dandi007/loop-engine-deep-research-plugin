@@ -357,6 +357,20 @@ export async function readTriageResult(
 }
 
 /**
+ * E0c5 §1.2 —— 检查给定 run_id 是否已在给定消息列表中 exited。
+ * 用于在等待 worker 结果时，若 run 已退出但未产出结果，立即停止等待。
+ */
+export function isRunExited(runId: string, messages: InspectMessage[]): boolean {
+  for (const msg of messages) {
+    const parsed = parseRunEvent(msg);
+    if (parsed && parsed.runId === runId && parsed.event.state === "exited") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

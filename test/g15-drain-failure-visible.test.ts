@@ -3,6 +3,8 @@
  *
  * 硬验收 Y1–Y4（spec §2）。每个测试用假 loop-engine CLI / 假 store-cli
  * 驱动生产 bin/deep-research-loop.sh，离线不碰 bus。
+ *
+ * E0c5 §1.3 —— 新增 TIMEOUT / exec_failed 检测（Y5–Y6）。
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -126,6 +128,17 @@ function writeJournal(journalPath: string, result: string): void {
       run_id: "tick~1",
       identity: "tick",
       result,
+    }) + "\n",
+  );
+}
+
+function writeEventJournal(journalPath: string, events: string[]): void {
+  writeFileSync(
+    journalPath,
+    JSON.stringify({
+      run_id: "tick~1",
+      identity: "tick",
+      events,
     }) + "\n",
   );
 }
@@ -410,6 +423,78 @@ describe("Y4: 痕迹不可读 ⇒ 响亮失败", () => {
     expect(res.code).not.toBe(0);
     expect(res.err).toContain("no lane entries");
     expect(res.err).toContain(drainId);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ── E0c5 §1.3: TIMEOUT / exec_failed 检测 ─────────────────────────────────────
+
+describe("Y5: tick 被引擎超时砍掉 (status=TIMEOUT) ⇒ 响亮失败点名 run_dir", () => {
+  it("journal contains status=TIMEOUT ⇒ non-zero exit naming run_dir and timeout", () => {
+    const drainId = "test-drain-y5";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y5");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeJournal(join(runDir, "journal.jsonl"), "[外部调用失败 status=TIMEOUT]");
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y5",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("timeout");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("Y6: tick 以 exec_failed 结束 ⇒ 响亮失败点名 run_dir", () => {
+  it("journal events contain exec_failed ⇒ non-zero exit naming run_dir", () => {
+    const drainId = "test-drain-y6";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y6");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeEventJournal(join(runDir, "journal.jsonl"), [
+      "start", "spawn", "dispatch", "done", "exec_failed", "stop",
+    ]);
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y6",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("exec_failed");
 
     rmSync(dir, { recursive: true, force: true });
   });

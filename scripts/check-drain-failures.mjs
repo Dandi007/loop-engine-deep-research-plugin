@@ -70,11 +70,26 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
+    // G15 —— 原有: bash 非零退出
     const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
     if (m) {
       failed = true;
       process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+    }
+    // E0c5 §1.3 —— tick 被引擎级超时砍掉（node_timeout）
+    const t = line.match(/status=TIMEOUT/);
+    if (t) {
+      failed = true;
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec timeout\n`);
+      process.stderr.write(`[deep-research-loop]   journal result: ${line.trim()}\n`);
+    }
+    // E0c5 §1.3 —— tick 以 exec_failed 结束（引擎 node_timeout 或进程崩溃）
+    const ef = line.match(/exec_failed/);
+    if (ef) {
+      failed = true;
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec_failed\n`);
+      process.stderr.write(`[deep-research-loop]   journal event: ${line.trim()}\n`);
     }
   }
 }

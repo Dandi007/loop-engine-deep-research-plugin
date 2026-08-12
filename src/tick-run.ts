@@ -1602,12 +1602,16 @@ export async function runChannelWrite(
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
   };
-  const t4DecisionStart = performance.now();
-  const decisions = decideTick(state, tickConfig);
-  const t5Decision = performance.now();
-  // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
   const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
   const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
+  const effectiveTickConfig = {
+    ...tickConfig,
+    maxClues,
+    maxDepth,
+  };
+  const t4DecisionStart = performance.now();
+  const decisions = decideTick(state, effectiveTickConfig);
+  const t5Decision = performance.now();
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
@@ -1754,7 +1758,7 @@ export async function runChannelWrite(
       prevCoverage: opts.prevCoverage ?? 0,
       prevZeroGrowthRounds: opts.prevZeroGrowthRounds ?? 0,
     },
-    tickConfig,
+    effectiveTickConfig,
   );
   const t9Term = performance.now();
 
@@ -1790,7 +1794,7 @@ export async function runChannelWrite(
     triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
-    triageThreshold: tickConfig.triageThreshold,
+    triageThreshold: effectiveTickConfig.triageThreshold,
     timings: {
       totalMs,
       boardReadMs: t1Board - t0Board,
@@ -1897,6 +1901,8 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /** E0c5 §1.1 —— MAX_CLUES（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
 }
 
 /**
@@ -1920,6 +1926,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -2003,6 +2010,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c5: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -2018,6 +2034,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

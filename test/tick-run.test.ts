@@ -1302,16 +1302,25 @@ describe("P11: spawnWorker widened — clue text really reaches the prompt (disc
   });
 });
 
-// ── E0c5 §1.1: 阶段耗时 instrumentation ──────────────────────────────────────
+// ── E0c5 §1.1: 判别性规范测试 —— 驱动真实 --run 在种子板上，断言远低于 node_timeout ──
 
-describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
-  it("timings field exists and all sub-fields are non-negative numbers", async () => {
+/**
+ * 判别性（判据 2 ⭐⭐）：在种子板（1 条线索）上驱动真实 `--run`，断言：
+ * 1. 耗时低于引擎 `node_timeout`（30 秒）的一半（即 < 15000ms）；
+ * 2. `termination` 可被读出（非 null，含 state/coverage/boardComposition）；
+ * 3. 全部阶段计时字段存在且可测量（移除阶段计时 ⇒ 该测试变红）。
+ */
+describe("E0c5 §1.1: discriminating — runChannelWrite on seed board", () => {
+  const NODE_TIMEOUT_HALF_MS = 15000; // node_timeout: 30 的一半
+
+  it("timings.totalMs < node_timeout/2, termination readable, all phase timings measurable", async () => {
+    // 构造种子板：1 条 open clue（sources 不含 code-local 以免触 code-local 检查）
     const openClueMsg = {
       message_id: "msg_open_1",
       channel_id: WIRE_CLUE_CHANNEL,
       channel_seq: 1,
       kind: "research.clue.v2",
-      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      payload: { status: "open", text: "t", depth: 0, sources: ["wiki"] },
       entity_id: "clue_x",
       supersedes: null,
       created_at: "2026-01-01T00:00:00Z",
@@ -1320,7 +1329,7 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
     let runsCalls = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: unknown, init?: RequestInit) => {
+      vi.fn(async (url: unknown) => {
         const u = String(url);
         if (u.includes("/entities/")) {
           return jsonResponse({ head: openClueMsg });
@@ -1344,8 +1353,10 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
     const outcome = await runChannelWrite({
       channelId: WIRE_CLUE_CHANNEL,
       spawnWorker,
+      maxClues: 24,
     });
 
+    // 断言 1：全部阶段计时存在且 >= 0（判别性：移除阶段计时 ⇒ 这些字段缺失/类型错误）
     const t = outcome.timings;
     expect(t).toBeDefined();
     const keys: (keyof PhaseTimings)[] = [
@@ -1358,6 +1369,20 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
       expect(t[k], `timings.${k} should be >= 0`).toBeGreaterThanOrEqual(0);
     }
     expect(t.totalMs).toBeGreaterThan(0);
+    // 终止判定计时必须可测（decideTermination 被调用过）
+    expect(t.terminationMs).toBeGreaterThanOrEqual(0);
+
+    // 断言 2：耗时远低于引擎 node_timeout 的一半
+    expect(t.totalMs).toBeLessThan(NODE_TIMEOUT_HALF_MS);
+
+    // 断言 3：termination 可读
+    expect(outcome.termination).toBeDefined();
+    expect(outcome.termination.state).toBeNull(); // 种子板只有 1 条线索，未收敛
+    expect(typeof outcome.termination.coverage).toBe("number");
+    expect(typeof outcome.termination.zeroGrowthRounds).toBe("number");
+    expect(outcome.termination.boardComposition).toBeDefined();
+    expect(outcome.termination.boardComposition.open).toBeGreaterThanOrEqual(0);
+    expect(outcome.termination.boardComposition.explored).toBeGreaterThanOrEqual(0);
   });
 
   it("timings totalMs is approximately the sum of major phases", async () => {
@@ -1366,7 +1391,7 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
       channel_id: WIRE_CLUE_CHANNEL,
       channel_seq: 1,
       kind: "research.clue.v2",
-      payload: { status: "open", text: "t", depth: 0, sources: ["code-local"] },
+      payload: { status: "open", text: "t", depth: 0, sources: ["wiki"] },
       entity_id: "clue_x",
       supersedes: null,
       created_at: "2026-01-01T00:00:00Z",
@@ -1375,7 +1400,7 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
     let runsCalls = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: unknown, init?: RequestInit) => {
+      vi.fn(async (url: unknown) => {
         const u = String(url);
         if (u.includes("/entities/")) {
           return jsonResponse({ head: openClueMsg });
@@ -1399,6 +1424,7 @@ describe("E0c5 §1.1: phase timings are present in RunWriteOutcome", () => {
     const outcome = await runChannelWrite({
       channelId: WIRE_CLUE_CHANNEL,
       spawnWorker,
+      maxClues: 24,
     });
 
     const t = outcome.timings;

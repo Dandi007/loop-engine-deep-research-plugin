@@ -12,7 +12,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -279,6 +279,29 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
     expect(e0.SEED_SOURCES.trim()).not.toBe("");
     // 种子文本须与 ALLOWED_ROOT 相称、能让 code-local worker 真找到东西（§1.4）。
     expect(e0.SEED_CLUE.length).toBeGreaterThan(20);
+  });
+
+  it("E0c1 DISCRIMINATING: SEED_CLUE references a real file under ALLOWED_ROOT (not a fabricated path)", () => {
+    // 评审 minor / blocker：原断言只看 length，无法区分「repo-relevant clue」与「似是而非的假线索」
+    // （上一版 SEED_CLUE 指向 src/tick-run.ts，但该文件属于本插件仓而非 ALLOWED_ROOT 指向的
+    // agent-runtime 仓——正是 §0「为观察不到的产物发明契约」的形状）。
+    // 这里把 SEED_CLUE 里的 src/<...>.ts 路径抽出来，要求它在 ALLOWED_ROOT 下真实存在，
+    // 使 criterion 4/9 对 clue 真伪可判别，而不是长度判别。
+    const e0 = readProfile("e0-regression");
+    const allowedRoot = e0.ALLOWED_ROOT;
+    expect(allowedRoot, "ALLOWED_ROOT must be declared by the profile").toBeTruthy();
+    const clue = e0.SEED_CLUE;
+    expect(clue, "SEED_CLUE must be declared by the profile").toBeTruthy();
+    // 抽出 clue 里形如 src/.../.ts 的路径（允许中间路径段含字母数字/_/-/.）。
+    const match = clue.match(/(src\/[A-Za-z0-9_./-]+\.ts)/);
+    expect(match, "SEED_CLUE must reference a src/*.ts path the code-local worker can observe under ALLOWED_ROOT").not.toBeNull();
+    const rel = match![1];
+    const abs = join(allowedRoot, rel);
+    // 判别性核心：clue 指向的文件必须在 ALLOWED_ROOT 下真实存在（非目录）。
+    // 如果实现者把 clue 改回指向 ALLOWED_ROOT 下不存在的文件（如 src/tick-run.ts），
+    // 这个断言会变红——正是上一版 blocker 的失败形状。
+    expect(existsSync(abs), `SEED_CLUE references "${rel}" but it does not exist under ALLOWED_ROOT=${allowedRoot} (abs=${abs})`).toBe(true);
+    expect(statSync(abs).isFile(), `SEED_CLUE references "${rel}" but it is not a regular file under ALLOWED_ROOT=${allowedRoot}`).toBe(true);
   });
 
   it("--profile e0-regression loads via the entry script (guard passes, script proceeds past profile load)", () => {

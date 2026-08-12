@@ -17,9 +17,22 @@ set -euo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# E0c1 §1.3 —— board:agent-runs 是全局 channel，名字在仓内只有一处真相源
-# （src/run-channels.ts:RUNS_CHANNEL_ID）。bash 侧只在此处引用该字面量，与 TS 真相源保持一致。
-RUNS_CHANNEL_ID="board:agent-runs"
+# E0c1 §1.3 / 判据 6 —— board:agent-runs 是全局 channel，名字在仓内只有一处真相源
+# （src/run-channels.ts:RUNS_CHANNEL_ID）。bash 侧**不再写第二份字面量**：从该 TS 常量
+# 经 vite-node 解析（与 §1.2 prod-read 同款调用），确保 entry 预备/记录的 channel 与
+# harvest/triage 读的 channel 永远来自同一处。解析失败即响亮失败（⛔ 不回退字面量）。
+_resolve_runs_channel_id() {
+  AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c1-runs-channel.ts"
+}
+if ! RUNS_CHANNEL_ID="$(_resolve_runs_channel_id)"; then
+  echo "[e0-regression] REFUSING to start: failed to resolve RUNS_CHANNEL_ID from src/run-channels.ts (spec §1.3 / 判据 6: the name has exactly one source of truth; refusing to fall back to a hardcoded literal)." >&2
+  exit 3
+fi
+if [ -z "$RUNS_CHANNEL_ID" ]; then
+  echo "[e0-regression] REFUSING to start: RUNS_CHANNEL_ID resolved to empty from src/run-channels.ts (spec §1.3: refusing to fall back to a hardcoded literal)." >&2
+  exit 3
+fi
 
 # ── 参数：--run <id>（可选覆盖 run id）/ --profile <name>（可选覆盖 profile）。──
 PROFILE="e0-regression"
@@ -201,8 +214,22 @@ PROD_BUS_TOKEN_FILE="${E0C1_PROD_BUS_TOKEN_FILE:-/data/agent-bus/tokens/uther-tu
 _read_prod_head_seq_sum() {
   # 真解析 + 真求和（GT-3）：用 node JSON.parse，⛔ 禁止贪婪正则抽多值。
   # 通过 node 调 src/bus.ts 的 listChannelsAt + sumHeadSeqAcrossChannels 以复用单一真相源。
-  AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" E0C1_PROD_BUS_URL="$PROD_BUS_URL" E0C1_PROD_BUS_TOKEN_FILE="$PROD_BUS_TOKEN_FILE" \
-    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c1-prod-read.ts" 2>/dev/null
+  # 不再丢弃子进程 stderr：把它的 stderr 透传给调用方（与 e0c1-prod-read.ts 自己的 stderr 合并），
+  # 这样 §1.2 读失败的根因（token 读不到、HTTP 状态、非数值 head_seq）能落到运行记录里便于诊断。
+  local _ec _out _err
+  set +e
+  _out="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" E0C1_PROD_BUS_URL="$PROD_BUS_URL" E0C1_PROD_BUS_TOKEN_FILE="$PROD_BUS_TOKEN_FILE" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c1-prod-read.ts" 2>"$ENTRY_TMP.prod-read.err")"
+  _ec=$?
+  set -e
+  if [ "$_ec" -ne 0 ]; then
+    _err="$(cat "$ENTRY_TMP.prod-read.err" 2>/dev/null || true)"
+    rm -f "$ENTRY_TMP.prod-read.err" 2>/dev/null || true
+    echo "[e0-regression] production bus read failed (exit=$_ec): ${_err:-<no stderr>}" >&2
+    return "$_ec"
+  fi
+  rm -f "$ENTRY_TMP.prod-read.err" 2>/dev/null || true
+  printf '%s' "$_out"
 }
 
 echo "[e0-regression] reading production bus sum(head_seq) BEFORE run ($PROD_BUS_URL)" >&2
@@ -225,12 +252,25 @@ echo "[e0-regression] tick_channel=$TICK_CHANNEL (per-run derived)"
 #   种子文本与 sources 均由 profile 声明（SEED_CLUE / SEED_SOURCES），⛔ 不写死在脚本里。
 #   幂等：idempotency key 由输入确定性派生（src/tick-seed.ts:buildSeedIdempotencyKey），重复播种不会翻倍。
 #   播种失败 ⇒ 响亮失败、非零退出（GT-2：sources 必须非空）。
+#   SEED_SOURCES 支持逗号/空格分隔的多个 source（GT-2：multi-source profile 必须作为列表传入，
+#   而不是一整个 bogus source 名字）；这里拆成重复的 --source 操作数。
 echo "[e0-regression] seeding empty per-run board: $TICK_CHANNEL (sources=$SEED_SOURCES)" >&2
+_seed_args=()
+for _src in $(printf '%s' "$SEED_SOURCES" | tr ',' ' '); do
+  if [ -n "$_src" ]; then
+    _seed_args+=(--source "$_src")
+  fi
+done
+if [ "${#_seed_args[@]}" -eq 0 ]; then
+  echo "[e0-regression] REFUSING to continue: SEED_SOURCES declared but produced no --source operands after splitting (spec §1.4 / GT-2: sources must be non-empty and parseable)." >&2
+  exit 3
+fi
 set +e
 SEED_LOG="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/tick-entry.ts" -- \
-  --seed "$TICK_CHANNEL" --clue "$SEED_CLUE" --source "$SEED_SOURCES" 2>&1)"
+  --seed "$TICK_CHANNEL" --clue "$SEED_CLUE" "${_seed_args[@]}" 2>&1)"
 SEED_EXIT=$?
 set -e
+unset _seed_args _src
 echo "$SEED_LOG" > "$RECORD_DIR/seed.log"
 if [ "$SEED_EXIT" -ne 0 ]; then
   echo "[e0-regression] REFUSING to continue: seeding failed (exit=$SEED_EXIT). spec §1.4: seeding failure must fail loudly (GT-2: sources must be non-empty and profile-declared)." >&2

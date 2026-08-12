@@ -311,6 +311,33 @@ describe("§1.3 / 判据 6: board:agent-runs has exactly one source of truth in 
   it("RUNS_CHANNEL_ID constant value is exactly board:agent-runs", () => {
     expect(RUNS_CHANNEL_ID).toBe("board:agent-runs");
   });
+
+  it("DISCRIMINATING: bin/e0-regression.sh does NOT hardcode the board:agent-runs literal (resolves it from the single TS source)", () => {
+    // 评审 major：bin/e0-regression.sh 旧版硬编码 RUNS_CHANNEL_ID="board:agent-runs" 作为第二份字面量，
+    // 判据 6「⛔ 不要再写一份字面量」失效；test 只扫 src/ 漂移无人守。
+    // 判别性：把脚本里的解析调用改回硬编码字面量 ⇒ 本测试变红。
+    const entry = readFileSync(join(REPO_ROOT, "bin", "e0-regression.sh"), "utf8");
+    // 跳过注释行（# 开头），只看实际代码。
+    const offenders: string[] = [];
+    entry.split("\n").forEach((line, i) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#")) return;
+      // 命中字面量 "board:agent-runs"（含单/双引号、模板串）即漂移。
+      if (/["'`]board:agent-runs["'`]/.test(line)) {
+        offenders.push(`bin/e0-regression.sh:${i + 1}: ${line.trim()}`);
+      }
+    });
+    expect(
+      offenders,
+      "bin/e0-regression.sh must resolve RUNS_CHANNEL_ID from src/run-channels.ts (via src/e0c1-runs-channel.ts), not hardcode the literal a second time (spec §1.3 / 判据 6)",
+    ).toEqual([]);
+    // 判别性（正向）：脚本必须真的去解析（调用 e0c1-runs-channel.ts），
+    // 否则把硬编码删掉却不解析也能让上面的 offenders 断言空过。
+    expect(
+      entry,
+      "bin/e0-regression.sh must invoke src/e0c1-runs-channel.ts to resolve the name from the single TS source",
+    ).toMatch(/e0c1-runs-channel\.ts/);
+  });
 });
 
 // ── §1.2：生产总线跑前/跑后两读数写进记录且相等 ──────────────────────────────
@@ -381,11 +408,13 @@ function startFakeBus(): Promise<{
   base: string;
   createdChannels: () => string[];
   setProdSum: (n: number) => void;
+  bumpProdSumAfterNextListRead: (delta: number) => void;
   close: () => void;
 }> {
   return new Promise((resolve) => {
     const created: string[] = [];
     let prodSum = 0;
+    let pendingBump: number | null = null;
     const server = createServer((req, res) => {
       const url = req.url ?? "";
       const method = req.method ?? "GET";
@@ -407,6 +436,13 @@ function startFakeBus(): Promise<{
       if (method === "GET" && url === "/v1/channels") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ channels: [{ channel_id: "fake:prod", head_seq: prodSum }] }));
+        // 确定性 bump：下一次列表读完成后把 prodSum 加上 pendingBump（模拟生产总线被写入）。
+        // 用回调替代固定 setTimeout，消除测试对入口各阶段耗时的时序耦合。
+        if (pendingBump !== null) {
+          const d = pendingBump;
+          pendingBump = null;
+          prodSum += d;
+        }
         return;
       }
       if (method === "GET" && url.startsWith("/v1/channels/")) {
@@ -435,6 +471,9 @@ function startFakeBus(): Promise<{
         createdChannels: () => [...created],
         setProdSum: (n: number) => {
           prodSum = n;
+        },
+        bumpProdSumAfterNextListRead: (delta: number) => {
+          pendingBump = delta;
         },
         close: () => server.close(),
       });
@@ -521,8 +560,10 @@ describe("E0c1 entry integration: per-run channels + board:agent-runs prep + §1
     const recRoot = mkdtempSync(join(tmpdir(), "e0c1-entry-rec3-"));
     const tokFile = makeTokenFileE0c1();
     const runId = "e0c1-entry-delta-003";
-    // loop 失败快（CLI 不存在）；bumpTimer 在 loop 期间把 prodSum 改大，模拟生产总线被写入。
-    const bumpTimer = setTimeout(() => bus.setProdSum(99), 600);
+    // loop 失败快（CLI 不存在）；用确定性 bump 模拟生产总线被写入：
+    // before-read（入口跑前读数）完成后，把 prodSum 加 89，使 after-read 读到 99 ⇒ delta=89。
+    // 用回调替代固定 setTimeout，消除入口各阶段（RUNS_CHANNEL_ID 解析、channel 预备等）耗时的时序耦合。
+    bus.bumpProdSumAfterNextListRead(89);
     try {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
@@ -540,7 +581,6 @@ describe("E0c1 entry integration: per-run channels + board:agent-runs prep + §1
       expect(meta).toMatch(/prod_bus_delta=89/);
       expect(res.code).toBe(3);
     } finally {
-      clearTimeout(bumpTimer);
       bus.close();
       rmSync(recRoot, { recursive: true, force: true });
       rmSync(dirname(tokFile), { recursive: true, force: true });

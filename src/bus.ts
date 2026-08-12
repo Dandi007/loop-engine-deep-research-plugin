@@ -182,8 +182,11 @@ export async function listChannelsAt(
       const headSeq = obj.head_seq;
       if (typeof channelId !== "string") continue;
       if (typeof headSeq !== "number" || !Number.isFinite(headSeq)) {
+        // E0c1 §1.1 —— 响亮失败须点名 channel 与**实际拿到的字段集**（spec §1.1），
+        // 以便真机形状改变时从错误本身即可诊断（评审 minor：原仅打印 head_seq 的 JSON.stringify）。
+        const observedKeys = Object.keys(obj).sort().join(", ");
         throw new Error(
-          `E0c1: list endpoint at ${baseUrl} returned channel "${channelId}" without a finite numeric head_seq (got ${JSON.stringify(headSeq)}). The list endpoint is the sole source of head_seq per GT-1; refusing to fabricate 0.`,
+          `E0c1: list endpoint at ${baseUrl} returned channel "${channelId}" without a finite numeric head_seq (got ${JSON.stringify(headSeq)}). Observed fields on the list item: [${observedKeys || "<none>"}]. The list endpoint is the sole source of head_seq per GT-1; refusing to fabricate 0.`,
         );
       }
       items.push({ channel_id: channelId, head_seq: headSeq });

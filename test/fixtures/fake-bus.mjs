@@ -51,8 +51,25 @@ const server = createServer((req, res) => {
       const list = (channels.get(id) ?? []).filter((m) => m.channel_seq > after);
       return send(200, { messages: list });
     }
-    if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
-      return send(200, { head_seq: (channels.get(decodeURIComponent(path.split("/")[3])) ?? []).length });
+    // E0c2 GT-8 —— 单 channel GET（/v1/channels/<id>）在真机 bus 上不含 head_seq。
+// ⛔ 假 bus 必须照此实现：单 channel GET 不返回 head_seq。
+// head_seq 的唯一可信来源是列表端点 GET /v1/channels。
+if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
+      const id = decodeURIComponent(path.split("/")[3]);
+      const list = channels.get(id) ?? [];
+      return send(200, {
+        channel_id: id,
+        closed_at: null,
+        created_at: new Date().toISOString(),
+        delivery_mode: "push",
+        owner_agent_id: "test-agent",
+        refs_required: false,
+        visibility: "public",
+        max_attempts: 3,
+        default_lease_ms: 30000,
+        metadata: {},
+        // ⛔ GT-8: single channel GET does NOT include head_seq
+      });
     }
     if (req.method === "GET" && /^\/v1\/entities\/[^/]+$/.test(path)) {
       const id = decodeURIComponent(path.split("/")[3]);

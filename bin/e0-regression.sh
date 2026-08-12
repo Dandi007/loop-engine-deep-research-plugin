@@ -294,13 +294,156 @@ if [ "$SEED_EXIT" -ne 0 ]; then
 fi
 echo "$SEED_LOG" >&2
 
-# ── 跑现状链路到终态；完整 stdout/stderr 落盘，退出码单独记录。──
-set +e
-bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
-  > "$RECORD_DIR/run.stdout.log" 2> "$RECORD_DIR/run.stderr.log"
-LOOP_EXIT=$?
-set -e
+# E0c2 §1.3 —— 跨 drain 循环参数校验（由 profile 声明，⛔ 不写死在脚本里）。
+# 缺失即响亮失败（与 SEED_CLUE / SEED_SOURCES / RESEARCH_PROFILE_BASE 范式一致）。
+if [ -z "${DRAIN_BACKOFF_SECONDS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: DRAIN_BACKOFF_SECONDS is not declared by profile '$PROFILE' (spec §1.3: backoff must be profile-declared, not hardcoded)." >&2
+  exit 3
+fi
+if [ -z "${DRAIN_MAX_ATTEMPTS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: DRAIN_MAX_ATTEMPTS is not declared by profile '$PROFILE' (spec §1.3: max attempts must be profile-declared, not hardcoded)." >&2
+  exit 3
+fi
+if [ -z "${DRAIN_WALL_CLOCK_SECONDS:-}" ]; then
+  echo "[e0-regression] REFUSING to start: DRAIN_WALL_CLOCK_SECONDS is not declared by profile '$PROFILE' (spec §1.3: wall clock limit must be profile-declared, not hardcoded)." >&2
+  exit 3
+fi
 
+# ── E0c2 §1.3 —— 跨 drain 循环：反复跑 deep-research-loop.sh 直到终态收敛。──
+# 每轮：跑 drain → 分类退出码（GT-6）→ 读 termination.state（§1.1）→ 判终态或退避重来。
+WALL_START=$(date +%s)
+DRAIN_ATTEMPT=0
+TERMINATION_STATE="null"
+LOOP_EXIT=0
+DRAIN_RECORDS=""
+
+mkdir -p "$RECORD_DIR/drain-rounds"
+
+_drain_fail_echo() {
+  local attempt="$1" exit_code="$2" reason="$3"
+  echo "[e0-regression] DRAIN FAILED (attempt ${attempt}): reason=${reason} exit=${exit_code}" >&2
+  echo "[e0-regression] drain stdout:" >&2
+  cat "$RECORD_DIR/drain-rounds/drain-${attempt}.stdout.log" >&2
+  echo "[e0-regression] drain stderr:" >&2
+  cat "$RECORD_DIR/drain-rounds/drain-${attempt}.stderr.log" >&2
+}
+
+while true; do
+  DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))
+
+  # 墙钟上限检查
+  NOW=$(date +%s)
+  ELAPSED=$((NOW - WALL_START))
+  if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
+    echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    LOOP_EXIT=4
+    break
+  fi
+
+  # 次数上限检查
+  if [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    LOOP_EXIT=4
+    break
+  fi
+
+  # ── 跑一次 drain ──
+  set +e
+  bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
+    > "$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log" \
+    2> "$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stderr.log"
+  DRAIN_EXIT=$?
+  set -e
+
+  # GT-7：逐行 JSON.parse 取摘要（⛔ 禁止花括号正则）
+  DRAIN_SUMMARY=""
+  if ! DRAIN_SUMMARY="$(node "$PLUGIN_ROOT/scripts/drain-parse-summary.mjs" \
+    < "$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log" 2>/dev/null)"; then
+    _drain_fail_echo "$DRAIN_ATTEMPT" "$DRAIN_EXIT" "parse_error"
+    LOOP_EXIT=5
+    break
+  fi
+
+  # 从摘要取 reason
+  DRAIN_REASON=""
+  DRAIN_REASON="$(printf '%s' "$DRAIN_SUMMARY" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      try { const o=JSON.parse(s.trim()); process.stdout.write(String(o.reason||'')); }
+      catch { process.stdout.write(''); }
+    });
+  " 2>/dev/null)" || DRAIN_REASON=""
+
+  # GT-6：分类退出码
+  if [ "$DRAIN_REASON" = "max_rounds" ]; then
+    if [ "$DRAIN_EXIT" -ne 1 ]; then
+      _drain_fail_echo "$DRAIN_ATTEMPT" "$DRAIN_EXIT" "max_rounds_unexpected_exit"
+      LOOP_EXIT=5
+      break
+    fi
+    # max_rounds + exit 1 ⇒ 还没收敛，退避重来
+  elif [ "$DRAIN_REASON" = "drained" ]; then
+    # drained ⇒ 继续判终态
+    :
+  else
+    if [ "$DRAIN_EXIT" -ne 0 ]; then
+      _drain_fail_echo "$DRAIN_ATTEMPT" "$DRAIN_EXIT" "${DRAIN_REASON:-unknown}"
+      LOOP_EXIT=5
+      break
+    fi
+  fi
+
+  # §1.1：读本次的 termination.state
+  TERM_JSON=""
+  if ! TERM_JSON="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>&1)"; then
+    echo "[e0-regression] FAILED to read termination.state (attempt ${DRAIN_ATTEMPT}): ${TERM_JSON}" >&2
+    LOOP_EXIT=5
+    break
+  fi
+
+  TERMINATION_STATE="$(printf '%s' "$TERM_JSON" | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      try { const o=JSON.parse(s.trim()); process.stdout.write(String(o.state||'null')); }
+      catch { process.stdout.write('null'); }
+    });
+  " 2>/dev/null)" || TERMINATION_STATE="null"
+
+  # 读板面 head_seq（复用 E0c1 已交付的列表端点读法，GT-8）
+  HEAD_SEQ="?"
+  HEAD_SEQ="$(curl -s -H "Authorization: Bearer $TOKEN" "$AGENT_BUS_URL/v1/channels" 2>/dev/null | node -e "
+    let s='';
+    process.stdin.on('data',d=>s+=d).on('end',()=>{
+      try {
+        const data=JSON.parse(s);
+        const channels=Array.isArray(data.channels)?data.channels:[];
+        const found=channels.find(c=>c.channel_id===process.argv[2]);
+        if(found&&typeof found.head_seq==='number') process.stdout.write(String(found.head_seq));
+        else process.stdout.write('?');
+      } catch { process.stdout.write('?'); }
+    });
+  " "$TICK_CHANNEL" 2>/dev/null)" || HEAD_SEQ="?"
+
+  # 进度行
+  echo "[e0-regression] drain #${DRAIN_ATTEMPT}: reason=${DRAIN_REASON} termination.state=${TERMINATION_STATE} head_seq=${HEAD_SEQ}"
+
+  # 追加运行记录
+  DRAIN_RECORDS="${DRAIN_RECORDS}drain_attempt_${DRAIN_ATTEMPT}_reason=${DRAIN_REASON} "
+  DRAIN_RECORDS="${DRAIN_RECORDS}termination_state=${TERMINATION_STATE} "
+  DRAIN_RECORDS="${DRAIN_RECORDS}head_seq=${HEAD_SEQ} "
+  DRAIN_RECORDS="${DRAIN_RECORDS}exit=${DRAIN_EXIT}\n"
+
+  # 终态非 null ⇒ 成功收尾
+  if [ "$TERMINATION_STATE" != "null" ] && [ -n "$TERMINATION_STATE" ]; then
+    LOOP_EXIT=0
+    break
+  fi
+
+  # 退避
+  sleep "$DRAIN_BACKOFF_SECONDS"
+done
+
+# ── 运行记录归档（含每轮 drain 记录）。──
 # E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。
 echo "[e0-regression] reading production bus sum(head_seq) AFTER run ($PROD_BUS_URL)" >&2
 if ! PROD_SUM_AFTER="$(_read_prod_head_seq_sum)"; then
@@ -312,12 +455,15 @@ if ! PROD_SUM_AFTER="$(_read_prod_head_seq_sum)"; then
     echo "evidence_channel=$EVIDENCE_CHANNEL"
     echo "doc_channel=$DOC_CHANNEL"
     echo "runs_channel=$RUNS_CHANNEL_ID"
+    echo "drain_attempts=$DRAIN_ATTEMPT"
+    echo "final_termination_state=$TERMINATION_STATE"
     echo "loop_exit_code=$LOOP_EXIT"
     echo "prod_bus_sum_before=$PROD_SUM_BEFORE"
     echo "prod_bus_sum_after=READ_FAILED"
     echo "loop_run_root=$RECORD_DIR/loop-run"
     echo "entry_exit_code=3"
     echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "drain_records=$(printf '%b' "$DRAIN_RECORDS")"
   } > "$RECORD_DIR/run.meta"
   cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
   exit 3
@@ -325,8 +471,7 @@ fi
 echo "[e0-regression] prod_bus_sum(head_seq)_after=$PROD_SUM_AFTER" >&2
 echo "$PROD_SUM_AFTER" > "$RECORD_DIR/prod_bus_sum_after.json"
 
-# §1.2 —— 两个读数不相等 ⇒ 判失败并非零退出（生产总线零写入是本次运行的硬不变量）。
-#   派发方独立复算（读 prod_bus_sum_before.json / prod_bus_sum_after.json 各自 JSON.parse 求和）。
+# §1.2 —— 两个读数不相等 ⇒ 判失败并非零退出。
 PROD_SUM_BEFORE_NUM="$(printf '%s' "$PROD_SUM_BEFORE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
 PROD_SUM_AFTER_NUM="$(printf '%s' "$PROD_SUM_AFTER" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
 PROD_DELTA=$((PROD_SUM_AFTER_NUM - PROD_SUM_BEFORE_NUM))
@@ -335,8 +480,7 @@ if [ "$PROD_DELTA" -ne 0 ]; then
   LOOP_EXIT=3
 fi
 
-# ── 运行记录归档（§2.3.5）：入口命令 stdout/stderr、最终 exit code、profile 与 channel 名、
-#    可据以回查的 loop-engine run 目录路径、§1.2 生产总线跑前跑后读数。⛔ 记录目录在仓外。──
+# ── 运行记录归档（§2.3.5）。──
 {
   echo "run_id=$RUN_ID"
   echo "profile=$PROFILE"
@@ -345,15 +489,17 @@ fi
   echo "doc_channel=$DOC_CHANNEL"
   echo "runs_channel=$RUNS_CHANNEL_ID"
   echo "loop_run_root=$RECORD_DIR/loop-run"
+  echo "drain_attempts=$DRAIN_ATTEMPT"
+  echo "final_termination_state=$TERMINATION_STATE"
   echo "prod_bus_sum_before=$PROD_SUM_BEFORE_NUM"
   echo "prod_bus_sum_after=$PROD_SUM_AFTER_NUM"
   echo "prod_bus_delta=$PROD_DELTA"
   echo "entry_exit_code=$LOOP_EXIT"
   echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "drain_records=$(printf '%b' "$DRAIN_RECORDS")"
 } > "$RECORD_DIR/run.meta"
 cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
 
-echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT, prod_bus_delta=$PROD_DELTA)"
+echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT, prod_bus_delta=$PROD_DELTA, drain_attempts=$DRAIN_ATTEMPT)"
 
-# 终态可判：0 = 跑到终态；非零 = 没跑到终态。绝不以 0 掩盖未跑完。
 exit "$LOOP_EXIT"

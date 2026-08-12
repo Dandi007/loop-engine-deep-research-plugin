@@ -228,6 +228,10 @@ function state(over: Partial<BoardState> = {}): BoardState {
 }
 
 // ── B1 + B1-guard：真实端到端 drain 必须收敛为 drained ─────────────
+// E0c2 GT-10：续投门放宽后（hasPendingWork==true OR (termination.state==null && !capHit)），
+// 板面排空后仍需继续 tick 直到终态或 max_rounds，B1/B2 必然变慢（实测 B1≈2.5s, B2≈4.4s）。
+// vitest 缺省 testTimeout 5s 在并发负载下不足，此处放宽到 30s 并注明理由；
+// ⛔ 不得全局调大 testTimeout 掩盖别处卡死，⛔ 不得改回续投门或 skip/删用例。
 
 describe("B1: real end-to-end drain converges to reason='drained'", () => {
   const guard = (fn: () => void) => {
@@ -235,7 +239,7 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       it.skip("B1 requires bun + loop-engine worktree (explicit skip, not silent pass)", fn);
       return;
     }
-    it("empty terminal board through the real driver drains with reason=drained", async () => {
+    it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
       const port = 18000 + Math.floor(Math.random() * 1000);
       const { code, out } = await runRealE2E({ port });
       expect(code).toBe(0);
@@ -268,7 +272,7 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       it.skip("B2 requires bun + loop-engine worktree (explicit skip, not silent pass)", fn);
       return;
     }
-    it("drains and leaves research.evidence.v2 in the evidence channel", async () => {
+    it("drains and leaves research.evidence.v2 in the evidence channel", { timeout: 30000 }, async () => {
       const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
       const seed = join(dir, "seed.json");
       writeFileSync(
@@ -343,11 +347,13 @@ function makeFakeTick(values: {
   hasPendingWork: boolean;
   dir: string;
   runnerLog: string;
+  terminationState?: string;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
+  const termState = values.terminationState ?? "null";
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${termState}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -401,7 +407,7 @@ describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)
     expect(hasPendingWork(s)).toBe(false);
     const dir = mkdtempSync(join(tmpdir(), "a10b-b4-"));
     const log = join(dir, "puts.log");
-    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, dir, runnerLog: log });
+    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, dir, runnerLog: log, terminationState: '"converged"' });
     writeFileSync(log, "");
     renderTickMd(
       {

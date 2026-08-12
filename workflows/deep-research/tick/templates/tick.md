@@ -75,49 +75,63 @@ if [ -n "$tick_channel" ]; then
     fi
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
-      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      # prev_line 形如换行分隔的 "--prev-coverage\n<n>\n--prev-zero-growth\n<m>\n"，
+      # 用 while read 逐行读取追加（zsh 兼容，避免 bash-only 的 read -a）。
+      while IFS= read -r _pa; do
+        if [ -n "$_pa" ]; then
+          prev_args+=("$_pa")
+        fi
+      done <<< "$prev_line"
     fi
   fi
   tick_args+=("${prev_args[@]}")
   run_output="$("${tick_args[@]}")"
   printf '%s\n' "$run_output"
-  # A9 —— 板面仍有非终态 clue（hasPendingWork=true）⇒ 投下一条触发（id 每轮唯一，否则 put 覆盖）；
-  #      否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
+  # A9 —— 续投条件（E0c2 §1.2 / GT-4）：板面仍有非终态 clue（hasPendingWork=true）
+  #    或 终态尚未收敛（termination.state 仍为 null 且未触顶）⇒ 投下一条触发；
+  #    否则不投 ⇒ drain 自然收敛退出。触发 id 用 纳秒时间戳 + PID，保证每轮唯一。
   # ⛔ 续投所需的 trigger_store_dir / loop_store_cli / loop_engine_runner 必须在 hasPendingWork=true 时
   #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
   # G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
   #    从 run_output 的 JSON 解析 termination.coverage / termination.zeroGrowthRounds，写进下一条 body。
-  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+  # E0c2 §1.2 —— 续投门对齐终态判据（GT-4）：不再只看 hasPendingWork，而是
+  #   hasPendingWork == true  或 (termination.state 仍为 null 且未触顶) ⇒ 续投。
+  #   用 node JSON 解析（⛔ 不再用 grep 正则），一并取出 termination 计数供下一条 trigger body。
+  #   输出：换行分隔的 "1/0\n<coverage>\n<zeroGrowthRounds>\n"（1=续投，0=停止）。
+  continuation=$(node - "$run_output" <<'G4B_CONTINUE_EOF'
+    const s = process.argv[2];
+    let o;
+    try { o = JSON.parse(s); } catch (e) {
+      console.error("G4b: run output is not valid JSON: " + e.message);
+      process.exit(1);
+    }
+    const t = o && typeof o === "object" ? o.termination : null;
+    if (!t || typeof t !== "object") {
+      console.error("G4b: run output missing termination object");
+      process.exit(1);
+    }
+    const hw = o.hasPendingWork === true;
+    const stateIsNull = t.state === null || t.state === undefined;
+    const capHit = t.capHit === true;
+    const shouldContinue = hw || (stateIsNull && !capHit);
+    const cov = t.coverage, zgr = t.zeroGrowthRounds;
+    if (typeof cov !== "number" || typeof zgr !== "number") {
+      console.error("G4b: termination.coverage/zeroGrowthRounds missing");
+      process.exit(1);
+    }
+    process.stdout.write((shouldContinue ? "1" : "0") + "\n" + cov + "\n" + zgr + "\n");
+G4B_CONTINUE_EOF
+  )
+  {
+    IFS= read -r _should_continue
+    IFS= read -r next_cov
+    IFS= read -r next_zgr
+  } <<< "$continuation"
+  if [ "$_should_continue" = "1" ]; then
     if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
-      echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
+      echo "[tick] continuation required but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
       exit 1
     fi
-    # G4b —— 解析本轮 termination 计数写进下一条 trigger body。run_output 必含 termination（tick-entry --run 输出）。
-    #   JS 经 heredoc 喂 node stdin，避免引号冲突（同上 G4B_PARSE_EOF 块的理由）。
-    next_term=$(node - "$run_output" <<'G4B_NEXT_EOF'
-      const s = process.argv[2];
-      let o;
-      try { o = JSON.parse(s); } catch (e) {
-        console.error("G4b: run output is not valid JSON: " + e.message);
-        process.exit(1);
-      }
-      const t = o && typeof o === "object" ? o.termination : null;
-      if (!t || typeof t !== "object") {
-        console.error("G4b: run output missing termination object");
-        process.exit(1);
-      }
-      const cov = t.coverage, zgr = t.zeroGrowthRounds;
-      if (typeof cov !== "number" || typeof zgr !== "number") {
-        console.error("G4b: termination.coverage/zeroGrowthRounds missing");
-        process.exit(1);
-      }
-      process.stdout.write(cov + "\t" + zgr);
-G4B_NEXT_EOF
-    )
-    next_cov="${next_term%$'\t'*}"
-    next_zgr="${next_term#*$'\t'}"
     next_id="a9-$(date +%s%N)-$$"
     next_body="{\"tick\":true,\"coverage\":${next_cov},\"zeroGrowthRounds\":${next_zgr}}"
     "$loop_engine_runner" "$loop_store_cli" "$trigger_store_dir" put \

@@ -54,13 +54,13 @@ usage:
                      G4c——--origin 与 --doc-channel 由 tick.md 从 {{research_origin}}/{{doc_channel}} 传入；
                              --origin 已配置且 termination.state !== null ⇒ runGenerate 被调用；
                              --one-shot-dir 跨进程一次性标记目录（缺省 tmpdir/deep-research-generated）。
-  ... --parse-trigger-body <body_json>
-                     G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：
-                     tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为
-                     统一调用 parseTerminationFromBody，单源真相）。
-                     输出（stdout，制表符分隔）：首轮 body（{"seed":true}）⇒ 空串（调用方不传 --prev-*）；
-                     续投 body（含 coverage/zeroGrowthRounds）⇒ "--prev-coverage\\t<n>\\t--prev-zero-growth\\t<m>"。
-                     body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。
+... --parse-trigger-body <body_json>
+                      G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：
+                      tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为
+                      统一调用 parseTerminationFromBody，单源真相）。
+                      输出（stdout，换行分隔）：首轮 body（{"seed":true}）⇒ 空串（调用方不传 --prev-*）；
+                      续投 body（含 coverage/zeroGrowthRounds）⇒ "--prev-coverage\n<n>\n--prev-zero-growth\n<m>\n"。
+                      body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
@@ -136,12 +136,13 @@ export async function main(argv: string[]): Promise<number> {
     try {
       const parsed = parseTerminationFromBody(body);
       // 首轮（seed body）⇒ 空输出，调用方据此不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。
-      // 续投 body ⇒ 输出 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，调用方按制表符切开追加。
+      // 续投 body ⇒ 输出换行分隔的 "--prev-coverage\n<n>\n--prev-zero-growth\n<m>\n"，
+      // 调用方用 while read 逐行读取追加（zsh 兼容，避免 bash-only 的 read -a）。
       if (parsed.firstRound) {
         process.stdout.write("");
       } else {
         process.stdout.write(
-          `--prev-coverage\t${parsed.prevCoverage}\t--prev-zero-growth\t${parsed.prevZeroGrowthRounds}`,
+          `--prev-coverage\n${parsed.prevCoverage}\n--prev-zero-growth\n${parsed.prevZeroGrowthRounds}\n`,
         );
       }
       return 0;

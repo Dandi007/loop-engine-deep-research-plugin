@@ -409,7 +409,7 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
       tickEntryPath: tickEntry,
       argvLog,
       fakeRunBody:
-        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
     });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl

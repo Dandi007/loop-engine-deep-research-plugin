@@ -305,24 +305,25 @@ _read_tick_head_seq() {
 # 重复：跑一次 deep-research-loop.sh → 按 GT-6 分类 → 按 §1.1 读终态 → 收敛则退出。
 # 退避时长 / drain 次数上限 / 墙钟上限均由 profile 声明（TERMINATION_BACKOFF_SECONDS /
 # TERMINATION_MAX_DRAINS / TERMINATION_WALL_CLOCK_SECONDS）。
+# 假 loop 可执行桩替身注入点：DEEP_RESEARCH_LOOP_BIN 覆盖 drain 命令（判据 5/6b 要求）。
 _termination_backoff="${TERMINATION_BACKOFF_SECONDS:-120}"
 _termination_max="${TERMINATION_MAX_DRAINS:-12}"
 _termination_wall_clock="${TERMINATION_WALL_CLOCK_SECONDS:-2400}"
+_drain_cmd="${DEEP_RESEARCH_LOOP_BIN:-$PLUGIN_ROOT/bin/deep-research-loop.sh}"
 _start_ts=$(date +%s)
 _drain_count=0
 _termination_state="null"
 _final_term=""
 _drain_records=""
 _loop_exit_code=0
+_drain_outs=""
 
 while true; do
   _drain_count=$((_drain_count + 1))
-  _now=$(date +%s)
-  _wall_elapsed=$((_now - _start_ts))
 
   # 跑一次 deep-research-loop.sh（一次 drain），完整捕获 stdout/stderr/退出码。
   set +e
-  _drain_out=$(bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" 2>&1)
+  _drain_out=$(bash "$_drain_cmd" --profile "$PROFILE" 2>&1)
   _drain_ec=$?
   set -e
 
@@ -367,10 +368,31 @@ EOF
   fi
 
   # §1.1 —— 读本次 drain 的 termination.state（GT-2 路径：journal → result → 第一个 JSON 文档）。
+  # 读取链路任一步失败 ⇒ 响亮失败并点名是哪一步（⛔ 不得把「读不到」当成任一方向的默认值）。
   _term_json=""
-  if [ -n "$_drain_id" ] && [ -n "$_runs_root" ]; then
-    _term_json="$(printf '%s' "$_drain_summary" | node "$PLUGIN_ROOT/scripts/read-termination-state.mjs" 2>/dev/null)" || true
+  _term_err=""
+  if [ -z "$_drain_id" ]; then
+    echo "[e0-regression] §1.1 READ FAILURE: drain summary has no drain_id (cannot locate run_dir). Aborting (spec §1.1: reading failure is failure, not 'not yet converged')." >&2
+    _loop_exit_code=3
+    break
   fi
+  if [ -z "$_runs_root" ]; then
+    echo "[e0-regression] §1.1 READ FAILURE: drain summary has no runs_root (cannot locate index.jsonl). Aborting (spec §1.1: reading failure is failure, not 'not yet converged')." >&2
+    _loop_exit_code=3
+    break
+  fi
+  set +e
+  _term_json="$(printf '%s' "$_drain_summary" | node "$PLUGIN_ROOT/scripts/read-termination-state.mjs" 2>"$ENTRY_TMP.term-err")"
+  _term_ec=$?
+  if [ "$_term_ec" -ne 0 ]; then
+    _term_err="$(cat "$ENTRY_TMP.term-err" 2>/dev/null || true)"
+    rm -f "$ENTRY_TMP.term-err" 2>/dev/null || true
+    echo "[e0-regression] §1.1 READ FAILURE: read-termination-state.mjs exited $_term_ec: ${_term_err:-<no stderr>}. Aborting (spec §1.1: reading failure is failure, not 'not yet converged')." >&2
+    _loop_exit_code=3
+    break
+  fi
+  set -e
+  rm -f "$ENTRY_TMP.term-err" 2>/dev/null || true
   _termination_state="null"
   _term_coverage=""
   _term_zero_growth=""
@@ -387,11 +409,14 @@ EOF
   # 每轮 drain 打一行进度（第几轮 / 本轮 drain reason / 当前 termination.state / 板面 head_seq）
   echo "[e0-regression] attempt=$_drain_count reason=$_drain_reason termination_state=$_termination_state head_seq=$_head_seq" >&2
 
-  # 每轮的 runs_root/reason/终态追加进运行记录
+  # 每轮的 runs_root/reason/终态追加进运行记录，并保留每轮 drain 的原始输出
   _drain_records="${_drain_records}drain_${_drain_count}_runs_root=${_runs_root:-}
 drain_${_drain_count}_reason=${_drain_reason}
 drain_${_drain_count}_termination_state=${_termination_state}
 drain_${_drain_count}_drain_id=${_drain_id:-}
+"
+  _drain_outs="${_drain_outs}=== drain $_drain_count ===
+$_drain_out
 "
 
   # 非 null 终态 ⇒ 成功收尾，退出循环。
@@ -408,8 +433,10 @@ drain_${_drain_count}_drain_id=${_drain_id:-}
     _loop_exit_code=3
     break
   fi
+  _now=$(date +%s)
+  _wall_elapsed=$((_now - _start_ts))
   if [ "$_wall_elapsed" -ge "$_termination_wall_clock" ]; then
-    echo "[e0-regression] TERMINATION NOT REACHED: hit wall clock limit ($_termination_wall_clock seconds). Last state=$_termination_state. Aborting (GT-3: convergence did not happen within the wall clock limit)." >&2
+    echo "[e0-regression] TERMINATION NOT REACHED: hit wall clock limit ($_termination_wall_clock seconds, elapsed=$_wall_elapsed). Last state=$_termination_state. Aborting (GT-3: convergence did not happen within the wall clock limit)." >&2
     _loop_exit_code=3
     break
   fi
@@ -421,7 +448,7 @@ done
 
 # ── 写入运行记录。──
 # 把每轮 drain 的 stdout/stderr 落盘，退出码单独记录。
-echo "$_drain_out" > "$RECORD_DIR/run.stdout.log"
+printf '%s' "$_drain_outs" > "$RECORD_DIR/run.stdout.log"
 echo "[e0-regression] loop exit code: $_loop_exit_code" > "$RECORD_DIR/run.stderr.log"
 
 # E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。

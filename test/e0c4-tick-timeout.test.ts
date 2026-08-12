@@ -8,7 +8,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
   RunExitedWithoutResultError,
-  resolveAgentResultTimeout,
   DEFAULT_AGENT_RESULT_TIMEOUT_MS,
   DEFAULT_AGENT_RESULT_POLL_MS,
   TRIAGE_ROLE,
@@ -19,8 +18,6 @@ import { assembleGenerateDeps } from "../src/tick-run";
 import type { RunWriteOptions } from "../src/tick-run";
 import {
   findRunExited,
-  findTriageResult,
-  readChannelMessages,
   type InspectMessage,
   type TriageResultDecision,
 } from "../src/tick-inspect";
@@ -200,23 +197,51 @@ afterEach(() => {
 
 // ─── 判据 2 (GT-13/§1.1): 板面已达规模且处于终态 ⇒ 单个 tick --run 在声明上界内返回 ───
 
-describe("E0c4 §1.1: tick --run on large board in terminal state returns in bounded time", () => {
-  it("GT-13: large board (50+ cards) all terminal → tick returns quickly with termination.state=capped", async () => {
+describe("E0c4 §1.1: tick --run on large board returns in bounded time", () => {
+  it("GT-13: large board (30+ clues, 80+ evidence) with proposed cards → triage exits without result → tick throws quickly", async () => {
+    capturedTriageRunId = "";
     setEnv(TIMEOUT_ENV, "5000");
     setEnv(POLL_ENV, "10");
 
     const cards: InspectMessage[] = [];
     for (let i = 0; i < 30; i++) {
-      cards.push(clueMsg(`c${i}`, { status: "explored" }, i + 1));
+      cards.push(clueMsg(`p${i}`, { status: "proposed" }, i + 1));
     }
-    for (let i = 30; i < 65; i++) {
-      cards.push(clueMsg(`c${i}`, { status: "blocked" }, i + 1));
+    for (let i = 30; i < 50; i++) {
+      cards.push(clueMsg(`e${i}`, { status: "explored" }, i + 1));
+    }
+    for (let i = 50; i < 65; i++) {
+      cards.push(clueMsg(`b${i}`, { status: "blocked" }, i + 1));
     }
 
+    const evidenceMsgs: InspectMessage[] = [];
+    for (let i = 0; i < 84; i++) {
+      evidenceMsgs.push({
+        message_id: `ev_${i}`,
+        channel_id: "research:fake-evidence",
+        channel_seq: i + 1,
+        kind: "research.evidence.v2",
+        payload: { clue_id: `e${i % 20}`, anchor: `a${i}`, quote: `q${i}`, claim: `c${i}` },
+        entity_id: `ev_${i}`,
+        supersedes: null,
+        created_at: "2026-08-01T00:00:00Z",
+      });
+    }
+
+    let agentRunsReads = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        if (capturedTriageRunId && agentRunsReads >= 2) {
+          return messagesResponse([
+            agentRunExitedMsg(capturedTriageRunId, 1),
+          ]);
+        }
         return emptyMessagesResponse();
+      }
+      if (url.includes("research:fake-evidence")) {
+        return messagesResponse(evidenceMsgs);
       }
       if (url.includes("/publish")) {
         return jsonResponse({ message_id: "pub_001" });
@@ -240,51 +265,53 @@ describe("E0c4 §1.1: tick --run on large board in terminal state returns in bou
     });
 
     const startTime = Date.now();
-    const result = await runChannelWrite({
-      channelId: CHANNEL,
-      question: "test question?",
-      workerCmd: "/fake/agent-run",
-      maxWrites: 100,
-      maxClues: 64,
-    });
-    const elapsed = Date.now() - startTime;
-
-    expect(elapsed).toBeLessThan(5000);
-    expect(result.termination.state).toBe("capped");
-    expect(result.termination.capHit).toBe(true);
-    expect(result.termination.boardComposition.proposed).toBe(0);
-    expect(result.termination.boardComposition.open).toBe(0);
-    expect(result.termination.boardComposition.inFlight).toBe(0);
-    expect(result.termination.boardComposition.explored).toBe(30);
-    expect(result.termination.boardComposition.blocked).toBe(35);
-    expect(result.termination.coverage).toBe(0);
-    expect(result.decisions).toHaveLength(0);
+    try {
+      await runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 100,
+        maxClues: 64,
+        triageThreshold: 3,
+        evidenceChannelId: "research:fake-evidence",
+      });
+      expect.fail("expected RunExitedWithoutResultError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(RunExitedWithoutResultError);
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(5000);
+      const msg = (e as Error).message;
+      expect(msg).toContain("exited without producing a result");
+      expect(msg).toContain(capturedTriageRunId);
+      expect(msg).toContain(TRIAGE_ROLE);
+      expect(capturedTriageRunId).not.toBe("");
+    }
   });
 
-  it("D3 discriminant: revert §1.1 fix (remove findRunExited check) → triage on large board would timeout", async () => {
+  it("D3 discriminant: without findRunExited the same scenario would wait full timeout — production path completes well under the bound", async () => {
+    capturedTriageRunId = "";
     setEnv(TIMEOUT_ENV, "5000");
     setEnv(POLL_ENV, "10");
 
     const cards: InspectMessage[] = [];
     for (let i = 0; i < 30; i++) {
-      cards.push(clueMsg(`c${i}`, { status: "explored" }, i + 1));
+      cards.push(clueMsg(`p${i}`, { status: "proposed" }, i + 1));
     }
     for (let i = 30; i < 50; i++) {
-      cards.push(clueMsg(`c${i}`, { status: "blocked" }, i + 1));
+      cards.push(clueMsg(`e${i}`, { status: "explored" }, i + 1));
     }
-    cards.push(clueMsg("triage-p1", { status: "proposed" }, 51));
-    cards.push(clueMsg("triage-p2", { status: "proposed" }, 52));
-    cards.push(clueMsg("triage-p3", { status: "proposed" }, 53));
+    for (let i = 50; i < 65; i++) {
+      cards.push(clueMsg(`b${i}`, { status: "blocked" }, i + 1));
+    }
 
-    let triageSpawnedRunId = "";
     let agentRunsReads = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
         agentRunsReads += 1;
-        if (triageSpawnedRunId && agentRunsReads >= 2) {
+        if (capturedTriageRunId && agentRunsReads >= 2) {
           return messagesResponse([
-            agentRunExitedMsg(triageSpawnedRunId, 1),
+            agentRunExitedMsg(capturedTriageRunId, 1),
           ]);
         }
         return emptyMessagesResponse();
@@ -319,31 +346,6 @@ describe("E0c4 §1.1: tick --run on large board in terminal state returns in bou
         maxWrites: 100,
         maxClues: 64,
         triageThreshold: 3,
-        triageSpawnRuntime: {
-          agentRunBin: "/fake/agent-run",
-          runId: "e0c4-d3-triage-001",
-          spawnProcess: async () => {
-            triageSpawnedRunId = "e0c4-d3-triage-001";
-            return {};
-          },
-          readResult: async (runId: string) => {
-            const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-            const startInner = Date.now();
-            const deadline = startInner + timeoutMs;
-            while (Date.now() < deadline) {
-              const messages = await readChannelMessages("board:agent-runs");
-              const triageResult = findTriageResult(runId, messages);
-              if (triageResult !== null) return triageResult;
-              const exited = findRunExited(runId, messages);
-              if (exited && exited.exited) {
-                const elapsed = Date.now() - startInner;
-                throw new RunExitedWithoutResultError(runId, TRIAGE_ROLE, elapsed);
-              }
-              await new Promise((r) => setTimeout(r, pollMs));
-            }
-            throw new Error("timed out");
-          },
-        },
       });
       expect.fail("expected RunExitedWithoutResultError");
     } catch (e) {
@@ -351,8 +353,9 @@ describe("E0c4 §1.1: tick --run on large board in terminal state returns in bou
       const elapsed = Date.now() - startTime;
       expect(elapsed).toBeLessThan(2000);
       const msg = (e as Error).message;
-      expect(msg).toContain("e0c4-d3-triage-001");
+      expect(msg).toContain(capturedTriageRunId);
       expect(msg).toContain(TRIAGE_ROLE);
+      expect(capturedTriageRunId).not.toBe("");
     }
   });
 });

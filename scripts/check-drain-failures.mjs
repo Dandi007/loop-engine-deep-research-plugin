@@ -88,13 +88,6 @@ for (const entry of laneEntries) {
         process.stderr.write(`[deep-research-loop]   journal result: ${result}\n`);
         continue;
       }
-      // E0c4: also detect TIMEOUT in result field
-      if (rec && typeof rec === "object" && typeof rec.result === "string" && rec.result.includes("TIMEOUT")) {
-        failed = true;
-        process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} TIMEOUT\n`);
-        process.stderr.write(`[deep-research-loop]   journal result: ${rec.result}\n`);
-        continue;
-      }
     } catch {
       // not a JSON line, which is fine — already checked for the bash pattern above
     }

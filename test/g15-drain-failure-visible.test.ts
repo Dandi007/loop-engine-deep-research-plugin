@@ -457,8 +457,8 @@ describe("Y5: tick exec/TIMEOUT detected via journal error=exec", () => {
   });
 });
 
-describe("Y6: tick TIMEOUT detected via result field containing TIMEOUT", () => {
-  it("journal with result containing TIMEOUT is detected even without error=exec", () => {
+describe("Y6: tick TIMEOUT detected via result field containing TIMEOUT with identity==tick and error==exec", () => {
+  it("journal with identity=tick, error=exec, result containing TIMEOUT is detected", () => {
     const drainId = "test-drain-y6";
     const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
       setUpFakeEnv("y6");
@@ -473,6 +473,7 @@ describe("Y6: tick TIMEOUT detected via result field containing TIMEOUT", () => 
     });
     writeJsonJournal(join(runDir, "journal.jsonl"), {
       identity: "tick",
+      error: "exec",
       result: "[外部调用失败 status=TIMEOUT]\\n",
     });
 

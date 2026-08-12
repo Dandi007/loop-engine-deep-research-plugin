@@ -23,6 +23,10 @@ pipelines:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），
       # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
       triage_threshold: ${TRIAGE_THRESHOLD}
+      # E0c4 —— 单个 tick 的声明上界（ms），由 profile 声明。TICK_TIMEOUT_MS 缺省空（不设限）。
+      tick_timeout_ms: ${TICK_TIMEOUT_MS}
+      # E0c4 —— 回归基线收窄 maxClues（缺省空，由 tick-entry 的 DEFAULT_TICK_CONFIG.maxClues 兜底）。
+      max_clues: ${MAX_CLUES}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

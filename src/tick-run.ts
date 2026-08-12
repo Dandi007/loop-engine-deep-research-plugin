@@ -99,6 +99,28 @@ export function resolveAgentResultTimeout(): { timeoutMs: number; pollMs: number
   return { timeoutMs, pollMs };
 }
 
+/**
+ * E0c4 —— 单个 tick 的声明上界（ms），由 profile 声明（TICK_TIMEOUT_MS），缺省 0 表示不设限。
+ * 超过时响亮失败并点名是哪一步慢。
+ */
+export const DEFAULT_TICK_TIMEOUT_MS = 0;
+
+export function resolveTickTimeoutMs(): number {
+  const v = Number(process.env.TICK_TIMEOUT_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return DEFAULT_TICK_TIMEOUT_MS;
+}
+
+/** E0c4 —— tick 在声明上界内未完成 ⇒ 响亮失败，点名慢在哪一步。 */
+export class TickTimeoutError extends Error {
+  constructor(elapsedMs: number, boundMs: number, slowStep: string) {
+    super(
+      `E0c4: tick exceeded declared upper bound (${elapsedMs}ms > ${boundMs}ms) — slow step: ${slowStep}`,
+    );
+    this.name = "TickTimeoutError";
+  }
+}
+
 /** v1 冻结只读 channel 前缀（spec §2 / §8：不得触碰）。 */
 export const FROZEN_CHANNEL_PATTERNS = [
   /^research:loop-mcp-semantics\./,
@@ -1514,13 +1536,24 @@ export async function runChannelWrite(
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
+  const tickBoundMs = resolveTickTimeoutMs();
+  const tickStart = Date.now();
+  function checkBound(step: string): void {
+    if (tickBoundMs <= 0) return;
+    const elapsed = Date.now() - tickStart;
+    if (elapsed > tickBoundMs) {
+      throw new TickTimeoutError(elapsed, tickBoundMs, step);
+    }
+  }
   const nonce = randomUUID();
   const runsChannelId = opts.runsChannelId ?? RUNS_CHANNEL_ID;
   const messages = await readChannelMessages(opts.channelId);
+  checkBound("board-read");
   // A8e——`board:agent-runs` 只分页读一次，同时喂给 runs 归集与每张卡的 worker.result
   //   查询（评审 note：readWorkerResult 原先每张 harvest 卡把整个 channel 再分页一遍，
   //   这是 O(cards x channel) 的读放大；这里复用同一份已读消息列表）。
   const runsMessages = await readChannelMessages(runsChannelId);
+  checkBound("runs-read");
   const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
@@ -1547,6 +1580,7 @@ export async function runChannelWrite(
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
   };
   const decisions = decideTick(state, tickConfig);
+  checkBound("decide-tick");
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
   const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
   const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
@@ -1651,6 +1685,7 @@ export async function runChannelWrite(
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  checkBound("run-write");
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1700,6 +1735,7 @@ export async function runChannelWrite(
     },
     tickConfig,
   );
+  checkBound("decide-termination");
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
   if (opts.origin) {
@@ -1711,6 +1747,7 @@ export async function runChannelWrite(
       if (!existsSync(markerPath)) {
         const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
         await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        checkBound("run-generate");
         mkdirSync(oneShotDir, { recursive: true });
         writeFileSync(markerPath, "");
       }
@@ -1821,6 +1858,8 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /** E0c4 —— maxClues（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
 }
 
 /**
@@ -1844,6 +1883,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1927,6 +1967,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c4: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1942,6 +1991,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

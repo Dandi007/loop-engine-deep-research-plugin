@@ -70,11 +70,33 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
+    // E0c4: detect bash non-zero exit pattern (existing)
     const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
     if (m) {
       failed = true;
       process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      continue;
+    }
+    // E0c4: detect JSON journal entries with error=exec (exec_failed / TIMEOUT)
+    try {
+      const rec = JSON.parse(line);
+      if (rec && typeof rec === "object" && rec.error === "exec") {
+        failed = true;
+        const result = typeof rec.result === "string" ? rec.result : JSON.stringify(rec.result);
+        process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec\n`);
+        process.stderr.write(`[deep-research-loop]   journal result: ${result}\n`);
+        continue;
+      }
+      // E0c4: also detect TIMEOUT in result field
+      if (rec && typeof rec === "object" && typeof rec.result === "string" && rec.result.includes("TIMEOUT")) {
+        failed = true;
+        process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} TIMEOUT\n`);
+        process.stderr.write(`[deep-research-loop]   journal result: ${rec.result}\n`);
+        continue;
+      }
+    } catch {
+      // not a JSON line, which is fine — already checked for the bash pattern above
     }
   }
 }

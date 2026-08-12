@@ -991,3 +991,41 @@ describe("B8: result exists + evidences empty array ⇒ casExplored true (discri
     expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
   });
 });
+
+// ─── E0c4: harvest diagnostic when run exited without result ───
+
+describe("E0c4: harvestCard produces noResultDiagnostic when run exited without result", () => {
+  it("noResultDiagnostic is set when hasRunExited returns true and no worker.result", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () => null),
+      hasRunExited: vi.fn((_runId: string) => true),
+    });
+    const report = await harvestCard(hd, HARVEST_CARD, "run-1", makeBudget(5));
+    expect(report.skipped).toBe(true);
+    expect(report.skippedReason).toBe("no_result");
+    expect(report.noResultDiagnostic).toBeDefined();
+    expect(report.noResultDiagnostic).toContain("run-1");
+    expect(report.noResultDiagnostic).toContain("exited without producing");
+  });
+
+  it("noResultDiagnostic is not set when hasRunExited returns false", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () => null),
+      hasRunExited: vi.fn((_runId: string) => false),
+    });
+    const report = await harvestCard(hd, HARVEST_CARD, "run-1", makeBudget(5));
+    expect(report.skipped).toBe(true);
+    expect(report.skippedReason).toBe("no_result");
+    expect(report.noResultDiagnostic).toBeUndefined();
+  });
+
+  it("D3 discriminant: noResultDiagnostic absent when hasRunExited not provided", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () => null),
+    });
+    const report = await harvestCard(hd, HARVEST_CARD, "run-1", makeBudget(5));
+    expect(report.skipped).toBe(true);
+    expect(report.skippedReason).toBe("no_result");
+    expect(report.noResultDiagnostic).toBeUndefined();
+  });
+});

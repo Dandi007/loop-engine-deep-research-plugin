@@ -225,6 +225,8 @@ export interface HarvestDeps {
     clue: ClueV2,
     idempotencyKey: string,
   ): Promise<void>;
+  /** E0c4 —— 检查指定 run 是否已退出（用于诊断 worker 已退出但无结果的情形）。 */
+  hasRunExited?: (runId: string) => boolean;
 }
 
 /** 写入预算接口（由上层 runWrite 提供共享计数，见 §1.7）。 */
@@ -257,6 +259,8 @@ export interface HarvestReport {
   skippedClues: number;
   /** true ⇒ 上层应在所有发布完成后 CAS 到 explored（§1.1 / H6）。 */
   casExplored: boolean;
+  /** E0c4 —— worker 已退出但无结果时的诊断摘要（run_id + role + 情况）。 */
+  noResultDiagnostic?: string;
 }
 
 /**
@@ -276,6 +280,11 @@ export async function harvestCard(
     // ⛔ A10a §0.3 / §1.2：找不到 worker.result ⇒ **不得写终态**。
     //   「没找到结果」≠「worker 确实无产出」。留 in_flight、响亮报告、casExplored=false，
     //   下一 tick 幂等重放仍可再收割。只有「结果存在且 evidences 为空数组」才可置终态。
+    // E0c4 —— 检查 run 是否已退出但无结果，产出可观测诊断。
+    let noResultDiagnostic: string | undefined;
+    if (hd.hasRunExited && hd.hasRunExited(runId)) {
+      noResultDiagnostic = `E0c4: worker run ${runId} exited without producing a worker.result.v1`;
+    }
     return {
       clueId: card.clueId,
       runId,
@@ -285,6 +294,7 @@ export async function harvestCard(
       cluesPublished: 0,
       skippedClues: 0,
       casExplored: false,
+      noResultDiagnostic,
     };
   }
 

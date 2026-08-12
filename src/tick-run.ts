@@ -33,6 +33,8 @@ import {
 import {
   assembleBoard,
   buildRunsFromMessages,
+  findGenerateResult,
+  findRunExited,
   findTriageResult,
   findWorkerResult,
   readChannelMessages,
@@ -362,6 +364,16 @@ export class MissingDocChannelError extends Error {
       "G4c: --doc-channel is not configured. Refusing to silently default to a board channel.",
     );
     this.name = "MissingDocChannelError";
+  }
+}
+
+/** E0c4 —— worker 已退出但未产出结果 ⇒ 立即停止等待，响亮诊断。 */
+export class RunExitedWithoutResultError extends Error {
+  constructor(runId: string, role: string, elapsedMs: number) {
+    super(
+      `E0c4: run ${runId} (role=${role}) exited without producing a result after ${elapsedMs}ms — stopping immediately instead of waiting for full timeout`,
+    );
+    this.name = "RunExitedWithoutResultError";
   }
 }
 
@@ -1321,10 +1333,18 @@ export function assembleGenerateDeps(
       },
       readBody: async (runId: string) => {
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-        const deadline = Date.now() + timeoutMs;
+        const startTime = Date.now();
+        const deadline = startTime + timeoutMs;
+        const runsChannel = RUNS_CHANNEL_ID;
         while (Date.now() < deadline) {
-          const result = await readGenerateResult(runId);
-          if (result) return result.body;
+          const messages = await readChannelMessages(runsChannel);
+          const genResult = findGenerateResult(runId, messages);
+          if (genResult) return genResult.body;
+          const exited = findRunExited(runId, messages);
+          if (exited && exited.exited) {
+            const elapsed = Date.now() - startTime;
+            throw new RunExitedWithoutResultError(runId, "generate-role", elapsed);
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1568,6 +1588,10 @@ export async function runChannelWrite(
       //    累加 `.value`，从而多张卡在同一 tick 内累计后板面也不超 maxClues（§1.6）。
       boardClueCount: { value: assembled.clueEntities },
       readWorkerResult: async (runId) => findWorkerResult(runId, runsMessages),
+      hasRunExited: (runId) => {
+        const exited = findRunExited(runId, runsMessages);
+        return exited !== null && exited.exited;
+      },
       publishEvidence: (channelId, evidence, key) =>
         publishEvidence(channelId, evidence, key).then(() => undefined),
       publishClue: (channelId, clue, key) =>
@@ -1598,10 +1622,18 @@ export async function runChannelWrite(
             },
             readResult: async (runId) => {
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
+              const startTime = Date.now();
+              const deadline = startTime + timeoutMs;
+              const runsChannel = RUNS_CHANNEL_ID;
               while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
-                if (result !== null) return result;
+                const messages = await readChannelMessages(runsChannel);
+                const triageResult = findTriageResult(runId, messages);
+                if (triageResult !== null) return triageResult;
+                const exited = findRunExited(runId, messages);
+                if (exited && exited.exited) {
+                  const elapsed = Date.now() - startTime;
+                  throw new RunExitedWithoutResultError(runId, TRIAGE_ROLE, elapsed);
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(

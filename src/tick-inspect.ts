@@ -313,6 +313,26 @@ export async function readGenerateResult(
 }
 
 /**
+ * E0c4 —— 在消息数组中查找指定 run_id 的 agent.run.exited 事件。
+ * 返回 { exited, exitCode } 或 null（未找到任何该 run 的 agent.run 事件）。
+ */
+export function findRunExited(
+  runId: string,
+  messages: InspectMessage[],
+): { exited: boolean; exitCode?: number } | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const parsed = parseRunEvent(messages[i]);
+    if (parsed && parsed.runId === runId) {
+      if (parsed.event.state === "exited") {
+        return { exited: true, exitCode: parsed.event.exitCode };
+      }
+      return { exited: false };
+    }
+  }
+  return null;
+}
+
+/**
  * G5 —— `dr-triage.result.v1` 的一条决策（`{clue_id, action, rationale}`）。
  */
 export interface TriageResultDecision {

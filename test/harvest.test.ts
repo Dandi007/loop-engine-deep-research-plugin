@@ -570,12 +570,16 @@ describe("H15: no .board→.evidence string derivation", () => {
     }
     // 只扫「把板 channel 名推导成 evidence channel」的**代码**形态（replace / 拼接 / 模板），
     // 不匹配文档注释里的「`.board`→`.evidence`」字样。
+    // E0c1 §1.3 例外：src/run-channels.ts 的 perRunResearchChannels 从 (profileBase, runId)
+    // 独立派生三条 channel（不是从 board channel 推导 evidence），是 spec 显式要求的形态；
+    // pattern 4 因此要求模板变量看起来像 board/tick/index channel（boardChannel / tickChannel / .index），
+    // 不误伤从 profileBase 派生的 per-run evidence channel。
     const forbidden = [
       /\.replace\s*\(\s*["'][^"']*board[^"']*["']\s*,\s*["'][^"']*evidence[^"']*["']\s*\)/i,
       /\.replace\s*\(\s*["'][^"']*\.board[^"']*["']/i,
       /\+\s*["']\.evidence["']/,
       /["']\.evidence["']\s*\+/,
-      /`[^`]*\$\{[^}]*\}[^`]*\.evidence\b/,
+      /`[^`]*\$\{[^}]*(?:boardChannel|tickChannel|boardCh|tickCh|\.index)[^}]*\}[^`]*\.evidence\b/i,
     ];
     for (const file of files) {
       const text = readFileSync(file, "utf8");

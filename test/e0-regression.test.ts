@@ -42,15 +42,17 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN = join(ROOT, "bin", "e0-regression.sh");
 const PROFILES_DIR = join(ROOT, "profiles", "deploy");
 const DEFAULT_TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
+// E0c1 §1.3 —— profile 不再写死固定 channel 名；TICK/EVIDENCE/DOC_CHANNEL 由入口按 run_id 派生。
+// 必备键改为：研究元数据 + 派生基名 + 播种声明（§1.4）+ 既有护栏键。
 const REQUIRED_PROFILE_KEYS = [
   "RESEARCH_QUESTION",
   "RESEARCH_ORIGIN",
-  "DOC_CHANNEL",
-  "TICK_CHANNEL",
-  "EVIDENCE_CHANNEL",
-  "ANCHOR_CHECK_BIN",
+  "RESEARCH_PROFILE_BASE",
+  "SEED_CLUE",
+  "SEED_SOURCES",
   "EXPORT_ROOT",
   "ALLOWED_ROOT",
+  "ANCHOR_CHECK_BIN",
 ];
 
 async function loadBus() {
@@ -253,15 +255,30 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
     }
   });
 
-  it("channel names are disjoint from the production profile agent-harness.env", () => {
+  it("E0c1: profile base derives per-run channels disjoint from the production profile's fixed channels", () => {
+    // E0c1 §1.3 —— channel 名由 RESEARCH_PROFILE_BASE + run_id 派生，不再写死在 profile。
+    // 判别性：profile 基名以 e0 开头 ⇒ 派生出的 channel 必形如 research:e0-<seg>.{index,evidence,docs}，
+    // 与生产 profile（agent-harness）的固定 channel（research:agent-harness.*）集合无交集。
     const e0 = readProfile("e0-regression");
     const prod = readProfile("agent-harness");
-    const e0Ch = [e0.TICK_CHANNEL, e0.EVIDENCE_CHANNEL, e0.DOC_CHANNEL];
+    const base = e0.RESEARCH_PROFILE_BASE;
+    expect(base).toBeTruthy();
+    expect(base).toMatch(/^e0/);
+    // 派生 channel 的前缀必不与生产固定 channel 重合（基名不同 ⇒ 前缀不同）。
+    const e0Prefix = `research:${base}-`;
     const prodCh = [prod.TICK_CHANNEL, prod.EVIDENCE_CHANNEL, prod.DOC_CHANNEL];
-    for (const c of e0Ch) {
-      expect(c).toMatch(/research:e0/);
-      expect(prodCh).not.toContain(c);
+    for (const c of prodCh) {
+      expect(c).toBeTruthy();
+      expect(c).not.toMatch(new RegExp(`^${e0Prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
     }
+  });
+
+  it("E0c1: SEED_SOURCES is non-empty (GT-2: seeding without sources must fail loudly, so the profile must declare them)", () => {
+    const e0 = readProfile("e0-regression");
+    expect(e0.SEED_SOURCES).toBeTruthy();
+    expect(e0.SEED_SOURCES.trim()).not.toBe("");
+    // 种子文本须与 ALLOWED_ROOT 相称、能让 code-local worker 真找到东西（§1.4）。
+    expect(e0.SEED_CLUE.length).toBeGreaterThan(20);
   });
 
   it("--profile e0-regression loads via the entry script (guard passes, script proceeds past profile load)", () => {

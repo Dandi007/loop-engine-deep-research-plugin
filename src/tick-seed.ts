@@ -4,6 +4,11 @@
  * 复用 src/bus.ts 的 publishClue，每条线索发一条 research.clue.v2，
  * status: "open"、depth: 0。idempotency key 由输入确定性派生，
  * 重复播种不会翻倍。
+ *
+ * E0c1 §1.4 / GT-2 —— sources **必须非空**：真机板面实录显示，种子不带 `sources`
+ * 会被结构性卡为 `blocked`（`rationale="source list has no mapped worker role; cannot dispatch"`），
+ * 没法派出任何 worker。因此 `--source` 现在是播种的硬前提（spec §1.4 / 验收判据 4）。
+ * ⛔ 不传 `--source`（或 sources 为空）⇒ 响亮失败，绝不静默播一条 `sources: []` 的线索。
  */
 import { createHash } from "node:crypto";
 import { publishClue } from "./bus";
@@ -28,6 +33,11 @@ export function buildSeedIdempotencyKey(
 export interface SeedOptions {
   channelId: string;
   clues: string[];
+  /**
+   * E0c1 §1.4 / GT-2 —— 种子的 sources 列表（必须非空）。
+   * 真机板面：`sources=[]` 的 clue 会被结构性卡为 blocked（无法派发 worker）。
+   * ⛔ 缺省/空数组 ⇒ `runSeed` 抛 `SeedError`（响亮失败，不静默播一条空 sources 的线索）。
+   */
   sources?: string[];
 }
 
@@ -52,6 +62,15 @@ export async function runSeed(
   }
 
   const sources = opts.sources ?? [];
+  // E0c1 §1.4 / GT-2 —— sources 必须非空：空 sources 的 clue 在真机会被结构性卡为 blocked
+  // （rationale="source list has no mapped worker role; cannot dispatch"），派不出任何 worker。
+  // ⛔ 静默播一条 sources:[] 的线索 = 假装播种成功 = 正是 spec §0 GT-2 / 验收判据 4 禁止的形态。
+  if (sources.length === 0) {
+    throw new SeedError(
+      "E0c1: --seed requires at least one --source. A clue with sources=[] is structurally blocked on the real board (rationale=\"source list has no mapped worker role; cannot dispatch\") and dispatches no worker. Refusing to silently seed a sources:[] clue (GT-2).",
+    );
+  }
+
   const messageIds: string[] = [];
 
   for (let i = 0; i < opts.clues.length; i++) {

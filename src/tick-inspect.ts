@@ -10,6 +10,7 @@
 import type { ClueV2, EvidenceV2 } from "./protocol";
 import type { WorkerResultV1 } from "./harvest";
 import { getMessages } from "./bus";
+import { RUNS_CHANNEL_ID } from "./run-channels";
 import {
   decideTick,
   decideTermination,
@@ -233,7 +234,7 @@ export function buildRunsFromMessages(
  * ⛔ 不硬编码空的 runs 字面量。
  */
 export async function readAgentRuns(
-  channelId = "board:agent-runs",
+  channelId = RUNS_CHANNEL_ID,
 ): Promise<Record<string, RunEvent>> {
   const messages = await readChannelMessages(channelId);
   return buildRunsFromMessages(messages);
@@ -270,7 +271,7 @@ export function findWorkerResult(
  */
 export async function readWorkerResult(
   runId: string,
-  channelId = "board:agent-runs",
+  channelId = RUNS_CHANNEL_ID,
 ): Promise<WorkerResultV1 | null> {
   const messages = await readChannelMessages(channelId);
   return findWorkerResult(runId, messages);
@@ -305,7 +306,7 @@ export function findGenerateResult(
  */
 export async function readGenerateResult(
   runId: string,
-  channelId = "board:agent-runs",
+  channelId = RUNS_CHANNEL_ID,
 ): Promise<{ body: string } | null> {
   const messages = await readChannelMessages(channelId);
   return findGenerateResult(runId, messages);
@@ -349,7 +350,7 @@ export function findTriageResult(
  */
 export async function readTriageResult(
   runId: string,
-  channelId = "board:agent-runs",
+  channelId = RUNS_CHANNEL_ID,
 ): Promise<TriageResultDecision[] | null> {
   const messages = await readChannelMessages(channelId);
   return findTriageResult(runId, messages);

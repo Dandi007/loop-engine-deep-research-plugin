@@ -40,10 +40,12 @@ usage:
   ... --help                    打印本用法并 exit 0（无副作用）
   ... --selfcheck               在空板面上执行一次纯决策自检并 exit 0（无副作用）
   ... --inspect <channel_id>    只读 agent-bus channel，跑决策并打印 JSON，exit 0
-  ... --seed <channel_id> --clue "<线索文本>" [--clue "<线索文本>" …] [--source <name> …]
+  ... --seed <channel_id> --clue "<线索文本>" [--clue "<线索文本>" …] --source <name> [--source <name> …]
                      播种入口：把初始线索发布到研究板（research.clue.v2），exit 0
                      每条线索 status=open、depth=0；idempotency key 由输入确定性派生，
                      重复播种不会翻倍。channel 不存在 ⇒ 响亮失败并点名；零线索 ⇒ 响亮失败。
+                     E0c1 §1.4 / GT-2：--source 必填且非空（真机：sources=[] 的 clue 会被结构性
+                     卡为 blocked、派不出 worker）；缺失 ⇒ 响亮失败，⛔ 不静默播一条 sources:[] 的线索。
 ... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>]
                      写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
                      G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经

@@ -48,7 +48,7 @@ describe("G4e X1: seeding N clues really publishes N research.clue.v2", () => {
   it("publishes 3 clues with correct status=open, depth=0, text verbatim", async () => {
     const { deps, calls } = fakePublishDeps();
     const result = await runSeed(
-      { channelId: "research:test", clues: ["clue A", "clue B", "clue C"] },
+      { channelId: "research:test", clues: ["clue A", "clue B", "clue C"], sources: ["code-local"] },
       deps,
     );
     expect(result.published).toBe(3);
@@ -76,14 +76,24 @@ describe("G4e X1: seeding N clues really publishes N research.clue.v2", () => {
     expect(calls[0].clue.sources).toEqual(["code-local", "web"]);
   });
 
-  it("publishes clues with empty sources when not provided", async () => {
-    const { deps, calls } = fakePublishDeps();
-    await runSeed(
-      { channelId: "research:test", clues: ["clue Y"] },
-      deps,
-    );
-    expect(calls).toHaveLength(1);
-    expect(calls[0].clue.sources).toEqual([]);
+  it("E0c1 GT-2: seeding without --source fails loudly (no silent sources:[] clue)", async () => {
+    const { deps } = fakePublishDeps();
+    await expect(
+      runSeed({ channelId: "research:test", clues: ["clue Y"] }, deps),
+    ).rejects.toThrow(SeedError);
+    await expect(
+      runSeed({ channelId: "research:test", clues: ["clue Y"] }, deps),
+    ).rejects.toThrow(/--source/);
+    // ⛔ 不静默播种：publishClue 不被调用。
+    expect(deps.publishClue).not.toHaveBeenCalled();
+  });
+
+  it("E0c1 GT-2: seeding with explicit empty sources array also fails loudly", async () => {
+    const { deps } = fakePublishDeps();
+    await expect(
+      runSeed({ channelId: "research:test", clues: ["clue Z"], sources: [] }, deps),
+    ).rejects.toThrow(SeedError);
+    expect(deps.publishClue).not.toHaveBeenCalled();
   });
 });
 
@@ -93,10 +103,10 @@ describe("G4e X2: idempotency — same clues twice ⇒ same keys", () => {
     const channelId = "research:test";
 
     const { deps: deps1, calls: calls1 } = fakePublishDeps();
-    await runSeed({ channelId, clues }, deps1);
+    await runSeed({ channelId, clues, sources: ["code-local"] }, deps1);
 
     const { deps: deps2, calls: calls2 } = fakePublishDeps();
-    await runSeed({ channelId, clues }, deps2);
+    await runSeed({ channelId, clues, sources: ["code-local"] }, deps2);
 
     expect(calls1).toHaveLength(3);
     expect(calls2).toHaveLength(3);
@@ -134,17 +144,17 @@ describe("G4e X3: channel not found ⇒ loud failure, no channel creation", () =
   it("404 from publishClue throws SeedError naming the channel", async () => {
     const deps = fakePublishDeps404();
     await expect(
-      runSeed({ channelId: "nonexistent", clues: ["clue"] }, deps),
+      runSeed({ channelId: "nonexistent", clues: ["clue"], sources: ["code-local"] }, deps),
     ).rejects.toThrow(SeedError);
     await expect(
-      runSeed({ channelId: "nonexistent", clues: ["clue"] }, deps),
+      runSeed({ channelId: "nonexistent", clues: ["clue"], sources: ["code-local"] }, deps),
     ).rejects.toThrow(/nonexistent/);
   });
 
   it("publishClue is called exactly once before throwing (no automatic creation)", async () => {
     const deps = fakePublishDeps404();
     await expect(
-      runSeed({ channelId: "nonexistent", clues: ["clue"] }, deps),
+      runSeed({ channelId: "nonexistent", clues: ["clue"], sources: ["code-local"] }, deps),
     ).rejects.toThrow(SeedError);
     expect(deps.publishClue).toHaveBeenCalledTimes(1);
   });

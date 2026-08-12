@@ -61,6 +61,7 @@ import {
   MissingAnchorCheckRepoRootError,
 } from "./generate";
 import { runExport, slugify, type ExportInput } from "./export";
+import { RUNS_CHANNEL_ID } from "./run-channels";
 
 /**
  * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
@@ -1486,7 +1487,7 @@ export async function runChannelWrite(
     throw new FrozenChannelError(opts.channelId);
   }
   const nonce = randomUUID();
-  const runsChannelId = opts.runsChannelId ?? "board:agent-runs";
+  const runsChannelId = opts.runsChannelId ?? RUNS_CHANNEL_ID;
   const messages = await readChannelMessages(opts.channelId);
   // A8e——`board:agent-runs` 只分页读一次，同时喂给 runs 归集与每张卡的 worker.result
   //   查询（评审 note：readWorkerResult 原先每张 harvest 卡把整个 channel 再分页一遍，

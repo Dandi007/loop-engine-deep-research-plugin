@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# E0 —— 「真机端到端回归基线」唯一入口命令。
+# E0c1 —— 「真机端到端回归基线」唯一入口命令（板面与凭证域）。
 # 一条命令把现状链路在 **测试总线**（127.0.0.1:7495）上从头跑到终态：
-#   导出 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE → 生产护栏 → channel 预备 → 跑 loop → 归档运行记录。
+#   导出 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE → 生产护栏 →
+#   §1.3 per-run channel 派生 + 预备（含 board:agent-runs）→
+#   §1.2 生产总线 sum(head_seq) 跑前读数 → §1.4 空板自播种（带 --source）→
+#   跑 loop → §1.2 生产总线 sum(head_seq) 跑后读数（两读数写进运行记录，不等则失败）→ 归档。
 # 用法：
 #   bash bin/e0-regression.sh                 # 缺省即可跑（profile e0-regression）
 #   bash bin/e0-regression.sh --run <id>      # 可选覆盖 run id（缺省自动生成）
 #   bash bin/e0-regression.sh --profile <p>   # 可选覆盖 profile（缺省 e0-regression）
 #
-# 退出码：0 = 链路跑到终态；非零 = 没跑到终态（含生产护栏拒绝、loop 失败）。绝不以 0 掩盖未跑完。
+# 退出码：0 = 链路跑到终态；非零 = 没跑到终态（含生产护栏拒绝、loop 失败、§1.2 读数不等）。
+# 绝不以 0 掩盖未跑完。
 
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# E0c1 §1.3 —— board:agent-runs 是全局 channel，名字在仓内只有一处真相源
+# （src/run-channels.ts:RUNS_CHANNEL_ID）。bash 侧只在此处引用该字面量，与 TS 真相源保持一致。
+RUNS_CHANNEL_ID="board:agent-runs"
 
 # ── 参数：--run <id>（可选覆盖 run id）/ --profile <name>（可选覆盖 profile）。──
 PROFILE="e0-regression"
@@ -68,6 +76,7 @@ _persist_record() {
         echo "tick_channel=${TICK_CHANNEL:-}"
         echo "evidence_channel=${EVIDENCE_CHANNEL:-}"
         echo "doc_channel=${DOC_CHANNEL:-}"
+        echo "runs_channel=$RUNS_CHANNEL_ID"
         echo "loop_run_root=$RECORD_DIR/loop-run"
         echo "entry_exit_code=$ec"
         echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -117,12 +126,40 @@ if [[ "$AGENT_BUS_TOKEN_FILE" == /data/agent-bus/* ]]; then
 fi
 
 # ── 归档根（仓外，不得落进仓内污染工作区）。──
+# 提前到 profile 键校验之前：E0c1 §1.4 的 SEED_SOURCES/SEED_CLUE 校验失败也要能落记录、
+# 且让 EXIT trap 的 _persist_record 关闭 teed fd（刷出 stderr 给捕获方），否则 tee 缓冲的
+# 错误行不会出现在调用方收到的 stderr 里。
 E0_RECORD_ROOT="${E0_RECORD_ROOT:-/data/loop-engine/e0-runs}"
 RECORD_DIR="$E0_RECORD_ROOT/$RUN_ID"
 mkdir -p "$RECORD_DIR"
 
-# ── channel 预备：profile 声明的 channel 若在测试总线上不存在则创建，已存在则原样使用。
+# E0c1 §1.4 —— 播种所需键必须由 profile 声明（种子文本 + sources）。
+# ⛔ 不写死在脚本里（spec §1.4）；缺失 ⇒ 响亮失败（GT-2：不静默播一条 sources:[] 的线索）。
+if [ -z "${SEED_CLUE:-}" ]; then
+  echo "[e0-regression] REFUSING to start: SEED_CLUE is not declared by profile '$PROFILE' (spec §1.4: seed text must be profile-declared and repo-relevant). Empty-board seeding is mandatory." >&2
+  exit 3
+fi
+if [ -z "${SEED_SOURCES:-}" ]; then
+  echo "[e0-regression] REFUSING to start: SEED_SOURCES is not declared by profile '$PROFILE' (spec §1.4 / GT-2: sources must be profile-declared and non-empty; a sources:[] clue is structurally blocked on the real board)." >&2
+  exit 3
+fi
+
+# E0c1 §1.3 —— 派生本次 run 的三条 research channel（profile 基名 + run_id 段）。
+# 与 src/run-channels.ts:perRunResearchChannels 同形（sha256(run_id)[:16] 作为派生段）。
+if [ -z "${RESEARCH_PROFILE_BASE:-}" ]; then
+  echo "[e0-regression] REFUSING to start: RESEARCH_PROFILE_BASE is not declared by profile '$PROFILE' (spec §1.3: per-run research channels are derived from the profile base name + run_id)." >&2
+  exit 3
+fi
+RUN_SEGMENT="$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-16)"
+TICK_CHANNEL="research:${RESEARCH_PROFILE_BASE}-${RUN_SEGMENT}.index"
+EVIDENCE_CHANNEL="research:${RESEARCH_PROFILE_BASE}-${RUN_SEGMENT}.evidence"
+DOC_CHANNEL="research:${RESEARCH_PROFILE_BASE}-${RUN_SEGMENT}.docs"
+export TICK_CHANNEL EVIDENCE_CHANNEL DOC_CHANNEL
+
+# ── channel 预备：派生出的 per-run channel + 全局 board:agent-runs 若在测试总线上不存在则创建。
 #   创建与复核都走测试总线的 HTTP API（POST /v1/channels；GET /v1/channels/<id>）。
+#   E0c1 §1.3 —— board:agent-runs 是全局的、不随 run 变，但**必须在预备清单里**
+#   （harvest/triage 都读它）。⛔ 不得删除/清空旧 channel（bus append-only 无 DELETE）。
 TOKEN="$(cat "$AGENT_BUS_TOKEN_FILE")"
 _has_channel() {
   local ch="$1"
@@ -152,6 +189,29 @@ _ensure_channel() {
 _ensure_channel "$TICK_CHANNEL"
 _ensure_channel "$EVIDENCE_CHANNEL"
 _ensure_channel "$DOC_CHANNEL"
+# E0c1 §1.3 / 验收判据 6 —— board:agent-runs 在预备清单内（名字来自 RUNS_CHANNEL_ID 单一真相源）。
+_ensure_channel "$RUNS_CHANNEL_ID"
+
+# E0c1 §1.2 —— 生产总线 sum(head_seq) 跑前读数（http://127.0.0.1:7490，只读 GET）。
+#   两个读数（跑前/跑后）写进运行记录；不等 ⇒ 判失败并非零退出。读失败即失败（⛔ 不得跳过检查）。
+#   生产总线 URL/token 与测试总线独立（不受 AGENT_BUS_URL 覆盖影响）；
+#   可用 E0C1_PROD_BUS_URL / E0C1_PROD_BUS_TOKEN_FILE 显式覆盖（测试注入用，生产路径不变）。
+PROD_BUS_URL="${E0C1_PROD_BUS_URL:-http://127.0.0.1:7490}"
+PROD_BUS_TOKEN_FILE="${E0C1_PROD_BUS_TOKEN_FILE:-/data/agent-bus/tokens/uther-tui.token}"
+_read_prod_head_seq_sum() {
+  # 真解析 + 真求和（GT-3）：用 node JSON.parse，⛔ 禁止贪婪正则抽多值。
+  # 通过 node 调 src/bus.ts 的 listChannelsAt + sumHeadSeqAcrossChannels 以复用单一真相源。
+  AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" E0C1_PROD_BUS_URL="$PROD_BUS_URL" E0C1_PROD_BUS_TOKEN_FILE="$PROD_BUS_TOKEN_FILE" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c1-prod-read.ts" 2>/dev/null
+}
+
+echo "[e0-regression] reading production bus sum(head_seq) BEFORE run ($PROD_BUS_URL)" >&2
+if ! PROD_SUM_BEFORE="$(_read_prod_head_seq_sum)"; then
+  echo "[e0-regression] REFUSING to continue: failed to read production bus sum(head_seq) before run (spec §1.2: the before/after production-bus read is mandatory; read failure is failure). PROD_BUS_URL=$PROD_BUS_URL" >&2
+  exit 3
+fi
+echo "[e0-regression] prod_bus_sum(head_seq)_before=$PROD_SUM_BEFORE" >&2
+echo "$PROD_SUM_BEFORE" > "$RECORD_DIR/prod_bus_sum_before.json"
 
 # ── 把 run 上下文导出，供 loop-engine run 目录与 idempotency key 落到本次记录目录下。──
 export DD_RUN_ID="$RUN_ID"
@@ -159,6 +219,40 @@ export DD_RUN_ROOT="$RECORD_DIR/loop-run"
 
 echo "[e0-regression] run_id=$RUN_ID"
 echo "[e0-regression] record_dir=$RECORD_DIR"
+echo "[e0-regression] tick_channel=$TICK_CHANNEL (per-run derived)"
+
+# E0c1 §1.4 —— 空板自播种：per-run 板（刚创建、必为空）⇒ 必然需要播种。
+#   种子文本与 sources 均由 profile 声明（SEED_CLUE / SEED_SOURCES），⛔ 不写死在脚本里。
+#   幂等：idempotency key 由输入确定性派生（src/tick-seed.ts:buildSeedIdempotencyKey），重复播种不会翻倍。
+#   播种失败 ⇒ 响亮失败、非零退出（GT-2：sources 必须非空）。
+echo "[e0-regression] seeding empty per-run board: $TICK_CHANNEL (sources=$SEED_SOURCES)" >&2
+set +e
+SEED_LOG="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/tick-entry.ts" -- \
+  --seed "$TICK_CHANNEL" --clue "$SEED_CLUE" --source "$SEED_SOURCES" 2>&1)"
+SEED_EXIT=$?
+set -e
+echo "$SEED_LOG" > "$RECORD_DIR/seed.log"
+if [ "$SEED_EXIT" -ne 0 ]; then
+  echo "[e0-regression] REFUSING to continue: seeding failed (exit=$SEED_EXIT). spec §1.4: seeding failure must fail loudly (GT-2: sources must be non-empty and profile-declared)." >&2
+  echo "$SEED_LOG" >&2
+  # 仍写出运行记录（含播种失败退出码），便于回查。
+  {
+    echo "run_id=$RUN_ID"
+    echo "profile=$PROFILE"
+    echo "tick_channel=$TICK_CHANNEL"
+    echo "evidence_channel=$EVIDENCE_CHANNEL"
+    echo "doc_channel=$DOC_CHANNEL"
+    echo "runs_channel=$RUNS_CHANNEL_ID"
+    echo "seed_exit_code=$SEED_EXIT"
+    echo "prod_bus_sum_before=$PROD_SUM_BEFORE"
+    echo "loop_run_root=$RECORD_DIR/loop-run"
+    echo "entry_exit_code=3"
+    echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$RECORD_DIR/run.meta"
+  cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
+  exit 3
+fi
+echo "$SEED_LOG" >&2
 
 # ── 跑现状链路到终态；完整 stdout/stderr 落盘，退出码单独记录。──
 set +e
@@ -167,21 +261,59 @@ bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
 LOOP_EXIT=$?
 set -e
 
+# E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。
+echo "[e0-regression] reading production bus sum(head_seq) AFTER run ($PROD_BUS_URL)" >&2
+if ! PROD_SUM_AFTER="$(_read_prod_head_seq_sum)"; then
+  echo "[e0-regression] REFUSING to succeed: failed to read production bus sum(head_seq) after run (spec §1.2: read failure is failure). PROD_BUS_URL=$PROD_BUS_URL" >&2
+  {
+    echo "run_id=$RUN_ID"
+    echo "profile=$PROFILE"
+    echo "tick_channel=$TICK_CHANNEL"
+    echo "evidence_channel=$EVIDENCE_CHANNEL"
+    echo "doc_channel=$DOC_CHANNEL"
+    echo "runs_channel=$RUNS_CHANNEL_ID"
+    echo "loop_exit_code=$LOOP_EXIT"
+    echo "prod_bus_sum_before=$PROD_SUM_BEFORE"
+    echo "prod_bus_sum_after=READ_FAILED"
+    echo "loop_run_root=$RECORD_DIR/loop-run"
+    echo "entry_exit_code=3"
+    echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$RECORD_DIR/run.meta"
+  cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
+  exit 3
+fi
+echo "[e0-regression] prod_bus_sum(head_seq)_after=$PROD_SUM_AFTER" >&2
+echo "$PROD_SUM_AFTER" > "$RECORD_DIR/prod_bus_sum_after.json"
+
+# §1.2 —— 两个读数不相等 ⇒ 判失败并非零退出（生产总线零写入是本次运行的硬不变量）。
+#   派发方独立复算（读 prod_bus_sum_before.json / prod_bus_sum_after.json 各自 JSON.parse 求和）。
+PROD_SUM_BEFORE_NUM="$(printf '%s' "$PROD_SUM_BEFORE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
+PROD_SUM_AFTER_NUM="$(printf '%s' "$PROD_SUM_AFTER" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
+PROD_DELTA=$((PROD_SUM_AFTER_NUM - PROD_SUM_BEFORE_NUM))
+if [ "$PROD_DELTA" -ne 0 ]; then
+  echo "[e0-regression] REFUSING to succeed: production bus sum(head_seq) grew during the run (before=$PROD_SUM_BEFORE_NUM, after=$PROD_SUM_AFTER_NUM, delta=$PROD_DELTA). spec §1.2: the regression must not write to the production bus." >&2
+  LOOP_EXIT=3
+fi
+
 # ── 运行记录归档（§2.3.5）：入口命令 stdout/stderr、最终 exit code、profile 与 channel 名、
-#    可据以回查的 loop-engine run 目录路径。⛔ 记录目录在仓外。──
+#    可据以回查的 loop-engine run 目录路径、§1.2 生产总线跑前跑后读数。⛔ 记录目录在仓外。──
 {
   echo "run_id=$RUN_ID"
   echo "profile=$PROFILE"
   echo "tick_channel=$TICK_CHANNEL"
   echo "evidence_channel=$EVIDENCE_CHANNEL"
   echo "doc_channel=$DOC_CHANNEL"
+  echo "runs_channel=$RUNS_CHANNEL_ID"
   echo "loop_run_root=$RECORD_DIR/loop-run"
+  echo "prod_bus_sum_before=$PROD_SUM_BEFORE_NUM"
+  echo "prod_bus_sum_after=$PROD_SUM_AFTER_NUM"
+  echo "prod_bus_delta=$PROD_DELTA"
   echo "entry_exit_code=$LOOP_EXIT"
   echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RECORD_DIR/run.meta"
 cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
 
-echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT)"
+echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT, prod_bus_delta=$PROD_DELTA)"
 
 # 终态可判：0 = 跑到终态；非零 = 没跑到终态。绝不以 0 掩盖未跑完。
 exit "$LOOP_EXIT"

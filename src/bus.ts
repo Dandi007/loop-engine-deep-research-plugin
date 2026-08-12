@@ -96,6 +96,177 @@ interface PublishResponse {
 
 // ── 读 ──
 
+/**
+ * E0c1 GT-1 —— channel 列表项的最小视图。
+ *
+ * 真机 bus 的两个 channel 端点**字段集不同**（spec §0 GT-1，逐字实测）：
+ *   GET /v1/channels/<id>  → channel_id, closed_at, created_at, default_lease_ms,
+ *                            delivery_mode, max_attempts, metadata, owner_agent_id,
+ *                            refs_required, visibility          ← ⛔ 没有 head_seq
+ *   GET /v1/channels       → channel_id, closed_at, created_at, delivery_mode,
+ *                            head_seq, owner_agent_id, visibility ← head_seq 只在这里
+ *
+ * 列表把**已创建但为空**的 channel 以 `head_seq: 0` 列出（不是省略）。
+ * 因此 `head_seq` 的唯一可信来源是**列表端点**；单 channel GET 即便返回也属本包不依赖的形状。
+ */
+export interface ChannelListItem {
+  channel_id: string;
+  head_seq: number;
+}
+
+/**
+ * E0c1 GT-1 —— 读 `GET /v1/channels`，返回**所有** channel（分页拉满）。
+ *
+ * 真实 JSON 一律真解析（仓内已依赖 Node，`JSON.parse` 即可，⛔ 不新增依赖）。
+ * ⛔ 禁止用贪婪正则从单行 JSON 抽多值（spec §0 GT-3：该写法每行只捕获最后一个，
+ *    算出来的是 3 而真实 `sum(head_seq)` 是 9788）。
+ *
+ * 读模块级 `BASE_URL`（受 `AGENT_BUS_URL` 覆盖，测试总线即此）。生产总线独立读数
+ * 见 `readProdBusHeadSeqSum` / `listChannelsAt`。
+ */
+export async function listChannels(): Promise<ChannelListItem[]> {
+  return listChannelsAt(BASE_URL, TOKEN_PATH);
+}
+
+/**
+ * E0c1 §1.2 —— 对**指定** bus 实例读 `GET /v1/channels` 真解析求和。
+ *
+ * 与 `listChannels()` 同形，但 base/token 由参数显式传入（不读模块级 `BASE_URL`/`token()`），
+ * 供 `readProdBusHeadSeqSum` 在测试总线覆盖 `AGENT_BUS_URL` 时仍能独立读生产总线，
+ * 也供单测直接注入假 base/token。全程只发 GET。
+ *
+ * ⛔ 真解析（`resp.json()`）；禁止贪婪正则抽多值（GT-3）。
+ * 列表端点对空 channel 也列 `head_seq: 0`（GT-1），非数字即结构性异常 ⇒ 响亮失败。
+ */
+export async function listChannelsAt(
+  baseUrl: string,
+  tokenPath: string,
+): Promise<ChannelListItem[]> {
+  let bearer: string;
+  try {
+    bearer = readFileSync(tokenPath, "utf-8").trim();
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `E0c1: failed to read bus token at '${tokenPath}' (${detail}). The head_seq list read is mandatory; refusing to skip it.`,
+    );
+  }
+  if (!bearer) {
+    throw new Error(
+      `E0c1: bus token at '${tokenPath}' is empty. The head_seq list read is mandatory; refusing to skip it.`,
+    );
+  }
+  const items: ChannelListItem[] = [];
+  let cursor: string | undefined;
+  for (;;) {
+    const path = cursor ? `/v1/channels?${cursor}` : "/v1/channels";
+    const url = `${baseUrl}${path}`;
+    const resp = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        "Content-Type": "application/json",
+      },
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new BusError("GET", path, resp.status, body);
+    }
+    const data = (await resp.json()) as {
+      channels?: unknown;
+      next_cursor?: unknown;
+    };
+    const channels = Array.isArray(data.channels) ? data.channels : [];
+    for (const raw of channels) {
+      const obj = raw as Record<string, unknown>;
+      const channelId = obj.channel_id;
+      const headSeq = obj.head_seq;
+      if (typeof channelId !== "string") continue;
+      if (typeof headSeq !== "number" || !Number.isFinite(headSeq)) {
+        throw new Error(
+          `E0c1: list endpoint at ${baseUrl} returned channel "${channelId}" without a finite numeric head_seq (got ${JSON.stringify(headSeq)}). The list endpoint is the sole source of head_seq per GT-1; refusing to fabricate 0.`,
+        );
+      }
+      items.push({ channel_id: channelId, head_seq: headSeq });
+    }
+    const next = data.next_cursor;
+    if (typeof next !== "string" || next.length === 0) break;
+    cursor = next;
+  }
+  return items;
+}
+
+/**
+ * E0c1 GT-1 / §1.1 —— 按 channel_id 从**列表端点**取 head_seq。
+ *
+ * 找不到该 channel、或该 channel 在列表里没有 `head_seq` 字段 ⇒
+ * **响亮失败并点名 channel 与实际拿到的字段集**（spec §1.1）。
+ * ⛔ 不得当作 0 继续（把「读不到」和「确实是 0」混为一谈会让增长判据失效）。
+ *
+ * 单 channel GET 端点（`GET /v1/channels/<id>`）在真机 bus 上**不含 head_seq**
+ * （GT-1），所以这里只读列表端点、按 channel_id 定位。
+ */
+export async function getChannelHeadSeq(channelId: string): Promise<number> {
+  const channels = await listChannels();
+  const found = channels.find((c) => c.channel_id === channelId);
+  if (!found) {
+    const present = channels.map((c) => c.channel_id).sort().join(", ");
+    throw new Error(
+      `E0c1: channel "${channelId}" not found on the list endpoint (GET /v1/channels). Present channel_ids: [${present || "<empty>"}]. Refusing to treat a missing channel as head_seq=0.`,
+    );
+  }
+  // listChannels 已对每条做 finite-number 校验；这里直接返回。
+  return found.head_seq;
+}
+
+/**
+ * E0c1 GT-3 / §1.2 —— 对列表里**所有** channel 的 head_seq 真实全量求和。
+ *
+ * ⛔ 真解析（`JSON.parse`），⛔ 禁止贪婪正则抽多值（GT-3）。
+ * 返回 { sum, byChannel }：sum 是真实全量和，byChannel 供运行记录归档与派发方独立复算。
+ * 纯函数：消费已读列表，不发起 IO（IO 由 listChannels 完成，可单独注入测试）。
+ */
+export function sumHeadSeqAcrossChannels(
+  channels: ChannelListItem[],
+): { sum: number; byChannel: Array<{ channel_id: string; head_seq: number }> } {
+  let sum = 0;
+  const byChannel: Array<{ channel_id: string; head_seq: number }> = [];
+  for (const c of channels) {
+    if (typeof c.head_seq !== "number" || !Number.isFinite(c.head_seq)) {
+      throw new Error(
+        `E0c1: non-finite head_seq on channel "${c.channel_id}" (${JSON.stringify(c.head_seq)}); refusing to sum.`,
+      );
+    }
+    sum += c.head_seq;
+    byChannel.push({ channel_id: c.channel_id, head_seq: c.head_seq });
+  }
+  return { sum, byChannel };
+}
+
+/**
+ * E0c1 §1.2 —— 读生产总线 `sum(head_seq)`（`http://127.0.0.1:7490`，只读 GET）。
+ *
+ * 用 `listChannels()` 真实求和（GT-3）；返回 { sum, byChannel } 供入口在跑前/跑后
+ * 各读一次并写进运行记录。读失败即失败（⛔ 不得跳过检查）。
+ *
+ * ⛔ 生产总线读数与测试总线（`AGENT_BUS_URL`）**完全独立**：本函数始终读
+ *    `http://127.0.0.1:7490` + 生产 token（`/data/agent-bus/tokens/uther-tui.token`），
+ *    不受 `AGENT_BUS_URL` / `AGENT_BUS_TOKEN_FILE` 覆盖影响——因为入口会把这两个变量
+ *    改指向测试总线（7495），而 §1.2 要的是**生产**总线在跑前/跑后的零增长读数。
+ *    可用 `E0C1_PROD_BUS_URL` / `E0C1_PROD_BUS_TOKEN_FILE` 显式覆盖（测试注入用，
+ *    生产路径不变）。
+ */
+export async function readProdBusHeadSeqSum(): Promise<{
+  sum: number;
+  byChannel: Array<{ channel_id: string; head_seq: number }>;
+}> {
+  const prodUrl = process.env.E0C1_PROD_BUS_URL ?? "http://127.0.0.1:7490";
+  const prodTokenPath =
+    process.env.E0C1_PROD_BUS_TOKEN_FILE ??
+    "/data/agent-bus/tokens/uther-tui.token";
+  const channels = await listChannelsAt(prodUrl, prodTokenPath);
+  return sumHeadSeqAcrossChannels(channels);
+}
+
 /** 获取 channel 消息（分页，增量） */
 export async function getMessages(
   channelId: string,

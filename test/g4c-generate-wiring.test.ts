@@ -746,7 +746,7 @@ describe("G4c U8: --origin and --doc-channel argv records", () => {
     const fakeTickEntry = `#!/usr/bin/env bash
 case "$1" in
   --parse-trigger-body) printf ''; exit 0 ;;
-  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
+  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
 esac
 `;
     writeFileSync(tickEntry, fakeTickEntry);
@@ -799,7 +799,7 @@ describe("G4c U9: value missing ⇒ flag not present", () => {
     const fakeTickEntry = `#!/usr/bin/env bash
 case "$1" in
   --parse-trigger-body) printf ''; exit 0 ;;
-  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
+  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
 esac
 `;
     writeFileSync(tickEntry, fakeTickEntry);
@@ -844,7 +844,7 @@ esac
     const fakeTickEntry = `#!/usr/bin/env bash
 case "$1" in
   --parse-trigger-body) printf ''; exit 0 ;;
-  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
+  *) printf '%s\\n' "$@" > "${argvLog}"; printf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'; exit 0 ;;
 esac
 `;
     writeFileSync(tickEntry, fakeTickEntry);

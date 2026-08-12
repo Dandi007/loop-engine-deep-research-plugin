@@ -58,9 +58,8 @@ usage:
                      G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：
                      tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为
                      统一调用 parseTerminationFromBody，单源真相）。
-                     输出（stdout，制表符分隔）：首轮 body（{"seed":true}）⇒ 空串（调用方不传 --prev-*）；
-                     续投 body（含 coverage/zeroGrowthRounds）⇒ "--prev-coverage\\t<n>\\t--prev-zero-growth\\t<m>"。
-                     body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。
+                     输出（stdout，空格分隔）：首轮 body（{"seed":true}）⇒ 空串（调用方不传 --prev-*）；
+                     续投 body（含 coverage/zeroGrowthRounds）⇒ "<n> <m>"（空格分隔的两个非负整数）。
 
 --help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。
 --inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。
@@ -141,7 +140,7 @@ export async function main(argv: string[]): Promise<number> {
         process.stdout.write("");
       } else {
         process.stdout.write(
-          `--prev-coverage\t${parsed.prevCoverage}\t--prev-zero-growth\t${parsed.prevZeroGrowthRounds}`,
+          `${parsed.prevCoverage} ${parsed.prevZeroGrowthRounds}`,
         );
       }
       return 0;

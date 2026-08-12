@@ -294,12 +294,135 @@ if [ "$SEED_EXIT" -ne 0 ]; then
 fi
 echo "$SEED_LOG" >&2
 
-# ── 跑现状链路到终态；完整 stdout/stderr 落盘，退出码单独记录。──
-set +e
-bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" \
-  > "$RECORD_DIR/run.stdout.log" 2> "$RECORD_DIR/run.stderr.log"
-LOOP_EXIT=$?
-set -e
+# E0c2 §1.3 / GT-8 —— 读板面 head_seq（复用 E0c1 已交付的列表端点实现）。
+# ⛔ 不得从单 channel GET 端点读（不返回 head_seq）。
+_read_tick_head_seq() {
+  AGENT_BUS_URL="$AGENT_BUS_URL" AGENT_BUS_TOKEN_FILE="$AGENT_BUS_TOKEN_FILE" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c2-read-head-seq.ts" "$TICK_CHANNEL"
+}
+
+# ── E0c2 §1.3 —— 跨 drain 循环直到终态（GT-3）。──
+# 重复：跑一次 deep-research-loop.sh → 按 GT-6 分类 → 按 §1.1 读终态 → 收敛则退出。
+# 退避时长 / drain 次数上限 / 墙钟上限均由 profile 声明（TERMINATION_BACKOFF_SECONDS /
+# TERMINATION_MAX_DRAINS / TERMINATION_WALL_CLOCK_SECONDS）。
+_termination_backoff="${TERMINATION_BACKOFF_SECONDS:-120}"
+_termination_max="${TERMINATION_MAX_DRAINS:-12}"
+_termination_wall_clock="${TERMINATION_WALL_CLOCK_SECONDS:-2400}"
+_start_ts=$(date +%s)
+_drain_count=0
+_termination_state="null"
+_final_term=""
+_drain_records=""
+_loop_exit_code=0
+
+while true; do
+  _drain_count=$((_drain_count + 1))
+  _now=$(date +%s)
+  _wall_elapsed=$((_now - _start_ts))
+
+  # 跑一次 deep-research-loop.sh（一次 drain），完整捕获 stdout/stderr/退出码。
+  set +e
+  _drain_out=$(bash "$PLUGIN_ROOT/bin/deep-research-loop.sh" --profile "$PROFILE" 2>&1)
+  _drain_ec=$?
+  set -e
+
+  # 从 stdout 逐行解析 drain 摘要（GT-7：逐行 JSON.parse，取含 drain_id 的那行；
+  # ⛔ 禁止花括号正则）。
+  _drain_summary=""
+  while IFS= read -r _line; do
+    _parsed_drain="$(printf '%s' "$_line" | node -e "
+      try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim());
+        if (o && typeof o === 'object' && o.drain_id) process.stdout.write(JSON.stringify(o)); }
+      catch(e) {}
+    " 2>/dev/null)"
+    if [ -n "$_parsed_drain" ]; then
+      _drain_summary="$_parsed_drain"
+      break
+    fi
+  done <<EOF
+$_drain_out
+EOF
+
+  _drain_reason="parse_error"
+  _drain_id=""
+  _runs_root=""
+  if [ -n "$_drain_summary" ]; then
+    _drain_reason="$(printf '%s' "$_drain_summary" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(o.reason || ''); } catch(e) {}" 2>/dev/null)"
+    _drain_id="$(printf '%s' "$_drain_summary" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(o.drain_id || ''); } catch(e) {}" 2>/dev/null)"
+    _runs_root="$(printf '%s' "$_drain_summary" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(o.runs_root || ''); } catch(e) {}" 2>/dev/null)"
+  fi
+
+  # GT-6 分类：
+  #   拿不到可解析摘要 / 非 max_rounds 的非零退出码 ⇒ 真失败，响亮收尾。
+  #   reason==drained 或 reason==max_rounds ⇒ 继续往下判终态（⛔ max_rounds 的 exit 1 不算失败）。
+  if [ -z "$_drain_summary" ]; then
+    echo "[e0-regression] DRAIN FAILED: cannot parse drain summary (exit=$_drain_ec). Aborting (GT-6: unparseable drain is a real failure, not 'not yet converged')." >&2
+    _loop_exit_code=3
+    break
+  fi
+  if [ "$_drain_reason" != "drained" ] && [ "$_drain_reason" != "max_rounds" ]; then
+    echo "[e0-regression] DRAIN FAILED: reason='$_drain_reason', exit=$_drain_ec. Aborting (GT-6: non-drained/non-max_rounds is a real failure)." >&2
+    _loop_exit_code=3
+    break
+  fi
+
+  # §1.1 —— 读本次 drain 的 termination.state（GT-2 路径：journal → result → 第一个 JSON 文档）。
+  _term_json=""
+  if [ -n "$_drain_id" ] && [ -n "$_runs_root" ]; then
+    _term_json="$(printf '%s' "$_drain_summary" | node "$PLUGIN_ROOT/scripts/read-termination-state.mjs" 2>/dev/null)" || true
+  fi
+  _termination_state="null"
+  _term_coverage=""
+  _term_zero_growth=""
+  if [ -n "$_term_json" ]; then
+    _termination_state="$(printf '%s' "$_term_json" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(o.state === null ? 'null' : o.state); } catch(e) {}" 2>/dev/null)"
+    _term_coverage="$(printf '%s' "$_term_json" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(String(o.coverage)); } catch(e) {}" 2>/dev/null)"
+    _term_zero_growth="$(printf '%s' "$_term_json" | node -e "try { const o = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8').trim()); process.stdout.write(String(o.zeroGrowthRounds)); } catch(e) {}" 2>/dev/null)"
+  fi
+
+  # GT-8 —— 读板面 head_seq（复用 E0c1 已交付的列表端点实现）。
+  _head_seq=""
+  _read_hs=$(_read_tick_head_seq 2>/dev/null) && _head_seq="$_read_hs" || _head_seq="READ_FAILED"
+
+  # 每轮 drain 打一行进度（第几轮 / 本轮 drain reason / 当前 termination.state / 板面 head_seq）
+  echo "[e0-regression] attempt=$_drain_count reason=$_drain_reason termination_state=$_termination_state head_seq=$_head_seq" >&2
+
+  # 每轮的 runs_root/reason/终态追加进运行记录
+  _drain_records="${_drain_records}drain_${_drain_count}_runs_root=${_runs_root:-}
+drain_${_drain_count}_reason=${_drain_reason}
+drain_${_drain_count}_termination_state=${_termination_state}
+drain_${_drain_count}_drain_id=${_drain_id:-}
+"
+
+  # 非 null 终态 ⇒ 成功收尾，退出循环。
+  if [ "$_termination_state" != "null" ] && [ -n "$_termination_state" ]; then
+    _final_term="$_term_json"
+    _loop_exit_code=0
+    echo "[e0-regression] TERMINATION REACHED: state=$_termination_state (coverage=$_term_coverage zeroGrowthRounds=$_term_zero_growth) after $_drain_count drain(s)" >&2
+    break
+  fi
+
+  # 撞墙钟或次数上限 ⇒ 失败收尾（响亮，非零退出，点名撞的是哪个上限、实测值多少）。
+  if [ "$_drain_count" -ge "$_termination_max" ]; then
+    echo "[e0-regression] TERMINATION NOT REACHED: hit max drain count ($_termination_max). Last state=$_termination_state. Aborting (GT-3: convergence did not happen within the declared limit)." >&2
+    _loop_exit_code=3
+    break
+  fi
+  if [ "$_wall_elapsed" -ge "$_termination_wall_clock" ]; then
+    echo "[e0-regression] TERMINATION NOT REACHED: hit wall clock limit ($_termination_wall_clock seconds). Last state=$_termination_state. Aborting (GT-3: convergence did not happen within the wall clock limit)." >&2
+    _loop_exit_code=3
+    break
+  fi
+
+  # 退避后再来一轮（GT-3：退避量与 worker 真实耗时 158 秒相称，≥ 120 秒）。
+  echo "[e0-regression] backoff $_termination_backoff seconds before next drain (state=$_termination_state, attempt=$_drain_count/$_termination_max)" >&2
+  sleep "$_termination_backoff"
+done
+
+# ── 写入运行记录。──
+# 把每轮 drain 的 stdout/stderr 落盘，退出码单独记录。
+echo "$_drain_out" > "$RECORD_DIR/run.stdout.log"
+echo "[e0-regression] loop exit code: $_loop_exit_code" > "$RECORD_DIR/run.stderr.log"
 
 # E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。
 echo "[e0-regression] reading production bus sum(head_seq) AFTER run ($PROD_BUS_URL)" >&2
@@ -312,7 +435,7 @@ if ! PROD_SUM_AFTER="$(_read_prod_head_seq_sum)"; then
     echo "evidence_channel=$EVIDENCE_CHANNEL"
     echo "doc_channel=$DOC_CHANNEL"
     echo "runs_channel=$RUNS_CHANNEL_ID"
-    echo "loop_exit_code=$LOOP_EXIT"
+    echo "loop_exit_code=$_loop_exit_code"
     echo "prod_bus_sum_before=$PROD_SUM_BEFORE"
     echo "prod_bus_sum_after=READ_FAILED"
     echo "loop_run_root=$RECORD_DIR/loop-run"
@@ -332,7 +455,7 @@ PROD_SUM_AFTER_NUM="$(printf '%s' "$PROD_SUM_AFTER" | node -e 'let s="";process.
 PROD_DELTA=$((PROD_SUM_AFTER_NUM - PROD_SUM_BEFORE_NUM))
 if [ "$PROD_DELTA" -ne 0 ]; then
   echo "[e0-regression] REFUSING to succeed: production bus sum(head_seq) grew during the run (before=$PROD_SUM_BEFORE_NUM, after=$PROD_SUM_AFTER_NUM, delta=$PROD_DELTA). spec §1.2: the regression must not write to the production bus." >&2
-  LOOP_EXIT=3
+  _loop_exit_code=3
 fi
 
 # ── 运行记录归档（§2.3.5）：入口命令 stdout/stderr、最终 exit code、profile 与 channel 名、
@@ -348,12 +471,14 @@ fi
   echo "prod_bus_sum_before=$PROD_SUM_BEFORE_NUM"
   echo "prod_bus_sum_after=$PROD_SUM_AFTER_NUM"
   echo "prod_bus_delta=$PROD_DELTA"
-  echo "entry_exit_code=$LOOP_EXIT"
+  echo "drain_count=$_drain_count"
+  echo "entry_exit_code=$_loop_exit_code"
+  printf '%s' "$_drain_records"
   echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RECORD_DIR/run.meta"
 cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
 
-echo "[e0-regression] run record written: $RECORD_DIR (exit=$LOOP_EXIT, prod_bus_delta=$PROD_DELTA)"
+echo "[e0-regression] run record written: $RECORD_DIR (exit=$_loop_exit_code, prod_bus_delta=$PROD_DELTA)"
 
 # 终态可判：0 = 跑到终态；非零 = 没跑到终态。绝不以 0 掩盖未跑完。
-exit "$LOOP_EXIT"
+exit "$_loop_exit_code"

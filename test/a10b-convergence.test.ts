@@ -347,7 +347,7 @@ function makeFakeTick(values: {
   const tickEntry = join(values.dir, "tick-entry");
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");

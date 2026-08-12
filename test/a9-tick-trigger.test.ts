@@ -267,7 +267,7 @@ function makeFakeTick(values: {
   // G4b —— fake tick-entry 的 JSON 输出必须含 termination（tick.md 现在读它写进下一条 trigger body）。
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");

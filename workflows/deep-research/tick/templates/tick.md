@@ -75,9 +75,11 @@ if [ -n "$tick_channel" ]; then
     fi
     rm -f "$parse_err"
     if [ -n "$prev_line" ]; then
-      # prev_line 形如 "--prev-coverage\t<n>\t--prev-zero-growth\t<m>"，按制表符切成数组追加。
-      IFS=$'\t' read -r -a prev_arr <<< "$prev_line"
-      prev_args+=("${prev_arr[@]}")
+      _prev_cov="${prev_line%% *}"
+      _prev_zgr="${prev_line#* }"
+      if [ -n "$_prev_cov" ] && [ -n "$_prev_zgr" ]; then
+        prev_args+=(--prev-coverage "$_prev_cov" --prev-zero-growth "$_prev_zgr")
+      fi
     fi
   fi
   tick_args+=("${prev_args[@]}")
@@ -89,9 +91,24 @@ if [ -n "$tick_channel" ]; then
   #    全部就绪；任一缺失 ⇒ **响亮失败**（非零退出 + 点名缺项），绝不静默不投（spec §3.2 禁止静默零结果）。
   # G4b —— 续投 trigger 的 body 承载本轮 decideTermination 的 coverage/zeroGrowthRounds（spec §1.2）。
   #    从 run_output 的 JSON 解析 termination.coverage / termination.zeroGrowthRounds，写进下一条 body。
-  if printf '%s' "$run_output" | grep -q '"hasPendingWork": *true'; then
+  # §1.2 —— 续投门对齐终态判据：hasPendingWork=true 或 (termination.state 仍为 null 且未触顶)。
+  #   ⛔ 不得再用 grep 正则（GT-4/GT-7）：用 node JSON.parse 真解析 run_output。
+  #   ⛔ 拿到非 null 终态后必须停止续投（GT-4）；触顶时按既有语义走（capped 需等在途排空）。
+  _should_continue=$(node -e "
+    const s = process.argv[1];
+    let o;
+    try { o = JSON.parse(s); } catch(e) { process.stdout.write('0'); process.exit(0); }
+    const hpw = o && typeof o === 'object' ? o.hasPendingWork : false;
+    const term = o && typeof o === 'object' ? o.termination : null;
+    const state = term && typeof term === 'object' ? term.state : undefined;
+    const capHit = term && typeof term === 'object' ? term.capHit : false;
+    if (hpw) { process.stdout.write('1'); process.exit(0); }
+    if ((state === null || state === undefined) && !capHit) { process.stdout.write('1'); process.exit(0); }
+    process.stdout.write('0');
+  " "$run_output")
+  if [ "$_should_continue" = "1" ]; then
     if [ -z "$trigger_store_dir" ] || [ -z "$loop_store_cli" ] || [ -z "$loop_engine_runner" ]; then
-      echo "[tick] hasPendingWork=true but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
+      echo "[tick] continuation required but trigger wiring is incomplete: trigger_store_dir/loop_store_cli/loop_engine_runner must all be set. Refusing to silently skip the continuation put." >&2
       exit 1
     fi
     # G4b —— 解析本轮 termination 计数写进下一条 trigger body。run_output 必含 termination（tick-entry --run 输出）。

@@ -236,12 +236,13 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       return;
     }
     it("empty terminal board through the real driver drains with reason=drained", async () => {
+      // E0c2 §1.2：续投门对齐终态判据后，空板 drain 可能需 2 轮（zeroGrowthRounds 攒到阈值）。
       const port = 18000 + Math.floor(Math.random() * 1000);
       const { code, out } = await runRealE2E({ port });
       expect(code).toBe(0);
       const result = drainResult(out) as { reason?: string };
       expect(result.reason).toBe("drained");
-    });
+    }, 30000);
   };
   guard(() => {});
 });
@@ -269,6 +270,8 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       return;
     }
     it("drains and leaves research.evidence.v2 in the evidence channel", async () => {
+      // E0c2 §1.2：续投门改为对齐终态判据后，drain 不再在 hasPendingWork=false 时立即收敛——
+      //   需多跑 1~2 轮让 zeroGrowthRounds 攒到阈值再 converged。给了 30s 以适应多轮真实 drain。
       const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
       const seed = join(dir, "seed.json");
       writeFileSync(
@@ -332,7 +335,7 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），
       //    故增量 == 回读到的 evidence 条数；收割的 evidence+clue 发布都计入预算（src/tick-run.ts）。
       expect(evidence.length).toBeLessThanOrEqual(5);
-    });
+    }, 30000);
   };
   guard(() => {});
 });
@@ -343,11 +346,19 @@ function makeFakeTick(values: {
   hasPendingWork: boolean;
   dir: string;
   runnerLog: string;
+  /**
+   * E0c2 §1.2：续投门改为对齐终态判据。续投 ⇔ hasPendingWork==true 或 (state==null 且 !capHit)。
+   * 为使「hasPendingWork=false ⇒ 不续投」在新门下仍成立，fakeRunBody 的 termination.state 必须非 null。
+   * 默认用 "converged"；需要测试 null 行为的用例可显式传入 null。
+   */
+  terminationState?: "converged" | "capped" | "partial" | null;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
+  const termState = values.terminationState ?? null;
+  const termStateJson = termState === null ? "null" : `"${termState}"`;
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${termStateJson}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -394,14 +405,17 @@ describe("B3: board has a non-terminal clue ⇒ still invests a next trigger", (
 });
 
 describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)", () => {
-  it("hasPendingWork false ⇒ tick.md writes no trigger", () => {
+  it("hasPendingWork false AND termination converged ⇒ tick.md writes no trigger", () => {
+    // E0c2 §1.2：续投门改为 hasPendingWork==true 或 (state==null 且 !capHit)。
+    //   本用例编码「不续投」侧：hasPendingWork=false 且 state=converged（非 null）⇒ 停止续投。
+    //   （把 state 改回 null 会让本用例在新门下变红——正是 GT-4 的判别性。）
     const s = state({
       cards: [card({ status: "explored" }), card({ status: "dropped" }), card({ status: "blocked" })],
     });
     expect(hasPendingWork(s)).toBe(false);
     const dir = mkdtempSync(join(tmpdir(), "a10b-b4-"));
     const log = join(dir, "puts.log");
-    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, dir, runnerLog: log });
+    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, terminationState: "converged", dir, runnerLog: log });
     writeFileSync(log, "");
     renderTickMd(
       {

@@ -44,6 +44,7 @@ const PROFILES_DIR = join(ROOT, "profiles", "deploy");
 const DEFAULT_TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 // E0c1 §1.3 —— profile 不再写死固定 channel 名；TICK/EVIDENCE/DOC_CHANNEL 由入口按 run_id 派生。
 // 必备键改为：研究元数据 + 派生基名 + 播种声明（§1.4）+ 既有护栏键。
+// E0c2 §1.3 —— 跨 drain 循环的三个上限也必须由 profile 声明（GT-3）。
 const REQUIRED_PROFILE_KEYS = [
   "RESEARCH_QUESTION",
   "RESEARCH_ORIGIN",
@@ -53,6 +54,9 @@ const REQUIRED_PROFILE_KEYS = [
   "EXPORT_ROOT",
   "ALLOWED_ROOT",
   "ANCHOR_CHECK_BIN",
+  "E0_DRAIN_BACKOFF_SECONDS",
+  "E0_DRAIN_MAX_WALL_SECONDS",
+  "E0_DRAIN_MAX_ATTEMPTS",
 ];
 
 async function loadBus() {
@@ -89,7 +93,7 @@ function readProfile(name: string): Record<string, string> {
   const text = readFileSync(join(PROFILES_DIR, `${name}.env`), "utf8");
   const rec: Record<string, string> = {};
   for (const line of text.split("\n")) {
-    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
     if (m) rec[m[1]] = m[2];
   }
   return rec;

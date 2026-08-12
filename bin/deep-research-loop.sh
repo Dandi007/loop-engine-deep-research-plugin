@@ -190,6 +190,16 @@ fi
 
 # A9 —— drain 之前投下首个触发（status:"open"），否则 claimableCount() 恒 0 ⇒ 0 tick。
 # 实测 loop-store 契约：put '{"id":"...","status":"open","body":{...}}' → 落盘 <id>.json。
+#
+# 评审 major 修复（attempt 1 final REJECT）：上一版在 put 前加了 store-cli 的 `list`+`open` 查询门，
+#   想在跨 drain 续投时跳过 seed。但 `list` 子命令在 spec §0 GT 与 docs/dev-notes 里都**无实测依据**
+#   （只有 put 与 claim open done tick 被记录为已测量）。若真实 store-cli 无 list 子命令或输出形状不同，
+#   驱动会在每次调用（含生产 agent-harness profile 路径）上 exit 3，regress E0c1 行为（判据 8）。
+#   该门只被一个返回 "[]" 的假 runner 满足（test/a9-tick-trigger.test.ts），正是 §0「为观察不到的产物
+#   发明契约、再写 fixture 满足它」的形状。
+#   ⇒ 移除 list 门，恢复 E0c1 的无条件 put（单一证据源契约）。跨 drain 续投链由 bin/e0-regression.sh
+#   的外层循环（§1.3）+ tick.md 的续投 put（§1.2）共同保证；本驱动每次被调起就投一条 open seed 触发，
+#   `claim open` 会认领任意 open 触发（含上一轮 tick.md 投下的续投触发），无需 list。
 TRIGGER_ID="a9-$(date +%s%N)-$$"
 "$LOOP_ENGINE_RUNNER" "$LOOP_STORE_CLI" "$TRIGGER_STORE_DIR" put \
   "{\"id\":\"${TRIGGER_ID}\",\"status\":\"open\",\"body\":{\"seed\":true}}"

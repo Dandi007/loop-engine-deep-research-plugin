@@ -95,10 +95,10 @@ describe("A10c D3 end-to-end: value really reaches tick-entry --run", () => {
     const dir = mkdtempSync(join(tmpdir(), "a10c-d3-"));
     const argvLog = join(dir, "tick-entry.argv.log");
     const tickEntry = join(dir, "tick-entry");
-    // 假 tick-entry：把 argv 逐行写进日志，并回显 hasPendingWork=false（无需续投/runner）。
+    // 假 tick-entry：把 argv 逐行写进日志，并回显 hasPendingWork=false + state=converged（E0c2 §1.2 新门下无需续投/runner）。
     writeFileSync(
       tickEntry,
-      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+      `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > "${argvLog}"\nprintf '%s\\n' '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 2, "capHit": false}}'\n`,
     );
     chmodSync(tickEntry, 0o755);
 

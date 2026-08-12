@@ -408,8 +408,9 @@ describe("R4: cross-tick counters really traverse trigger body (both ends)", () 
     writeFakeTickEntry({
       tickEntryPath: tickEntry,
       argvLog,
+      // E0c §1.3 —— 终态已判定（state 非 null）⇒ 不再续投，seed 体只验证不传 --prev-*。
       fakeRunBody:
-        '{"hasPendingWork": false, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
+        '{"hasPendingWork": false, "decisions": [], "termination": {"state": "converged", "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}',
     });
     const tpl = readFileSync(TICK_MD, "utf8");
     const script = tpl

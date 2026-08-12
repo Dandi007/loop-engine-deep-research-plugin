@@ -236,12 +236,14 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       return;
     }
     it("empty terminal board through the real driver drains with reason=drained", async () => {
+      // E0c §1.3 —— 空板现在需多轮（round1 state=null、round2 才 converged）才到可判终态，
+      //    故给真实 E2E 显式更长超时，避免默认 5s 误报。
       const port = 18000 + Math.floor(Math.random() * 1000);
       const { code, out } = await runRealE2E({ port });
       expect(code).toBe(0);
       const result = drainResult(out) as { reason?: string };
       expect(result.reason).toBe("drained");
-    });
+    }, 30000);
   };
   guard(() => {});
 });
@@ -269,6 +271,8 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       return;
     }
     it("drains and leaves research.evidence.v2 in the evidence channel", async () => {
+      // E0c §1.3 —— 收割后板面已排空但终态未判定仍需续投攒 zeroGrowthRounds，轮数增加；
+      //    给真实 E2E 显式更长超时，避免默认 5s 误报。
       const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
       const seed = join(dir, "seed.json");
       writeFileSync(
@@ -332,7 +336,7 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），
       //    故增量 == 回读到的 evidence 条数；收割的 evidence+clue 发布都计入预算（src/tick-run.ts）。
       expect(evidence.length).toBeLessThanOrEqual(5);
-    });
+    }, 60000);
   };
   guard(() => {});
 });
@@ -343,11 +347,15 @@ function makeFakeTick(values: {
   hasPendingWork: boolean;
   dir: string;
   runnerLog: string;
+  /** E0c §1.3 —— 可选覆盖 termination.state（缺省 null）。 */
+  termState?: string | null;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
+  // E0c §1.3 —— 续投门读 termination.state：null 表示终态未判定（板面已排空时仍续投）。
+  const state = values.termState === undefined ? "null" : JSON.stringify(values.termState);
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${state}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -393,15 +401,21 @@ describe("B3: board has a non-terminal clue ⇒ still invests a next trigger", (
   });
 });
 
-describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)", () => {
-  it("hasPendingWork false ⇒ tick.md writes no trigger", () => {
+describe("B4: board fully terminal AND termination decided ⇒ does not invest (E0c §1.3)", () => {
+  it("hasPendingWork false with non-null termination.state ⇒ tick.md writes no trigger", () => {
     const s = state({
       cards: [card({ status: "explored" }), card({ status: "dropped" }), card({ status: "blocked" })],
     });
     expect(hasPendingWork(s)).toBe(false);
     const dir = mkdtempSync(join(tmpdir(), "a10b-b4-"));
     const log = join(dir, "puts.log");
-    const { tickEntry, runner, storeDir } = makeFakeTick({ hasPendingWork: false, dir, runnerLog: log });
+    // E0c §1.3 —— 终态已判定（非 null）⇒ 不再续投。
+    const { tickEntry, runner, storeDir } = makeFakeTick({
+      hasPendingWork: false,
+      dir,
+      runnerLog: log,
+      termState: "converged",
+    });
     writeFileSync(log, "");
     renderTickMd(
       {
@@ -417,6 +431,35 @@ describe("B4: board fully terminal ⇒ does not invest (discriminant against B3)
     );
     const puts = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
     expect(puts).toHaveLength(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("hasPendingWork false but termination.state still null and not capped ⇒ STILL invests (E0c §1.3 GT-5)", () => {
+    // ⭐ 本包关键修正：板面已排空但终态尚未判定 ⇒ 仍续投。改回只看 hasPendingWork ⇒ 变红。
+    const dir = mkdtempSync(join(tmpdir(), "a10b-b4b-"));
+    const log = join(dir, "puts.log");
+    const { tickEntry, runner, storeDir } = makeFakeTick({
+      hasPendingWork: false,
+      dir,
+      runnerLog: log,
+      termState: null,
+    });
+    writeFileSync(log, "");
+    renderTickMd(
+      {
+        tick_entry: tickEntry,
+        tick_channel: "research:p02-smoke-1dce60",
+        evidence_channel: "",
+        allowed_root: "",
+        trigger_store_dir: storeDir,
+        loop_store_cli: join(dir, "store-cli.js"),
+        loop_engine_runner: runner,
+      },
+      join(dir, "tick.sh"),
+    );
+    const puts = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(puts[0]).status).toBe("open");
     rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -262,12 +262,16 @@ function makeFakeTick(values: {
   hasPendingWork: boolean;
   dir: string;
   runnerLog: string;
+  /** E0c §1.3 —— 可选覆盖 termination.state（缺省 null）。 */
+  termState?: string | null;
 }): { tickEntry: string; runner: string; storeDir: string } {
   const tickEntry = join(values.dir, "tick-entry");
   // G4b —— fake tick-entry 的 JSON 输出必须含 termination（tick.md 现在读它写进下一条 trigger body）。
+  // E0c §1.3 —— 续投门读 termination.state：null 表示终态未判定（板面已排空时仍续投）。
+  const state = values.termState === undefined ? "null" : JSON.stringify(values.termState);
   writeFileSync(
     tickEntry,
-    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": null, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
+    `#!/usr/bin/env bash\nprintf '%s\\n' '{"hasPendingWork": ${values.hasPendingWork}, "decisions": [], "termination": {"state": ${state}, "coverage": 0, "zeroGrowthRounds": 0, "capHit": false}}'\n`,
   );
   chmodSync(tickEntry, 0o755);
   const runner = join(values.dir, "runner");
@@ -320,13 +324,15 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("hasPendingWork false ⇒ no trigger record written", () => {
+  it("hasPendingWork false AND termination.state non-null ⇒ no trigger record written (E0c §1.3)", () => {
     const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
     const log = join(dir, "puts.log");
     const { tickEntry, runner, storeDir } = makeFakeTick({
       hasPendingWork: false,
       dir,
       runnerLog: log,
+      // E0c §1.3 —— 终态已判定（非 null）⇒ 不再续投。这是新续投门的终止条件。
+      termState: "converged",
     });
     writeFileSync(log, "");
     runRenderedTick(
@@ -343,6 +349,36 @@ describe("F9: tick.md puts a next trigger iff hasPendingWork === true", () => {
     );
     const puts = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
     expect(puts).toHaveLength(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("hasPendingWork false BUT termination.state still null and not capped ⇒ STILL continues (E0c §1.3 GT-5)", () => {
+    // ⭐ 本包关键修正：板面已排空（hasPendingWork=false）但终态尚未判定（state 仍 null、未触顶）
+    //   ⇒ 仍要续投，让零增长轮把 zeroGrowthRounds 攒够。把续投门改回只看 hasPendingWork ⇒ 本用例变红。
+    const dir = mkdtempSync(join(tmpdir(), "a9-tick-"));
+    const log = join(dir, "puts.log");
+    const { tickEntry, runner, storeDir } = makeFakeTick({
+      hasPendingWork: false,
+      dir,
+      runnerLog: log,
+      termState: null, // 终态未判定
+    });
+    writeFileSync(log, "");
+    runRenderedTick(
+      {
+        tick_entry: tickEntry,
+        tick_channel: "research:p02-smoke-1dce60",
+        evidence_channel: "",
+        allowed_root: "",
+        trigger_store_dir: storeDir,
+        loop_store_cli: join(dir, "store-cli.js"),
+        loop_engine_runner: runner,
+      },
+      join(dir, "tick.sh"),
+    );
+    const puts = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+    expect(puts).toHaveLength(1);
+    expect(JSON.parse(puts[0]).status).toBe("open");
     rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -3,6 +3,15 @@
  *
  * 所有 mutation 必带 idempotency_key（否则 400）。
  * 读写 agent-bus 的 HTTP API (127.0.0.1:7490)。
+ *
+ * E0c（GT-1 / GT-2）——两个 channel 端点的字段集不同：
+ *   GET /v1/channels/<id>  → channel_id, closed_at, created_at, default_lease_ms,
+ *                            delivery_mode, max_attempts, metadata, owner_agent_id,
+ *                            refs_required, visibility          ← ⛔ 没有 head_seq
+ *   GET /v1/channels       → channel_id, closed_at, created_at, delivery_mode,
+ *                            head_seq, owner_agent_id, visibility ← head_seq 只在这里
+ * 列表会把**已创建但为空**的 channel 以 head_seq: 0 列出（不是省略）。
+ * ⛔ 凡读 head_seq 一律走列表端点 + 真 JSON 解析（GT-2），禁止从单行 JSON 用贪婪正则抽多值。
  */
 import type { ClueV2, EvidenceV2, DocV2 } from "./protocol";
 import { readFileSync } from "node:fs";
@@ -95,6 +104,76 @@ interface PublishResponse {
 }
 
 // ── 读 ──
+
+/**
+ * E0c（GT-1）——列表端点的单条 channel 最小视图。
+ * ⛔ head_seq **只**出现在 `GET /v1/channels` 列表端点；单 channel GET 没有。
+ */
+export interface ListChannel {
+  channel_id: string;
+  head_seq: number;
+  /** 其余字段（created_at / delivery_mode / visibility / …）逐字透传，不作假设。 */
+  [key: string]: unknown;
+}
+
+/**
+ * E0c（GT-1 / GT-2）——读 `GET /v1/channels` 列表端点，返回全部 channel（含 head_seq）。
+ * ⛔ 用真 JSON 解析（resp.json()），不做任何正则抽取；列表会把已创建但为空的 channel 以
+ *    head_seq: 0 列出，不是省略。
+ */
+export async function listChannels(): Promise<ListChannel[]> {
+  const resp = await busFetch("/v1/channels");
+  const data = (await resp.json()) as { channels?: unknown[] } | unknown[];
+  const arr = Array.isArray(data)
+    ? data
+    : Array.isArray((data as { channels?: unknown[] })?.channels)
+      ? (data as { channels: unknown[] }).channels
+      : [];
+  return arr as ListChannel[];
+}
+
+/**
+ * E0c（GT-1）——从**列表端点**按 channel_id 定位并取该 channel 的 head_seq。
+ * ⛔ 找不到该 channel，或该 channel 项上没有 head_seq 字段 ⇒ **响亮失败**并点名 channel 与
+ *    实际拿到的字段集，⛔ 不得当作 0 继续。
+ */
+export async function channelHeadSeq(channelId: string): Promise<number> {
+  const channels = await listChannels();
+  const found = channels.find((c) => c.channel_id === channelId);
+  if (!found) {
+    const actual = channels.map((c) => c.channel_id);
+    throw new Error(
+      `E0c GT-1: channel "${channelId}" not found in GET /v1/channels list. Actual channel_ids present: [${actual.join(", ")}]. Refusing to treat head_seq as 0.`,
+    );
+  }
+  if (typeof found.head_seq !== "number") {
+    const fields = Object.keys(found);
+    throw new Error(
+      `E0c GT-1: channel "${channelId}" in GET /v1/channels list has no head_seq field. Actual fields: [${fields.join(", ")}]. Refusing to treat head_seq as 0.`,
+    );
+  }
+  return found.head_seq;
+}
+
+/**
+ * E0c（GT-2）——生产总线 `sum(head_seq)`：对列表里**所有** channel 的 head_seq 求和。
+ * ⛔ 是真实全量求和：遍历整个列表，逐项取 head_seq（真 JSON 解析，不抽正则在单行 JSON 抽多值）。
+ * ⛔ 任一 channel 缺 head_seq 字段 ⇒ 响亮失败点名（不得当作 0 静默参与求和）。
+ */
+export async function sumAllHeadSeqs(): Promise<number> {
+  const channels = await listChannels();
+  let sum = 0;
+  for (const c of channels) {
+    if (typeof c.head_seq !== "number") {
+      const fields = Object.keys(c);
+      throw new Error(
+        `E0c GT-2: channel "${c.channel_id}" in GET /v1/channels list has no head_seq field. Actual fields: [${fields.join(", ")}]. Refusing to silently contribute 0 to the production-bus sum.`,
+      );
+    }
+    sum += c.head_seq;
+  }
+  return sum;
+}
 
 /** 获取 channel 消息（分页，增量） */
 export async function getMessages(

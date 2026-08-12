@@ -16,6 +16,7 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deriveResearchChannels } from "../src/e0-regression";
 
 const fsProbe = vi.hoisted(() => ({
   readPaths: [] as string[],
@@ -45,9 +46,9 @@ const DEFAULT_TOKEN_PATH = "/data/agent-bus/tokens/uther-tui.token";
 const REQUIRED_PROFILE_KEYS = [
   "RESEARCH_QUESTION",
   "RESEARCH_ORIGIN",
-  "DOC_CHANNEL",
-  "TICK_CHANNEL",
-  "EVIDENCE_CHANNEL",
+  "RESEARCH_CHANNEL_BASE",
+  "SEED_CLUES",
+  "SEED_SOURCES",
   "ANCHOR_CHECK_BIN",
   "EXPORT_ROOT",
   "ALLOWED_ROOT",
@@ -253,13 +254,17 @@ describe("T-D: --profile e0-regression provides every required key and disjoint 
     }
   });
 
-  it("channel names are disjoint from the production profile agent-harness.env", () => {
+  it("channel base is disjoint from the production profile agent-harness.env channels", () => {
     const e0 = readProfile("e0-regression");
     const prod = readProfile("agent-harness");
-    const e0Ch = [e0.TICK_CHANNEL, e0.EVIDENCE_CHANNEL, e0.DOC_CHANNEL];
+    const base = e0.RESEARCH_CHANNEL_BASE;
+    expect(base).toBeTruthy();
+    // E0c §1.2 —— per-run channel 名由基名 + run_id 派生，绝不与生产固定 channel 冲突。
+    const derived = deriveResearchChannels(base, "probe-run");
+    const e0Ch = [derived.index, derived.evidence, derived.docs];
     const prodCh = [prod.TICK_CHANNEL, prod.EVIDENCE_CHANNEL, prod.DOC_CHANNEL];
     for (const c of e0Ch) {
-      expect(c).toMatch(/research:e0/);
+      expect(c).toMatch(/research:e0-/);
       expect(prodCh).not.toContain(c);
     }
   });

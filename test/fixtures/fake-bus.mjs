@@ -51,6 +51,14 @@ const server = createServer((req, res) => {
       const list = (channels.get(id) ?? []).filter((m) => m.channel_seq > after);
       return send(200, { messages: list });
     }
+    // E0c2 —— GET /v1/channels (list) returns all channels with head_seq.
+    if (req.method === "GET" && path === "/v1/channels") {
+      const result = [];
+      for (const [id, msgs] of channels) {
+        result.push({ channel_id: id, head_seq: msgs.length });
+      }
+      return send(200, { channels: result });
+    }
     // E0c2 GT-8 —— 单 channel GET（/v1/channels/<id>）在真机 bus 上不含 head_seq。
 // ⛔ 假 bus 必须照此实现：单 channel GET 不返回 head_seq。
 // head_seq 的唯一可信来源是列表端点 GET /v1/channels。
@@ -76,6 +84,23 @@ if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
       const h = entities.get(id);
       if (!h) return send(404, { code: "NOT_FOUND" });
       return send(200, { head: h });
+    }
+    if (req.method === "POST" && path === "/v1/channels") {
+      let body = "";
+      req.on("data", (d) => (body += d));
+      req.on("end", () => {
+        let p;
+        try {
+          p = JSON.parse(body);
+        } catch {
+          return send(400, { code: "BAD" });
+        }
+        const id = p.channel_id;
+        if (!id) return send(400, { code: "BAD", message: "channel_id required" });
+        if (!channels.has(id)) channels.set(id, []);
+        return send(200, { channel_id: id, created: true });
+      });
+      return;
     }
     if (req.method === "POST" && /^\/v1\/channels\/[^/]+\/publish/.test(path)) {
       let body = "";

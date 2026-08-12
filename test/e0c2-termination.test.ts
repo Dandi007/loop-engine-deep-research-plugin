@@ -4,13 +4,15 @@
  * 覆盖 spec §2 判据 2–7（判别性单测）。
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +23,294 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const READ_TERMINATION = join(ROOT, "scripts", "read-termination.mjs");
 const DRAIN_PARSE_SUMMARY = join(ROOT, "scripts", "drain-parse-summary.mjs");
 const TICK_MD = join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md");
+
+const runningBuses: number[] = [];
+afterEach(() => {
+  for (const pid of runningBuses.splice(0)) {
+    try {
+      process.kill(pid);
+    } catch {
+      /* already gone */
+    }
+  }
+});
+
+function startFakeBus(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const fixture = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+    const child = spawn(process.execPath, [fixture], {
+      env: { ...process.env, A10B_BUS_PORT: String(port) },
+      stdio: "ignore",
+    });
+    runningBuses.push(child.pid as number);
+    const deadline = Date.now() + 5000;
+    const check = () => {
+      fetch(`http://127.0.0.1:${port}/v1/channels/_probe`)
+        .then(() => resolve())
+        .catch(() => {
+          if (Date.now() > deadline) reject(new Error(`fake bus did not come up on ${port}`));
+          else setTimeout(check, 50);
+        });
+    };
+    check();
+  });
+}
+
+function setupRuntimeDir(
+  engineRoot: string,
+  runsRoot: string,
+  drainId: string,
+  terminationState: string | null,
+  coverage?: number,
+  zeroGrowthRounds?: number,
+): string {
+  const runDir = join(runsRoot, `run-${drainId}`, "tick-run");
+  mkdirSync(runDir, { recursive: true });
+  const tickOutput = JSON.stringify({
+    hasPendingWork: false,
+    decisions: [],
+    termination: {
+      state: terminationState,
+      coverage: coverage ?? 0,
+      zeroGrowthRounds: zeroGrowthRounds ?? 0,
+      capHit: false,
+    },
+  });
+  const journalFile = join(runDir, "journal.jsonl");
+  writeFileSync(
+    journalFile,
+    JSON.stringify({
+      run_id: `tick~${drainId}`,
+      identity: "tick",
+      result: tickOutput,
+      effects: [],
+    }) + "\n",
+  );
+  const indexFile = join(engineRoot, "index.jsonl");
+  const existing = existsSync(indexFile) ? readFileSync(indexFile, "utf8") : "";
+  const entry = JSON.stringify({
+    schema: "lei/1",
+    kind: "run.start",
+    run_id: `tick~${drainId}`,
+    label: "tick",
+    fleet: "fleet.yaml",
+    caller: "drain",
+    run_dir: runDir,
+    ts: new Date().toISOString(),
+    pid: 12345,
+    drain_id: drainId,
+    lane: "tick",
+    tick: 1,
+  }) + "\n";
+  writeFileSync(indexFile, existing + entry);
+  return runDir;
+}
+
+function createFakeLoopStub(
+  binDir: string,
+  version: string,
+  attemptFile: string,
+  runsRoot: string,
+): void {
+  // Use a printf-based approach to avoid nested quoting issues
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    "ATTEMPT=1",
+    'if [ -f "${FAKE_LOOP_ATTEMPT_FILE:-}" ]; then',
+    '  ATTEMPT=$(($(cat "${FAKE_LOOP_ATTEMPT_FILE:-}") + 1))',
+    "fi",
+    'echo "$ATTEMPT" > "${FAKE_LOOP_ATTEMPT_FILE:-/dev/null}"',
+    "",
+    'VERSION="${FAKE_LOOP_VERSION:-default}"',
+    "",
+    'case "$VERSION" in',
+  ];
+
+  if (version === "maxrounds-then-converge") {
+    lines.push("  maxrounds-then-converge)");
+    lines.push('    if [ "$ATTEMPT" -eq 1 ]; then');
+    lines.push(`      printf '{"reason":"max_rounds","rounds":16,"ticksByLabel":{"tick":16},"runs_root":"${runsRoot}","drain_id":"fake-drain-maxrounds-1"}\\n'`);
+    lines.push("      exit 1");
+    lines.push("    else");
+    lines.push(`      printf '{"reason":"drained","rounds":2,"ticksByLabel":{"tick":2},"runs_root":"${runsRoot}","drain_id":"fake-drain-converged-2"}\\n'`);
+    lines.push("      exit 0");
+    lines.push("    fi");
+    lines.push("    ;;");
+  } else if (version === "null-then-converge") {
+    lines.push("  null-then-converge)");
+    lines.push(`    printf '{"reason":"drained","rounds":2,"ticksByLabel":{"tick":2},"runs_root":"${runsRoot}","drain_id":"fake-drain-attempt-'"$ATTEMPT"'\\"}\\n'`);
+    lines.push("    exit 0");
+    lines.push("    ;;");
+  } else if (version === "always-null") {
+    lines.push("  always-null)");
+    lines.push(`    printf '{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"${runsRoot}","drain_id":"fake-drain-null-'"$ATTEMPT"'\\"}\\n'`);
+    lines.push("    exit 0");
+    lines.push("    ;;");
+  } else if (version === "other-exit-code") {
+    lines.push("  other-exit-code)");
+    lines.push(`    printf '{"reason":"other","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"${runsRoot}","drain_id":"fake-drain-bad-1"}\\n'`);
+    lines.push("    exit 3");
+    lines.push("    ;;");
+  } else if (version === "unparseable") {
+    lines.push("  unparseable)");
+    lines.push('    printf "not json at all\\n"');
+    lines.push("    exit 1");
+    lines.push("    ;;");
+  }
+
+  lines.push("  *)");
+  lines.push(`    printf '{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"${runsRoot}","drain_id":"fake-drain-default"}\\n'`);
+  lines.push("    exit 0");
+  lines.push("    ;;");
+  lines.push("esac");
+
+  writeFileSync(join(binDir, "deep-research-loop.sh"), lines.join("\n") + "\n");
+  chmodSync(join(binDir, "deep-research-loop.sh"), 0o755);
+}
+
+function setupE0RegressionEnv(
+  version: string,
+  opts: {
+    maxAttempts?: number;
+    wallClockSeconds?: number;
+    backoffSeconds?: number;
+    terminationStates?: Array<{ drainId: string; state: string | null }>;
+  } = {},
+): {
+  dir: string;
+  env: Record<string, string>;
+  busPort: number;
+  prodBusPort: number;
+  busUrl: string;
+  prodBusUrl: string;
+  attemptFile: string;
+  e0regression: string;
+  recordRoot: string;
+  engineRoot: string;
+  runsRoot: string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "e0c2-exec-"));
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+
+  try {
+    symlinkSync(join(ROOT, "bin", "e0-regression.sh"), join(binDir, "e0-regression.sh"));
+  } catch {
+    // Already exists or symlink not supported
+  }
+
+  for (const sub of ["node_modules", "src", "scripts", "package.json", "tsconfig.json"]) {
+    const target = join(dir, sub);
+    if (!existsSync(target)) {
+      try {
+        symlinkSync(join(ROOT, sub), target);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const profilesDir = join(dir, "profiles", "deploy");
+  mkdirSync(profilesDir, { recursive: true });
+  const recordRoot = join(dir, "records");
+  mkdirSync(recordRoot, { recursive: true });
+  const engineRoot = join(dir, "engine-root");
+  mkdirSync(engineRoot, { recursive: true });
+  const runsRoot = join(engineRoot, "runs");
+  mkdirSync(runsRoot, { recursive: true });
+
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const wallClockSeconds = opts.wallClockSeconds ?? 10;
+  const backoffSeconds = opts.backoffSeconds ?? 0;
+
+  const profile = [
+    "RESEARCH_PROFILE_BASE=e0c2-test",
+    "RESEARCH_QUESTION=test research question",
+    "RESEARCH_ORIGIN=test",
+    `EXPORT_ROOT=${join(dir, "export")}`,
+    `ALLOWED_ROOT=${dir}`,
+    "ANCHOR_CHECK_BIN=/bin/true",
+    "SEED_CLUE=test seed clue for e0c2",
+    "SEED_SOURCES=code-local",
+    `DRAIN_BACKOFF_SECONDS=${backoffSeconds}`,
+    `DRAIN_MAX_ATTEMPTS=${maxAttempts}`,
+    `DRAIN_WALL_CLOCK_SECONDS=${wallClockSeconds}`,
+    `LOOP_ENGINE_RUNTIME_ROOT=${engineRoot}`,
+    "",
+  ].join("\n");
+  writeFileSync(join(profilesDir, "test-e0c2.env"), profile);
+
+  const tokenDir = join(dir, "tokens");
+  mkdirSync(tokenDir, { recursive: true });
+  const tokenFile = join(tokenDir, "token");
+  writeFileSync(tokenFile, "test-token\n");
+
+  const attemptFile = join(dir, "fake-attempt.txt");
+  writeFileSync(attemptFile, "0");
+  createFakeLoopStub(binDir, version, attemptFile, runsRoot);
+
+  if (opts.terminationStates) {
+    for (const ts of opts.terminationStates) {
+      setupRuntimeDir(engineRoot, runsRoot, ts.drainId, ts.state);
+    }
+  }
+
+  const busPort = 18000 + Math.floor(Math.random() * 1000);
+  const busUrl = `http://127.0.0.1:${busPort}`;
+  const prodBusPort = 19000 + Math.floor(Math.random() * 1000);
+  const prodBusUrl = `http://127.0.0.1:${prodBusPort}`;
+
+  const env: Record<string, string> = {
+    AGENT_BUS_URL: busUrl,
+    AGENT_BUS_TOKEN_FILE: tokenFile,
+    E0_RECORD_ROOT: recordRoot,
+    E0C1_PROD_BUS_URL: prodBusUrl,
+    E0C1_PROD_BUS_TOKEN_FILE: tokenFile,
+    DD_RUN_ID: `test-e0c2-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    PATH: process.env.PATH ?? "/usr/bin",
+    HOME: process.env.HOME ?? "/root",
+    FAKE_LOOP_ATTEMPT_FILE: attemptFile,
+    FAKE_LOOP_VERSION: version,
+    LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+  };
+
+  return {
+    dir,
+    env,
+    busPort,
+    prodBusPort,
+    busUrl,
+    prodBusUrl,
+    attemptFile,
+    e0regression: join(binDir, "e0-regression.sh"),
+    recordRoot,
+    engineRoot,
+    runsRoot,
+  };
+}
+
+function runE0Regression(
+  e0regression: string,
+  env: Record<string, string>,
+): { code: number; out: string; err: string } {
+  try {
+    const out = execFileSync("bash", [e0regression, "--profile", "test-e0c2"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30000,
+    });
+    return { code: 0, out, err: "" };
+  } catch (e) {
+    const ee = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+    return {
+      code: ee.status ?? -1,
+      out: String(ee.stdout ?? ""),
+      err: String(ee.stderr ?? ""),
+    };
+  }
+}
 
 function runNodeScript(scriptPath: string, input: string, env?: Record<string, string>): { code: number; out: string; err: string } {
   try {
@@ -33,7 +323,7 @@ function runNodeScript(scriptPath: string, input: string, env?: Record<string, s
     });
     return { code: 0, out: out.trim(), err: "" };
   } catch (e) {
-    const ee = e;
+    const ee = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
     return {
       code: ee.status ?? -1,
       out: String(ee.stdout ?? "").trim(),
@@ -348,7 +638,7 @@ describe("判据 7 (GT-5): tick.md continuation runs under zsh -c", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (e) {
-      const ee = e;
+      const ee = e as { status?: number; stderr?: string | Buffer };
       code = ee.status ?? -1;
       err = String(ee.stderr ?? "");
     }
@@ -379,7 +669,7 @@ describe("判据 7 (GT-5): tick.md continuation runs under zsh -c", () => {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (e) {
-      const ee = e;
+      const ee = e as { status?: number; stderr?: string | Buffer };
       code = ee.status ?? -1;
       err = String(ee.stderr ?? "");
     }
@@ -432,18 +722,74 @@ describe("判据 6d (GT-8): single channel GET does not return head_seq", () => 
 
 // ══════════════════════════════════════════════════════════════════════
 // 判据 6b (GT-6): max_rounds + exit 1 不是失败，其他非零退出码是失败
+// ⛔ 这些测试真正执行 bin/e0-regression.sh 本身，假 loop 用可执行桩替身注入。
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 6b (GT-6): max_rounds exit 1 classification", () => {
-  it("e0-regression.sh contains the GT-6 classification logic", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    // Must distinguish max_rounds from other failures
-    expect(script).toMatch(/DRAIN_REASON.*max_rounds/);
-    expect(script).toMatch(/DRAIN_EXIT/);
-    // Must treat max_rounds + exit 1 as not-failure
-    expect(script).toMatch(/max_rounds/);
-    // Must not have "non-zero is failure" catch-all
-    expect(script).not.toMatch(/非零即失败|DRAIN_FAILED.*non-zero/);
+describe("判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regression.sh)", () => {
+  it("max_rounds + exit 1 first drain, then converges ⇒ exit 0, both attempts made", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "maxrounds-then-converge",
+      {
+        terminationStates: [
+          { drainId: "fake-drain-maxrounds-1", state: null },
+          { drainId: "fake-drain-converged-2", state: "converged" },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).toBe(0);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(res.out).toMatch(/drain #1/);
+      expect(res.out).toMatch(/drain #2/);
+      expect(res.out).toMatch(/max_rounds/);
+      expect(res.out).toMatch(/converged/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("other non-zero exit code (e.g. 3) ⇒ immediate failure, non-zero exit, does not retry", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "other-exit-code",
+      {
+        terminationStates: [
+          { drainId: "fake-drain-bad-1", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBe(1);
+      expect(res.err).toMatch(/DRAIN FAILED|FAILED/i);
+      expect(res.err).toMatch(/3/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("unparseable drain output ⇒ immediate failure, non-zero exit, does not retry", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "unparseable",
+      {
+        terminationStates: [],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBe(1);
+      expect(res.err).toMatch(/parse_error|DRAIN FAILED|FAILED/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -453,42 +799,129 @@ describe("判据 6b (GT-6): max_rounds exit 1 classification", () => {
 // ══════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 5/6: 跨 drain 循环（e0-regression.sh 的循环结构检查）
+// 判据 5 (GT-3): 跨 drain 循环直到终态收敛
+// ⛔ 这些测试真正执行 bin/e0-regression.sh 本身，假 loop 用可执行桩替身注入。
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 5/6: e0-regression.sh has cross-drain loop structure", () => {
-  it("contains a while loop with drain attempt tracking", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    expect(script).toMatch(/while true; do/);
-    expect(script).toMatch(/DRAIN_ATTEMPT/);
-    expect(script).toMatch(/DRAIN_MAX_ATTEMPTS/);
-    expect(script).toMatch(/DRAIN_WALL_CLOCK_SECONDS/);
-    expect(script).toMatch(/DRAIN_BACKOFF_SECONDS/);
+describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regression.sh)", () => {
+  it("first drain null, second drain converged ⇒ runs both, exits 0", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "null-then-converge",
+      {
+        terminationStates: [
+          { drainId: "fake-drain-attempt-1", state: null },
+          { drainId: "fake-drain-attempt-2", state: "converged" },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).toBe(0);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(res.out).toMatch(/drain #1/);
+      expect(res.out).toMatch(/drain #2/);
+      expect(res.out).toMatch(/termination\.state=converged/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it("termination.state non-null ⇒ LOOP_EXIT=0, break", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    expect(script).toMatch(/TERMINATION_STATE.*!=.*null/);
-    expect(script).toMatch(/LOOP_EXIT=0/);
-    expect(script).toMatch(/break/);
+  it("discriminant: if the implementation only ran one drain, null termination would NOT exit 0", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "null-then-converge",
+      {
+        terminationStates: [
+          { drainId: "fake-drain-attempt-1", state: null },
+          { drainId: "fake-drain-attempt-2", state: "converged" },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).toBe(0);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBeGreaterThanOrEqual(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 判据 6 (GT-3 上限): 永远 null ⇒ 撞到上限时非零退出，点名撞的是哪个上限
+// ⛔ 这些测试真正执行 bin/e0-regression.sh 本身，假 loop 用可执行桩替身注入。
+// ══════════════════════════════════════════════════════════════════════
+
+describe("判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh)", () => {
+  it("always null ⇒ hits attempt limit, non-zero exit naming the limit", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 30,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      expect(res.err).toMatch(/HIT ATTEMPT LIMIT|HIT WALL CLOCK LIMIT/i);
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it("hits limits ⇒ non-zero exit naming the limit", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    expect(script).toMatch(/HIT WALL CLOCK LIMIT/);
-    expect(script).toMatch(/HIT ATTEMPT LIMIT/);
+  it("always null ⇒ hits wall clock limit, non-zero exit naming the limit", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression, attemptFile } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 10,
+        wallClockSeconds: 0,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      expect(res.err).toMatch(/HIT WALL CLOCK LIMIT/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it("failure branches echo drain stdout and stderr", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    expect(script).toMatch(/drain stdout/);
-    expect(script).toMatch(/drain stderr/);
-  });
-
-  it("progress line contains head_seq, reason, termination.state, attempt number", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    expect(script).toMatch(/head_seq/);
-    expect(script).toMatch(/termination\.state/);
-    expect(script).toMatch(/DRAIN_ATTEMPT/);
-  });
+  it("discriminant: never infinite loops (test completes in finite time)", async () => {
+    const { dir, env, busPort, prodBusPort, e0regression } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 5,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    await Promise.all([startFakeBus(busPort), startFakeBus(prodBusPort)]);
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, { timeout: 15000 });
 });

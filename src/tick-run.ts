@@ -1598,6 +1598,7 @@ export async function runChannelWrite(
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
+    ...(opts.maxClues !== undefined ? { maxClues: opts.maxClues } : {}),
   };
   const decisions = decideTick(state, tickConfig);
   const decideEnd = Date.now();

@@ -385,7 +385,7 @@ describe("Y5: tick 以 exec_failed / status=TIMEOUT 死亡 ⇒ 响亮失败并�
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("Y5 reverse: if exec_failed treated as not-yet-converged, script exits 0", () => {
+  it("Y5 reverse: non-matching pattern (外部调用成功, not 失败) ⇒ script exits 0, no false positive", () => {
     const drainId = "test-drain-y5-reverse";
     const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
       setUpFakeEnv("y5-reverse");
@@ -400,7 +400,7 @@ describe("Y5: tick 以 exec_failed / status=TIMEOUT 死亡 ⇒ 响亮失败并�
     });
     writeJournal(
       join(runDir, "journal.jsonl"),
-      "[外部调用失败 status=TIMEOUT]",
+      "[外部调用成功 status=OK]",
     );
 
     const res = runScript({
@@ -412,12 +412,8 @@ describe("Y5: tick 以 exec_failed / status=TIMEOUT 死亡 ⇒ 响亮失败并�
       RESEARCH_QUESTION: "test research question",
     });
 
-    // The fix makes this non-zero; if the implementation were broken
-    // (only matching [bash 非零退出]), this would be 0 instead.
-    expect(res.code).not.toBe(0);
-    expect(res.err).toContain("TICK FAILURE");
-    expect(res.err).toContain(runDir);
-    expect(res.err).toContain("status=TIMEOUT");
+    expect(res.code).toBe(0);
+    expect(res.err).not.toContain("TICK FAILURE");
 
     rmSync(dir, { recursive: true, force: true });
   });

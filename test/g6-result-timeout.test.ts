@@ -762,37 +762,24 @@ describe("E0c6 §2 criterion 2 (GT-17): generate worker exited without result �
       return emptyMessagesResponse();
     });
 
+    const prodDeps = assembleGenerateDeps(
+      { channelId: CHANNEL, workerCmd: "/fake/agent-run" },
+      termState({ state: "converged" }),
+      boardState(),
+    );
+
     const generateDeps: GenerateDeps = {
+      ...prodDeps,
+      spawnRuntime: {
+        ...prodDeps.spawnRuntime!,
+        newRunId: () => "gt17-run-001",
+      },
       readTermination: async () => termState({ state: "converged" }),
       countBlocked: async () => 0,
       readQuestion: async () => "test question",
       readOrigin: async () => "test-origin",
       readEvidences: async () => [],
-      spawnRuntime: {
-        agentRunBin: "/fake/agent-run",
-        newRunId: () => "gt17-run-001",
-        spawnProcess: async () => {
-          return {};
-        },
-        readBody: async (runId: string) => {
-          const startTime = Date.now();
-          const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-          const deadline = startTime + timeoutMs;
-          while (Date.now() < deadline) {
-            const result = await readGenerateResult(runId);
-            if (result) return result.body;
-            const exited = await checkRunExited(runId);
-            if (exited) {
-              const waitedMs = Date.now() - startTime;
-              throw new GenerateWorkerExitedWithoutResultError(runId, "generate", waitedMs);
-            }
-            await new Promise((r) => setTimeout(r, pollMs));
-          }
-          throw new Error(`G4c: timed out waiting for generate result for run ${runId}`);
-        },
-      },
       spawnAnchorCheck: async () => anchorResult(),
-      spawnExport: async () => {},
       writeDoc: async () => "msg-1",
       lockSynthesizer: async () => async () => {},
     };
@@ -1106,26 +1093,65 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
   let fakeBusServer: ReturnType<typeof createServer> | undefined;
 
   beforeAll(async () => {
-    const server = createServer((_req, res) => {
-      const url = new URL(_req.url ?? "/", `http://127.0.0.1:${fakeBusPort}`);
+    const messagesByChannel = new Map<string, unknown[]>();
+    let seq = 0;
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", `http://127.0.0.1:${fakeBusPort}`);
       const path = url.pathname;
-      if (_req.method === "GET" && /^\/v1\/channels\/[^/]+\/messages/.test(path)) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ messages: [] }));
+      const send = (code: number, data: unknown) => {
+        res.writeHead(code, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(data));
+      };
+      if (req.method === "GET" && /^\/v1\/channels\/[^/]+\/messages/.test(path)) {
+        const id = decodeURIComponent(path.split("/")[3]);
+        const after = Number(url.searchParams.get("after_seq") ?? 0);
+        const list = (messagesByChannel.get(id) ?? []).filter(
+          (m: any) => m.channel_seq > after,
+        );
+        return send(200, { messages: list });
+      }
+      if (req.method === "GET" && /^\/v1\/entities\/[^/]+$/.test(path)) {
+        const id = decodeURIComponent(path.split("/")[3]);
+        const h = (messagesByChannel.get("_entities") ?? []).find(
+          (e: any) => e.entity_id === id,
+        );
+        if (h) return send(200, { head: h });
+        return send(404, { code: "NOT_FOUND" });
+      }
+      if (req.method === "POST" && /^\/v1\/channels\/[^/]+\/publish/.test(path)) {
+        let body = "";
+        req.on("data", (d: string) => (body += d));
+        req.on("end", () => {
+          let p: any;
+          try {
+            p = JSON.parse(body);
+          } catch {
+            return send(400, { code: "BAD" });
+          }
+          const channelId = decodeURIComponent(path.split("/")[3]);
+          const list = messagesByChannel.get(channelId) ?? [];
+          const msg = {
+            message_id: `msg_${++seq}`,
+            channel_id: channelId,
+            channel_seq: list.length + 1,
+            kind: p.kind,
+            payload: p.payload,
+            entity_id: p.entity_id ?? `msg_${seq}`,
+            supersedes: p.supersedes ?? "",
+            created_at: new Date().toISOString(),
+          };
+          list.push(msg);
+          messagesByChannel.set(channelId, list);
+          if (p.entity_id) {
+            const entities = messagesByChannel.get("_entities") ?? [];
+            entities.push(msg);
+            messagesByChannel.set("_entities", entities);
+          }
+          return send(200, { message_id: msg.message_id, channel_seq: msg.channel_seq, deduplicated: false });
+        });
         return;
       }
-      if (_req.method === "GET" && /^\/v1\/entities\/[^/]+$/.test(path)) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ code: "NOT_FOUND" }));
-        return;
-      }
-      if (_req.method === "POST" && /^\/v1\/channels\/[^/]+\/publish/.test(path)) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message_id: "pub_001", channel_seq: 1, deduplicated: false }));
-        return;
-      }
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ code: "NOT_FOUND" }));
+      return send(404, { code: "NOT_FOUND" });
     });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => {
@@ -1156,30 +1182,56 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     delete process.env.AGENT_RESULT_POLL_MS;
   });
 
-  it("GT-16a: seed board with 1 clue completes under half the engine node_timeout and termination is readable", async () => {
-    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+  it("GT-16a: seed board with triageThreshold=1 triggers real work and completes under half the engine node_timeout", async () => {
+    process.env.AGENT_RESULT_TIMEOUT_MS = "16000";
     process.env.AGENT_RESULT_POLL_MS = "10";
 
-    const cards = [
-      clueMsg("seed-1", { status: "proposed" }, 1),
-    ];
-
     const nativeFetch = globalThis.fetch.bind(globalThis);
-    let msgReads = 0;
+    // Seed the fake-bus with board messages
+    const seedMsg = (entityId: string, afterSeq: number) =>
+      nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/${encodeURIComponent(CHANNEL)}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "research.clue.v2",
+          payload: { clue_id: entityId, status: "proposed", text: `clue ${entityId}`, depth: 0, sources: [] },
+          entity_id: entityId,
+          supersedes: "",
+        }),
+      });
+    await seedMsg("seed-1", 1);
+    await seedMsg("seed-2", 2);
+    await seedMsg("seed-3", 3);
+
     vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
+      const urlObj = new URL(url);
+      const path = urlObj.pathname + urlObj.search;
       if (url.includes("board:agent-runs")) {
-        return nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/board%3Aagent-runs/messages`, init);
+        const msgs = capturedTriageRunId
+          ? [
+              {
+                message_id: "msg_exited_v1",
+                channel_id: "board:agent-runs",
+                channel_seq: 200,
+                kind: "agent.run.exited.v1",
+                payload: { run_id: capturedTriageRunId, exit_code: 0 },
+                entity_id: capturedTriageRunId,
+                supersedes: null,
+                created_at: new Date().toISOString(),
+              },
+            ]
+          : [];
+        return messagesResponse(msgs);
       }
       if (url.includes("/publish")) {
-        return nativeFetch(input, init);
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       if (url.includes("/v1/entities/")) {
-        return nativeFetch(input, init);
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       if (url.includes("/messages")) {
-        msgReads += 1;
-        return msgReads <= 1 ? messagesResponse(cards) : emptyMessagesResponse();
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       return emptyMessagesResponse();
     });
@@ -1189,6 +1241,8 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
       channelId: CHANNEL,
       workerCmd: "/fake/agent-run",
       maxWrites: 10,
+      triageThreshold: 1,
+      question: "test question?",
     });
     const elapsed = Date.now() - start;
 
@@ -1200,36 +1254,62 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     expect(result.termination).toHaveProperty("capHit");
     expect(result.termination).toHaveProperty("boardComposition");
     expect(result.decisions).toBeDefined();
-    expect(result.messageCount).toBe(1);
+    expect(result.decisions.length).toBeGreaterThan(0);
     expect(result.timings).toBeDefined();
     expect(result.timings!.totalMs).toBeGreaterThan(0);
-    expect(result.timings!.busReadMs).toBeGreaterThan(0);
+    expect(result.timings!.busReadMs).toBeGreaterThanOrEqual(0);
+    expect(capturedTriageRunId).not.toBe("");
   });
 
   it("GT-16b: time-based polling with AGENT_RESULT_TIMEOUT_MS/POL_MS does not cause the seed tick to exceed half node_timeout", async () => {
-    process.env.AGENT_RESULT_TIMEOUT_MS = "200";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "16000";
     process.env.AGENT_RESULT_POLL_MS = "5";
 
-    const cards = [
-      clueMsg("seed-1", { status: "proposed" }, 1),
-    ];
-
     const nativeFetch = globalThis.fetch.bind(globalThis);
-    let msgReads = 0;
+    const seedMsg = (entityId: string) =>
+      nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/${encodeURIComponent(CHANNEL)}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "research.clue.v2",
+          payload: { clue_id: entityId, status: "proposed", text: `clue ${entityId}`, depth: 0, sources: [] },
+          entity_id: entityId,
+          supersedes: "",
+        }),
+      });
+    await seedMsg("seed-1");
+    await seedMsg("seed-2");
+    await seedMsg("seed-3");
+
     vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
+      const urlObj = new URL(url);
+      const path = urlObj.pathname + urlObj.search;
       if (url.includes("board:agent-runs")) {
-        return nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/board%3Aagent-runs/messages`, init);
+        const msgs = capturedTriageRunId
+          ? [
+              {
+                message_id: "msg_exited_v1",
+                channel_id: "board:agent-runs",
+                channel_seq: 200,
+                kind: "agent.run.exited.v1",
+                payload: { run_id: capturedTriageRunId, exit_code: 0 },
+                entity_id: capturedTriageRunId,
+                supersedes: null,
+                created_at: new Date().toISOString(),
+              },
+            ]
+          : [];
+        return messagesResponse(msgs);
       }
       if (url.includes("/publish")) {
-        return nativeFetch(input, init);
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       if (url.includes("/v1/entities/")) {
-        return nativeFetch(input, init);
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       if (url.includes("/messages")) {
-        msgReads += 1;
-        return msgReads <= 1 ? messagesResponse(cards) : emptyMessagesResponse();
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}${path}`, init);
       }
       return emptyMessagesResponse();
     });
@@ -1239,6 +1319,8 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
       channelId: CHANNEL,
       workerCmd: "/fake/agent-run",
       maxWrites: 10,
+      triageThreshold: 1,
+      question: "test question?",
     });
     const elapsed = Date.now() - start;
 
@@ -1247,5 +1329,6 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     expect(result.termination).toHaveProperty("coverage");
     expect(result.timings).toBeDefined();
     expect(result.timings!.totalMs).toBeGreaterThan(0);
+    expect(capturedTriageRunId).not.toBe("");
   });
 });

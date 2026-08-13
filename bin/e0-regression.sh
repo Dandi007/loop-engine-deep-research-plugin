@@ -379,15 +379,11 @@ _drain_fail_echo() {
 }
 
 while true; do
-  # E0c9 §1.1b —— 墙钟预算为主：先查墙钟。次数是失控兜底，只在墙钟耗尽后作为伴随诊断输出。
-  # 墙钟未耗尽即继续；不得让次数独立于墙钟先撞线。
+  # E0c9 §1.1b —— 墙钟预算为主：先查墙钟。墙钟耗尽即终止。
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
     echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-      echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    fi
     if [ "$DRAIN_ATTEMPT" -gt 0 ]; then
       _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
       if [ -f "$_last_stdout" ]; then
@@ -503,6 +499,14 @@ while true; do
   # 终态非 null ⇒ 成功收尾
   if [ "$TERMINATION_STATE" != "null" ] && [ -n "$TERMINATION_STATE" ]; then
     LOOP_EXIT=0
+    break
+  fi
+
+  # E0c9 §1.1b —— 失控兜底：次数上限是安全网（GT-22），仅在墙钟未耗尽时作为兜底触发。
+  # 使用 -gt（严格大于）使最后一次 drain 有机会在 DRAIN_MAX_ATTEMPTS 次尝试内成功到达终态。
+  if [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    LOOP_EXIT=4
     break
   fi
 

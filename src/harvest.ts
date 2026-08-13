@@ -360,6 +360,12 @@ export interface HarvestReport {
    */
   contentCluesBlocked: number;
   /**
+   * E1 D9——本卡因 maxClues 封顶而被跳过（未调 ingest、未落板）的 content-clue 条数。
+   * 与既有 clue 封顶（`skippedClues`）同构：封顶必须有可观测的报告，不得无声截断。
+   * D2 复用路径不计入此字段（复用是幂等静默，不是封顶）。
+   */
+  skippedContentClues: number;
+  /**
    * E1 E2b §1.3 ⭐ —— 被机械拒发的 evidence 记录（条目级，不连坐整卡）。
    * 每条点名 clue_id、稳定序号、失败的判据；⛔ 不含 quote 全文。
    */
@@ -395,6 +401,7 @@ export async function harvestCard(
       skippedClues: 0,
       contentCluesPublished: 0,
       contentCluesBlocked: 0,
+      skippedContentClues: 0,
       evidenceRejections: [],
       casExplored: false,
     };
@@ -413,11 +420,13 @@ export async function harvestCard(
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，
   //    发布循环里再用运行计数逐条校验（见下）。
   const headroom = Math.max(0, hd.maxClues - hd.boardClueCount.value);
-  const cluesAllowed = Math.min(clueItems.length, headroom);
   // 整卡所需写数：evidence 条数 + 将新增的 clue 条数 + 最终 CAS（§1.7）。
-  // E1 D3——content-clue 也是 clue，计入预算（最坏：每条 material 都落一条 content-clue）。
-  const contentClueBudgetMax = ingestEnabled ? matItems.length : 0;
-  const needed = evItems.length + cluesAllowed + contentClueBudgetMax + 1;
+  // E1 D3/D9——content-clue 也是 clue，与普通 clue 共享同一 boardClueCount/headroom。
+  //   最坏情况下本卡新增的 clue 写数（普通 + content）上界 = min(总待发, headroom)，
+  //   而非「普通 clue 取满 headroom 之外再单独算 content」——两者竞争同一计数器。
+  const pendingClueTotal = clueItems.length + (ingestEnabled ? matItems.length : 0);
+  const clueBudgetMax = Math.min(pendingClueTotal, headroom);
+  const needed = evItems.length + clueBudgetMax + 1;
 
   if (budget.remaining() < needed) {
     // ⛔ A10c §1.2——预算不足 ⇒ 整卡跳过：不发、不 CAS，留 in_flight，响亮报告（§1.7 / H13）。
@@ -436,6 +445,7 @@ export async function harvestCard(
       skippedClues: clueItems.length,
       contentCluesPublished: 0,
       contentCluesBlocked: 0,
+      skippedContentClues: 0,
       evidenceRejections: [],
       casExplored: false,
     };
@@ -446,6 +456,7 @@ export async function harvestCard(
   let skippedClues = clueItems.length;
   let contentCluesPublished = 0;
   let contentCluesBlocked = 0;
+  let skippedContentClues = 0;
   const evidenceRejections: EvidenceRejection[] = [];
   // ⛔ maxClues 运行计数：`boardClueCount` 是**共享可变对象**（runWrite 把同一 `deps.harvest`
   //    传给每张 harvest 卡）。每发一条新 clue 就把 `.value` +1，从而单张卡（或多张卡累计）
@@ -501,10 +512,19 @@ export async function harvestCard(
   // E1 D3——对该卡 worker 结果里的**每条 material** 调 ingest（D3）。
   //   接线（hd.ingestMaterial）且 materials 非空才执行；否则与 base 逐字一致（GT-2）。
   //   ingestMaterial 内部负责 D1（权威 digest）/ D2（复用）/ D4（propose）/ D5（复用不 propose）/
-  //   D6（失败出生即 blocked，父 clue 不连坐）/ D9（maxClues 封顶走同一 boardClueCount）。
+  //   D6（失败出生即 blocked，父 clue 不连坐）。
+  //   ⛔ D9 maxClues 封顶在**此处**判定（与既有 clue 封顶同构、同计数器 boardClueCount）：
+  //   达到 maxClues ⇒ 该 material 不调 ingest、不落板，计入 skippedContentClues（可观测报告），
+  //   绝不无声截断。这与 D2 复用路径（ingestMaterial 返回 null）形态不同：复用是幂等静默、
+  //   不计入 skippedContentClues；封顶是显式跳过、必须报告（spec §2 判据 9）。
   //   落板的 content-clue 计入 boardClueCount（D9：content-clue 也是 clue）与 budget。
   if (ingestEnabled) {
     for (let i = 0; i < matItems.length; i += 1) {
+      // D9：封顶判定在调用 ingest 之前（与上方普通 clue 的 `boardClueCount.value >= maxClues` 同构）。
+      if (boardClueCount.value >= hd.maxClues) {
+        skippedContentClues += matItems.length - i;
+        break;
+      }
       const m = matItems[i];
       const clue = await hd.ingestMaterial!(m, card.clueId, card.depth, `dr-content:${runId}:${i}`);
       if (clue) {
@@ -527,6 +547,7 @@ export async function harvestCard(
     skippedClues,
     contentCluesPublished,
     contentCluesBlocked,
+    skippedContentClues,
     evidenceRejections,
     casExplored: true,
   };

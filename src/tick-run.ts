@@ -54,6 +54,7 @@ import {
   ingestMaterial as ingestMaterialImpl,
   readExistingTranscript,
   fetchMaterialHttp,
+  createMutex,
   type IngestDeps,
 } from "./ingest";
 import { fileParse } from "./mineru";
@@ -1705,6 +1706,13 @@ export async function runChannelWrite(
   const _tDecideStart = Date.now();
   const decisions = decideTick(state, tickConfig);
   _tDecide = Date.now() - _tDecideStart;
+  // E1 D7——本 tick 内所有 material 的 MinerU 调用共享同一个 createMutex（spec §1 D7：
+  //   「N 条 material 同时到达，任一时刻在飞 MinerU 调用 = 1」）。⚠️ 评审 major finding：
+  //   原实现把 serialize 参数省略 ⇒ ingestMaterialImpl 为每条 material 各 new 一个 createMutex，
+  //   in-flight===1 仅靠 harvest for-loop 的顺序 await 成立，starred D7 断言只覆盖 ingestBatch
+  //   （无生产调用者）。这里把单一 mutex 注入生产装配链，使 D7 的串行化真正由 base 的 createMutex
+  //   语义保证（删除它 ⇒ 并发 > 1）。
+  const ingestSerialize = createMutex();
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
@@ -1750,8 +1758,13 @@ export async function runChannelWrite(
       publishClue: (channelId, clue, key) =>
         publishClue(channelId, clue, key).then(() => undefined),
       // E1 D3——对该卡 worker 结果里的每条 material 调 ingest（D1 权威 digest / D2 复用 /
-      //   D4 propose content-clue / D5 复用不 propose / D6 失败出生即 blocked / D9 maxClues 封顶）。
+      //   D4 propose content-clue / D5 复用不 propose / D6 失败出生即 blocked）。
       //   生产装配：用真实 bus（research:content）+ MinerU + 生产 fetchMaterialHttp。
+      //   ⛔ D9 maxClues 封顶由 harvest 在调用本 dep 之前判定（与既有 clue 封顶同构、同 boardClueCount），
+      //      并计入 harvestReport.skippedContentClues（可观测报告）；本装配不再二次封顶，
+      //      使封顶判定有唯一权威源、且删除即变红（spec §2 判据 9）。
+      //   ⛔ D7 串行化：把本 tick 共享的 ingestSerialize 注入 ingestMaterialImpl，
+      //      保证跨 material 的 MinerU 在飞 = 1（base createMutex 语义，非 for-loop 副作用）。
       ingestMaterial: (material, parentClueId, parentDepth, key) => {
         const contentChannel = opts.contentChannelId ?? CONTENT_CHANNEL_ID;
         const ingestDeps: IngestDeps = {
@@ -1766,22 +1779,20 @@ export async function runChannelWrite(
             ),
           fetchMaterial: (uri) => fetchMaterialHttp(uri),
           transcribe: (filename, bytes) => fileParse(filename, bytes),
+          // ⛔ 幂等键命名空间隔离（评审 minor finding）：doc(transcript) 发往 content channel，
+          //    content-clue 发往 board channel，二者 kind/channel 均不同；为避免对「bus 按 channel
+          //    隔离幂等键」的未文档化假设，给两键加可区分后缀（:doc / :clue），使跨 channel 也不碰撞。
           publishDoc: (doc) =>
-            publishDoc(contentChannel, doc, key).then(() => undefined),
-          proposeContentClue: (clue) => {
-            // D9：content-clue 封顶走同一个 boardClueCount（与既有 clue 封顶同构）。
-            const bc = deps.harvest!.boardClueCount;
-            if (bc.value >= maxClues) {
-              return Promise.resolve(null);
-            }
-            return publishClue(opts.channelId, clue, key).then(() => clue);
-          },
+            publishDoc(contentChannel, doc, `${key}:doc`).then(() => undefined),
+          proposeContentClue: (clue) =>
+            publishClue(opts.channelId, clue, `${key}:clue`).then(() => clue),
         };
         return ingestMaterialImpl(
           ingestDeps,
           { uri: material.uri, digest: material.digest ?? "", clueId: parentClueId },
           parentDepth,
-          key,
+          `${key}:clue`,
+          ingestSerialize,
         );
       },
     },

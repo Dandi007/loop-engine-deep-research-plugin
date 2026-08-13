@@ -9,6 +9,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import {
   anchorForEvidence,
   composeAnchor,
@@ -1206,5 +1207,553 @@ describe("E2b §1.3 ⭐ (runWrite): live-URL web evidence not on bus; rejection 
     expect(JSON.stringify(result.harvestReports[0].evidenceRejections)).not.toContain("live quote");
     // 活性：同卡合规 evidence 照常发布，整卡 CAS explored。
     expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+  });
+});
+
+// ── E1 D3/D9（runWrite 生产装配链 harvestCard）：content-clue 封顶可观测 + 判别 ──
+// ⛔ spec §2 判据 9 + 评审 blocker：原实现把封顶埋在生产装配的 proposeContentClue 里，
+//    且 harvest 无法区分「封顶 null」与「D2 复用 null」——两者都被 `if (clue)` 静默丢弃，
+//    删除生产封顶检查整套测试仍绿。本组直接驱动真实的 harvestCard（生产收割逻辑），
+//    断言封顶走 skippedContentClues（与 skippedClues 同构）、ingestMaterial 零调用。
+
+describe("E1 D9 ⭐ (runWrite/harvestCard): content-clue cap is observable + discriminative", () => {
+  it("board at maxClues ⇒ ingestMaterial never called, skippedContentClues === material count, content-clue not published", async () => {
+    const ingest = vi.fn(async () => ({ status: "proposed", sources: ["content"] } as ClueV2));
+    const hd = harvestDeps({
+      boardClueCount: { value: 64 },
+      maxClues: 64,
+      ingestMaterial: ingest,
+    });
+    const deps = writeDeps(hd);
+    const result = await runWrite(deps, [HARVEST_DECISION], 20);
+    expect(ingest).toHaveBeenCalledTimes(0);
+    expect(result.harvestReports[0].skippedContentClues).toBe(1);
+    expect(result.harvestReports[0].contentCluesPublished).toBe(0);
+    // 活性：evidence 照发 + CAS（封顶不阻断收割终态）。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(2);
+    expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+  });
+
+  it("⭐ DISCRIMINATING: board below cap ⇒ ingestMaterial IS called, skippedContentClues === 0 (deleting the cap guard would still pass this; the red signal is the test above)", async () => {
+    // 这一条与上一条成对：封顶存在 ⇒ 上一条 ingest=0、本条 ingest=1；
+    // 若删掉 harvest 的封顶守卫，上一条会变成 ingest=1（红）。本条保证活性（不封顶时正常 ingest）。
+    const ingest = vi.fn(async () => ({ status: "proposed", sources: ["content"] } as ClueV2));
+    const hd = harvestDeps({
+      boardClueCount: { value: 0 },
+      maxClues: 64,
+      ingestMaterial: ingest,
+    });
+    const result = await runWrite(writeDeps(hd), [HARVEST_DECISION], 20);
+    expect(ingest).toHaveBeenCalledTimes(1);
+    expect(result.harvestReports[0].skippedContentClues).toBe(0);
+    expect(result.harvestReports[0].contentCluesPublished).toBe(1);
+  });
+
+  it("D9 vs D2 distinction: D2 reuse returns null but is NOT counted as skippedContentClues (only cap is)", async () => {
+    // D2 复用 ⇒ ingestMaterial 返回 null（幂等静默），不计 skippedContentClues；
+    // 封顶 ⇒ 根本不调 ingestMaterial，计 skippedContentClues。两者形态不同（评审 blocker #2）。
+    const ingest = vi.fn(async () => null);
+    const hd = harvestDeps({
+      boardClueCount: { value: 0 },
+      maxClues: 64,
+      ingestMaterial: ingest,
+    });
+    const result = await runWrite(writeDeps(hd), [HARVEST_DECISION], 20);
+    expect(ingest).toHaveBeenCalledTimes(1);
+    expect(result.harvestReports[0].contentCluesPublished).toBe(0);
+    expect(result.harvestReports[0].skippedContentClues).toBe(0);
+  });
+});
+
+// ── E1 D3/D7（runWrite 生产装配链）：materials:[] 回归 + 串行化经生产 dep ──
+
+describe("E1 D3 ⭐ (runWrite/harvestCard): materials:[] ⇒ ingest zero calls, writes identical to no-ingest base", () => {
+  it("materials:[] ⇒ ingestMaterial called 0 times, writes === baseline (no ingest dep wired)", async () => {
+    const ingest = vi.fn(async () => ({ status: "proposed" } as ClueV2));
+    // 带 ingest dep 但 materials 为空数组。
+    const hdEmpty = harvestDeps({
+      ingestMaterial: ingest,
+      readWorkerResult: vi.fn(async () => ({
+        run_id: "run-1",
+        evidences: [
+          { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+        ],
+        proposed_clues: [{ clue: "i1" }],
+        materials: [],
+      })),
+    });
+    const resultEmpty = await runWrite(writeDeps(hdEmpty), [HARVEST_DECISION], 20);
+    expect(ingest).toHaveBeenCalledTimes(0);
+    expect(resultEmpty.harvestReports[0].contentCluesPublished).toBe(0);
+    expect(resultEmpty.harvestReports[0].skippedContentClues).toBe(0);
+
+    // 基线：不带 ingest dep（与 base GT-2 行为逐字一致）。
+    const hdBase = harvestDeps({
+      readWorkerResult: vi.fn(async () => ({
+        run_id: "run-1",
+        evidences: [
+          { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+        ],
+        proposed_clues: [{ clue: "i1" }],
+        materials: [],
+      })),
+    });
+    const resultBase = await runWrite(writeDeps(hdBase), [HARVEST_DECISION], 20);
+    // ⛔ bus 写入次数逐字一致（materials:[] 不多写一次 bus）。
+    expect(resultEmpty.writes).toBe(resultBase.writes);
+    expect(resultEmpty.writes).toBe(3); // 1 evidence + 1 clue + 1 CAS
+  });
+});
+
+// ── E1 D3/D1/D2/D4/D5/D7/D9（runChannelWrite 全生产装配链）──
+// ⛔ spec §2 判据 10：断言必须打在生产组装出的 deps 上。本组通过 runChannelWrite
+//    驱动真实装配（readExistingTranscript→research:content / transcribe→MinerU fileParse /
+//    publishDoc→content channel / proposeContentClue→board），桩只停在 fetch（网络边界）。
+//    成功路径（fetch → 权威 digest → publishDoc → propose content-clue）首次被真正走通。
+
+describe("E1 production assembly (runChannelWrite): full ingest success path", () => {
+  // 构造一张 in_flight 卡 + exited(0) run + worker.result.v1（含一条 material），
+  // 桩 fetch 同时服务：entities head / 各 channel 的 messages 分页 / publish /
+  // material HTTP 下载（arrayBuffer）/ MinerU /file_parse（CPU 图片路径）。
+  function setupBoard(opts: {
+    materials: Array<{ uri: string; digest?: string }>;
+    materialBytes?: Uint8Array;
+    materialFilename?: string;
+    minerUMd?: string;
+    existingContentDocs?: unknown[];
+    proposedClues?: Array<{ clue: string }>;
+    evidenceItems?: Array<{ quote: string; claim: string; source: string; locator: string; revision: string }>;
+    maxClues?: number;
+  }) {
+    const inFlightMsg = {
+      message_id: "msg_clue_1",
+      channel_id: WIRE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      payload: {
+        status: "in_flight",
+        text: "investigate X",
+        depth: 0,
+        sources: ["code-local"],
+        run_id: "run-1",
+      },
+      entity_id: "card_x",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-1", exit_code: 0 },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_1",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-1",
+          evidences: opts.evidenceItems ?? [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: opts.proposedClues ?? [],
+          materials: opts.materials,
+        },
+        entity_id: "run-1",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    const publishBodies: Array<{
+      channel?: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      idempotency_key?: string;
+    }> = [];
+    let boardCalls = 0;
+    let runsCalls = 0;
+    let contentCalls = 0;
+    const materialBytes = opts.materialBytes ?? new Uint8Array([1, 2, 3, 4, 5]);
+    const materialFilename = opts.materialFilename ?? "a.png";
+    const minerUMd = opts.minerUMd ?? "# transcribed";
+    const existingContentDocs = opts.existingContentDocs ?? [];
+    const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) {
+        return jsonResponse({ head: inFlightMsg });
+      }
+      const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+      if (pm) {
+        const body = JSON.parse(String(init?.body));
+        publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+        return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${WIRE_CHANNEL}/messages`)) {
+        boardCalls += 1;
+        return jsonResponse({ messages: boardCalls === 1 ? [inFlightMsg] : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        runsCalls += 1;
+        return jsonResponse({ messages: runsCalls === 1 ? runsMessages : [] });
+      }
+      if (u.includes("/v1/channels/research:content/messages")) {
+        contentCalls += 1;
+        return jsonResponse({ messages: contentCalls === 1 ? existingContentDocs : [] });
+      }
+      // material HTTP 下载（fetchMaterialHttp）：返回带 arrayBuffer 的响应。
+      if (u.includes("://material.example.com/")) {
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () =>
+            materialBytes.buffer.slice(
+              materialBytes.byteOffset,
+              materialBytes.byteOffset + materialBytes.byteLength,
+            ),
+        };
+      }
+      // MinerU /file_parse（CPU 图片路径）。
+      if (u.includes("/file_parse")) {
+        const form = init?.body as FormData;
+        const fname = form?.get("files") instanceof File
+          ? (form.get("files") as File).name
+          : materialFilename;
+        const key = fname.includes(".") ? fname.slice(0, fname.lastIndexOf(".")) : fname;
+        return jsonResponse({
+          task_id: "t",
+          status: "completed",
+          backend: "pipeline",
+          results: { [key]: { md_content: minerUMd } },
+        });
+      }
+      return jsonResponse({ messages: [] });
+    });
+    return {
+      fetchMock,
+      publishBodies,
+      inFlightMsg,
+      runsMessages,
+      run: () =>
+        runChannelWrite({
+          channelId: WIRE_CHANNEL,
+          evidenceChannelId: "research:p02-smoke-1dce60.evidence",
+          ...(opts.maxClues !== undefined ? { maxClues: opts.maxClues } : {}),
+        }),
+    };
+  }
+
+  it("⭐ D3: one material ⇒ doc(transcript) published on research:content with doc_kind=transcript, origin=source URI", async () => {
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png" }],
+      materialBytes: new Uint8Array([10, 20, 30, 40]),
+      materialFilename: "a.png",
+    });
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    const docPubs = ctx.publishBodies.filter(
+      (b) => b.kind === "research.doc.v2" && b.channel === "research:content",
+    );
+    expect(docPubs).toHaveLength(1);
+    const doc = docPubs[0].payload as Record<string, unknown>;
+    expect(doc.doc_kind).toBe("transcript");
+    expect(doc.origin).toBe("http://material.example.com/a.png");
+    // D1：digest 是对取回字节的 sha256（权威），不是 worker 上报值。
+    const expectedDigest = createHash("sha256")
+      .update(new Uint8Array([10, 20, 30, 40]))
+      .digest("hex");
+    expect(doc.digest).toBe(expectedDigest);
+    expect(outcome.harvestReports[0].contentCluesPublished).toBe(1);
+  });
+
+  it("⭐ D1 DISCRIMINATING (production): worker reports a fake digest ⇒ published doc.digest === sha256(bytes), not the fake value", async () => {
+    const fakeDigest = "f00d".repeat(16);
+    const bytes = new Uint8Array([99, 98, 97]);
+    const expectedDigest = createHash("sha256").update(bytes).digest("hex");
+    expect(fakeDigest).not.toBe(expectedDigest);
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png", digest: fakeDigest }],
+      materialBytes: bytes,
+    });
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    await ctx.run();
+    const docPubs = ctx.publishBodies.filter(
+      (b) => b.kind === "research.doc.v2" && b.channel === "research:content",
+    );
+    expect(docPubs).toHaveLength(1);
+    expect(docPubs[0].payload.digest).toBe(expectedDigest);
+    expect(docPubs[0].payload.digest).not.toBe(fakeDigest);
+  });
+
+  it("⭐⭐ D2 DISCRIMINATING (production): same bytes already on research:content ⇒ MinerU not called, existing doc reused, no new doc publish", async () => {
+    const bytes = new Uint8Array([7, 7, 7]);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const existingDoc = {
+      message_id: "existing_doc",
+      channel_id: "research:content",
+      channel_seq: 1,
+      kind: "research.doc.v2",
+      payload: {
+        doc_kind: "transcript",
+        digest,
+        body: "already-here",
+        origin: "http://material.example.com/a.png",
+      },
+      entity_id: "doc_existing",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    let minerCalls = 0;
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png", digest: "different-worker-hint" }],
+      materialBytes: bytes,
+      existingContentDocs: [existingDoc],
+    });
+    // 包装 fetchMock 以计数 MinerU 调用。
+    const inner = ctx.fetchMock;
+    const countingFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes("/file_parse")) minerCalls += 1;
+      return inner(url, init);
+    });
+    vi.stubGlobal("fetch", countingFetch);
+    await ctx.run();
+    expect(minerCalls).toBe(0);
+    const docPubs = ctx.publishBodies.filter(
+      (b) => b.kind === "research.doc.v2" && b.channel === "research:content",
+    );
+    expect(docPubs).toHaveLength(0);
+  });
+
+  it("⭐ D4 (production): success ⇒ content-clue on board with sources=['content'], parent=card, depth=parent.depth, text has digest+URI", async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png" }],
+      materialBytes: bytes,
+    });
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    const card = outcome.harvestReports[0];
+    // depth = parent depth（卡 depth=0），⛔ 不是 +1。
+    expect(card.clueId).toBe("card_x");
+    const contentClues = ctx.publishBodies.filter(
+      (b) =>
+        b.kind === "research.clue.v2"
+        && b.channel === WIRE_CHANNEL
+        && (b.payload as Record<string, unknown>).status !== "explored"
+        && ((b.payload as Record<string, unknown>).sources as string[]).includes("content"),
+    );
+    expect(contentClues).toHaveLength(1);
+    const clue = contentClues[0].payload as Record<string, unknown>;
+    expect(clue.sources).toEqual(["content"]);
+    expect(clue.parent).toBe("card_x");
+    expect(clue.depth).toBe(0);
+    expect(clue.status).toBe("proposed");
+    expect(clue.text).toContain(digest);
+    expect(clue.text).toContain("http://material.example.com/a.png");
+  });
+
+  it("⭐ D5 (production): second material with same digest ⇒ no second doc, no second content-clue (idempotent)", async () => {
+    // 两条 material 字节相同。第一条：content channel 空 → 发 doc + content-clue。
+    // 桩把第一条发布的 doc 反映回 content channel 的扫描结果，使第二条 readExistingTranscript
+    // 命中复用 → 不发 doc、不发 content-clue（D5 幂等）。
+    const bytes = new Uint8Array([5, 5, 5]);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const publishedDocs: Array<{
+      message_id: string;
+      channel_id: string;
+      channel_seq: number;
+      kind: string;
+      payload: unknown;
+      entity_id: string;
+      supersedes: string | null;
+      created_at: string;
+    }> = [];
+    const ctx = setupBoard({
+      materials: [
+        { uri: "http://material.example.com/a.png" },
+        { uri: "http://material.example.com/a.png" },
+      ],
+      materialBytes: bytes,
+    });
+    const inner = ctx.fetchMock;
+    const reflectingFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      // 把对 content channel 的发布反映到后续 scan。
+      if (/\/v1\/channels\/research:content\/publish/.test(u)) {
+        const body = JSON.parse(String(init?.body));
+        publishedDocs.push({
+          message_id: `ref_${publishedDocs.length}`,
+          channel_id: "research:content",
+          channel_seq: publishedDocs.length + 1,
+          kind: "research.doc.v2",
+          payload: body.payload,
+          entity_id: `ref_${publishedDocs.length}`,
+          supersedes: null,
+          created_at: "2026-01-01T00:00:00Z",
+        });
+      }
+      const resp = await inner(url, init);
+      return resp;
+    });
+    // 再包一层：让 content channel 的 messages scan 返回已发布的 doc（第二次扫到）。
+    const finalFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/v1/channels/research:content/messages")) {
+        const hasAfterSeq = /[?&]after_seq=/.test(u);
+        return jsonResponse({ messages: hasAfterSeq ? [] : [...publishedDocs] });
+      }
+      return reflectingFetch(url, init);
+    });
+    vi.stubGlobal("fetch", finalFetch);
+    await ctx.run();
+    const docPubs = ctx.publishBodies.filter(
+      (b) => b.kind === "research.doc.v2" && b.channel === "research:content",
+    );
+    expect(docPubs).toHaveLength(1);
+    expect(docPubs[0].payload.digest).toBe(digest);
+    const contentClues = ctx.publishBodies.filter(
+      (b) =>
+        b.kind === "research.clue.v2"
+        && b.channel === WIRE_CHANNEL
+        && (b.payload as Record<string, unknown>).status !== "explored"
+        && ((b.payload as Record<string, unknown>).sources as string[]).includes("content"),
+    );
+    expect(contentClues).toHaveLength(1);
+  });
+
+  it("⭐ D9 (production assembly): board at maxClues ⇒ content-clue not published, skippedContentClues > 0, ingest skipped", async () => {
+    // maxClues=1，卡带 1 条 proposed_clue + 1 条 material。普通 clue 先发（board=1=cap），
+    // 随后 material 因封顶被跳过：不发 doc、不发 content-clue，skippedContentClues=1。
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png" }],
+      proposedClues: [{ clue: "takes-the-only-slot" }],
+      maxClues: 1,
+    });
+    let minerCalls = 0;
+    const inner = ctx.fetchMock;
+    const countingFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes("/file_parse")) minerCalls += 1;
+      return inner(url, init);
+    });
+    vi.stubGlobal("fetch", countingFetch);
+    const outcome = await ctx.run();
+    expect(minerCalls).toBe(0);
+    const report = outcome.harvestReports[0];
+    expect(report.skippedContentClues).toBe(1);
+    expect(report.contentCluesPublished).toBe(0);
+    const contentClues = ctx.publishBodies.filter(
+      (b) =>
+        (b.payload as Record<string, unknown>).sources
+        && ((b.payload as Record<string, unknown>).sources as string[]).includes("content"),
+    );
+    expect(contentClues).toHaveLength(0);
+    // 活性：普通 clue 占了唯一的 cap 槽，CAS 仍发生（板上出现 explored 状态的 card_x）。
+    const exploredPubs2 = ctx.publishBodies.filter(
+      (b) => (b.payload as Record<string, unknown>).status === "explored",
+    );
+    expect(exploredPubs2.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("⭐ D7 (production assembly): N materials through the shipped dep keep MinerU in-flight <= 1 (shared mutex + sequential harvest)", async () => {
+    // 生产装配链把本 tick 共享的 createMutex 注入 ingestMaterialImpl（评审 major #6）。
+    // harvest 的 for-loop 顺序 await + 共享 mutex 双重保证 in-flight=1。三条 material 字节
+    // 各异（dedup 全不命中）⇒ 三条都打 MinerU；用计数器观测峰值并发 <= 1。
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let minerCalls = 0;
+    const ctx = setupBoard({
+      materials: [
+        { uri: "http://material.example.com/a.png" },
+        { uri: "http://material.example.com/b.png" },
+        { uri: "http://material.example.com/c.png" },
+      ],
+      materialBytes: new Uint8Array([1]),
+      materialFilename: "x.png",
+    });
+    const inner = ctx.fetchMock;
+    const concurrencyFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("://material.example.com/")) {
+        // 按 URI 末段派生不同字节，保证 digest 各异、dedup 全不命中。
+        const seg = u.split("/").pop() ?? "x";
+        const code = seg.charCodeAt(0);
+        const buf = new Uint8Array([code, code + 1, code + 2]);
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () =>
+            buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+        };
+      }
+      if (u.includes("/file_parse")) {
+        minerCalls += 1;
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          // 让 MinerU 调用异步地 yield 一次，给并发可观测窗口。
+          await new Promise((r) => setTimeout(r, 5));
+          return jsonResponse({
+            status: "completed",
+            results: { x: { md_content: "md" } },
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      }
+      return inner(url, init);
+    });
+    vi.stubGlobal("fetch", concurrencyFetch);
+    await ctx.run();
+    expect(minerCalls).toBe(3);
+    expect(maxInFlight).toBeLessThanOrEqual(1);
+  });
+
+  it("⭐ D6 (production assembly): MinerU fails ⇒ content-clue born blocked on board, parent still explored, evidence still published", async () => {
+    const ctx = setupBoard({
+      materials: [{ uri: "http://material.example.com/a.png" }],
+      evidenceItems: [
+        { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+      ],
+    });
+    const inner = ctx.fetchMock;
+    const failingFetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/file_parse")) {
+        return jsonResponse({ status: "failed", error: "cannot identify image file" });
+      }
+      return inner(url, init);
+    });
+    vi.stubGlobal("fetch", failingFetch);
+    const outcome = await ctx.run();
+    const report = outcome.harvestReports[0];
+    // (a) content-clue 出生即 blocked。
+    expect(report.contentCluesPublished).toBe(1);
+    expect(report.contentCluesBlocked).toBe(1);
+    const contentClues = ctx.publishBodies.filter(
+      (b) =>
+        b.kind === "research.clue.v2"
+        && ((b.payload as Record<string, unknown>).sources as string[] | undefined)?.includes(
+          "content",
+        ),
+    );
+    expect(contentClues).toHaveLength(1);
+    expect((contentClues[0].payload as Record<string, unknown>).status).toBe("blocked");
+    expect(
+      String((contentClues[0].payload as Record<string, unknown>).rationale),
+    ).toContain("status=failed");
+    // (b) 父 clue 仍 explored（板上出现 explored 状态的 card_x）。
+    const exploredPubs3 = ctx.publishBodies.filter(
+      (b) => (b.payload as Record<string, unknown>).status === "explored",
+    );
+    expect(exploredPubs3.length).toBeGreaterThanOrEqual(1);
+    // (c) evidence 照常发布。
+    const evidencePubs = ctx.publishBodies.filter((b) => b.kind === "research.evidence.v2");
+    expect(evidencePubs).toHaveLength(1);
   });
 });

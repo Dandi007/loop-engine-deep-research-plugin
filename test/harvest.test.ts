@@ -13,12 +13,15 @@ import { createHash } from "node:crypto";
 import {
   anchorForEvidence,
   anchorAuthorityMismatch,
+  cardAnchorPolicy,
   composeAnchor,
   contentAnchorAuthority,
+  isContentCard,
   evidenceFromWorker,
   clueFromWorker,
   harvestCard,
   normalizeAnchorRange,
+  CONTENT_AUTHORITY_MISSING_REASON,
   MissingEvidenceChannelError,
   OVER_MAX_DEPTH_RATIONALE,
   WorkerResultShapeError,
@@ -151,8 +154,10 @@ describe("E1c D1 ⭐⭐: content anchor comes from the dispatcher-side clue meta
   it("⭐⭐ D1 discriminating: GT-1b verbatim reports A and B ⇒ THE SAME authoritative anchor", () => {
     const authority = contentAnchorAuthority(CONTENT_CARD)!;
     expect(authority).toEqual({ uri: AUTH_URI, digest: AUTH_DIGEST });
-    const anchorA = anchorForEvidence(WORKER_REPORT_A, authority);
-    const anchorB = anchorForEvidence(WORKER_REPORT_B, authority);
+    // E1d D1：路由信号由卡算出（cardAnchorPolicy），⛔ 不再来自 worker 的任何字段。
+    const policy = cardAnchorPolicy(CONTENT_CARD);
+    const anchorA = anchorForEvidence(WORKER_REPORT_A, policy);
+    const anchorB = anchorForEvidence(WORKER_REPORT_B, policy);
     // 判据 2：两条逐字真实回报必须产出同一个锚点。
     expect(anchorA).toBe(EXPECTED_ANCHOR);
     expect(anchorB).toBe(EXPECTED_ANCHOR);
@@ -167,8 +172,7 @@ describe("E1c D1 ⭐⭐: content anchor comes from the dispatcher-side clue meta
   });
 
   it("⭐⭐ D1 discriminating: report C (bare URI, range L3:1-43) ⇒ authoritative uri@digest, range kept verbatim", () => {
-    const authority = contentAnchorAuthority(CONTENT_CARD)!;
-    const anchor = anchorForEvidence(WORKER_REPORT_C, authority);
+    const anchor = anchorForEvidence(WORKER_REPORT_C, cardAnchorPolicy(CONTENT_CARD));
     // 判据 2 输入 C：anchor 结尾为 #L3:1-43（range 原样保留，只归一 L 前缀）。
     expect(anchor).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}#L3:1-43`);
     expect(anchor.endsWith("#L3:1-43")).toBe(true);
@@ -181,12 +185,13 @@ describe("E1c D1 ⭐⭐: content anchor comes from the dispatcher-side clue meta
     expect(() => anchorForEvidence(WORKER_REPORT_A, null)).toThrow(/authority/i);
   });
 
-  it("⭐ D1: the gate is pinned on `source`, NOT on the worker's locator prefix", () => {
+  it("⭐ D1: the gate is pinned on the CARD, NOT on the worker's locator prefix", () => {
     // 三条回报的 locator 前缀三种形态（web:// / 无 scheme 的文件名 / 裸 URI），
-    // 但 source 都是 content ⇒ 三条都走权威路径。若闸门钉在 locator 前缀上，B/C 必然漏。
-    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    // 但卡是同一张 content 卡 ⇒ 三条都走权威路径。若闸门钉在 locator 前缀上，B/C 必然漏。
+    // E1d：连 source 字段也不再参与判定（见 E1d D1 的四形态判别性）。
+    const policy = cardAnchorPolicy(CONTENT_CARD);
     const anchors = [WORKER_REPORT_A, WORKER_REPORT_B, WORKER_REPORT_C].map((r) =>
-      anchorForEvidence(r, authority),
+      anchorForEvidence(r, policy),
     );
     for (const a of anchors) {
       expect(a.startsWith(`web://${AUTH_URI}@${AUTH_DIGEST}#`)).toBe(true);
@@ -224,9 +229,9 @@ describe("E1c D1 ⭐⭐: content anchor comes from the dispatcher-side clue meta
 
 describe("E1c D2b ⭐: range shape is normalized (worker returns 'L9' or '9')", () => {
   it("⭐ D2b discriminating: range '9' and 'L9' ⇒ both anchors end with #L9", () => {
-    const authority = contentAnchorAuthority(CONTENT_CARD)!;
-    const withL = anchorForEvidence({ ...WORKER_REPORT_A, range: "L9" }, authority);
-    const withoutL = anchorForEvidence({ ...WORKER_REPORT_A, range: "9" }, authority);
+    const policy = cardAnchorPolicy(CONTENT_CARD);
+    const withL = anchorForEvidence({ ...WORKER_REPORT_A, range: "L9" }, policy);
+    const withoutL = anchorForEvidence({ ...WORKER_REPORT_A, range: "9" }, policy);
     expect(withL.endsWith("#L9")).toBe(true);
     expect(withoutL.endsWith("#L9")).toBe(true);
     expect(withoutL).toBe(withL);
@@ -246,8 +251,10 @@ describe("E1c D2b ⭐: range shape is normalized (worker returns 'L9' or '9')", 
   });
 
   it("D2b: range absent ⇒ content anchor has no # segment (H4 regression)", () => {
-    const authority = contentAnchorAuthority(CONTENT_CARD)!;
-    const a = anchorForEvidence({ ...WORKER_REPORT_A, range: undefined }, authority);
+    const a = anchorForEvidence(
+      { ...WORKER_REPORT_A, range: undefined },
+      cardAnchorPolicy(CONTENT_CARD),
+    );
     expect(a).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}`);
     expect(a).not.toContain("#");
   });
@@ -2294,5 +2301,502 @@ describe("E1c D1/D4 ⭐⭐ (production assembly): the anchor that actually lands
     const outcome = await ctx.run();
     expect(ctx.evidenceAnchors()).toEqual([EXPECTED_ANCHOR]);
     expect(outcome.harvestReports[0].anchorMismatches).toHaveLength(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// E1d ⭐⭐⭐ —— content 锚点的**触发信号取自卡自身**，不取 worker 回传的任何字段
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// §0 GT-1：同一个 role、同类输入，派发方四次真机取证，worker 吐出了**四种互不相同**的
+// 字段布局。前三次 `source="content"`（E1c 的闸门命中），第四次整个 URI 跑进了 `source`、
+// 行号跑进了 `locator`（E1c 的闸门**不命中**）⇒ 10 条证据全部落回通用模板，被拼成
+// `web://http://127.0.0.1:50287/e1-material4.png://L3@b9eba894…#L3` 发上了无 DELETE 的
+// append-only 证据 channel（GT-2 逐字）。
+//
+// GT-3：本线第三次修这同一处闸门（E1b 钉 locator 前缀 → 被绕过；E1c 钉 source 字段 →
+// 被绕过）。⇒ **判定改为取自卡侧事实**（clue 的 sources / 该卡的 authority），
+// worker 只提供 quote 与 range。⛔ 再钉在任何 worker 可控字段上都会被第五种形态绕过。
+
+/** 判据 2 逐字：该 content 卡的**调度器侧权威值**（uri + 完整 64 位 digest）。 */
+const E1D_URI = "http://127.0.0.1:50287/e1-material4.png";
+const E1D_DIGEST = "b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d";
+/** 判据 2 的期望 anchor 前缀：四条真实回报**全部**必须产出它（只有 `#range` 段不同）。 */
+const E1D_AUTHORITATIVE = `web://${E1D_URI}@${E1D_DIGEST}`;
+/** 该 content 卡（调度器侧：sources=["content"]、text 由 contentClueText 产出）。 */
+const E1D_CARD = {
+  clueId: "card_content4",
+  text: `web://${E1D_URI}@${E1D_DIGEST}`,
+  depth: 0,
+  sources: ["content"],
+};
+
+/**
+ * GT-1 第三次真跑的 revision：spec §0 逐字记作 `9bee527f…（完整 64 位）`——派发方原文
+ * 省略了尾部。这里保留其逐字可见的前缀 `9bee527f` 并补足到 64 位。
+ * ⚠️ 本条的判别性只依赖「一个完整 64 位、且与本卡权威 digest 不同的 revision」；
+ *    anchor 里根本不取 worker 的 revision，被省略的那几位对判据 2 无任何影响。
+ */
+const GT1_RUN3_REVISION = `9bee527f${"0".repeat(56)}`;
+
+/**
+ * §0 GT-1 的**四种**逐字字段布局（⛔ 不得改造它们去迁就实现）。
+ * `expectedRangeSuffix` = 该条按 D4 归一后 anchor 的结尾（判据 2 括注）。
+ */
+const GT1_LAYOUTS = [
+  {
+    label: "run#1 (board:agent-runs seq 733): source=content, worker-prefixed web:// locator, full digest, range L9",
+    report: {
+      quote: "H1 工程基建组围绕…",
+      claim: "H1 工程基建组以…为北极星方向。",
+      source: "content",
+      locator: "web://http://127.0.0.1:50287/e1-material.png",
+      revision: "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b",
+      range: "L9",
+    },
+    expectedRangeSuffix: "#L9",
+  },
+  {
+    label: "run#2 (seq 751): source=content, spool filename locator, digest TRUNCATED to 16, range '9' (no L)",
+    report: {
+      quote: "H1 工程基建组围绕…",
+      claim: "H1 工程基建组以…为北极星方向。",
+      source: "content",
+      locator: "63ac13abaabf5726.md",
+      revision: "63ac13abaabf5726",
+      range: "9",
+    },
+    expectedRangeSuffix: "#L9",
+  },
+  {
+    label: "run#3 (E1b Z2, 16 evidences): source=content, bare URI locator, full digest, range L3:1-43",
+    report: {
+      quote: "H1 工程基建组围绕…",
+      claim: "H1 工程基建组以…为北极星方向。",
+      source: "content",
+      locator: "http://127.0.0.1:50287/e1-material2.png",
+      revision: GT1_RUN3_REVISION,
+      range: "L3:1-43",
+    },
+    expectedRangeSuffix: "#L3:1-43",
+  },
+  {
+    label: "run#4 (E1c Z2, 10 evidences, run 27dd238b): ⭐ the WHOLE URI ran into `source`, the line number into `locator`",
+    report: {
+      quote: "H1 工程基建组围绕…",
+      claim: "H1 工程基建组以…为北极星方向。",
+      source: "web://http://127.0.0.1:50287/e1-material4.png",
+      locator: "L3",
+      revision: "b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d",
+      range: "L3",
+    },
+    expectedRangeSuffix: "#L3",
+  },
+];
+
+/** 四条逐字回报（按 GT-1 的次序）。 */
+const GT1_REPORTS = GT1_LAYOUTS.map((l) => l.report);
+
+/**
+ * 驱动**生产收割函数** `harvestCard`，返回 `publishEvidence` 实际收到的 evidence。
+ * ⛔ spec §2 判据 6：不得绕过装配链直接给 `anchorForEvidence` 传参。
+ */
+async function harvestE1d(
+  card: { clueId: string; text: string; depth: number; sources: string[] },
+  evidences: Array<Record<string, unknown>>,
+) {
+  const captured: EvidenceV2[] = [];
+  const hd = harvestDeps({
+    publishEvidence: vi.fn(async (_channel, evidence) => {
+      captured.push(evidence);
+    }),
+    readWorkerResult: vi.fn(async () =>
+      validWorkerResult({
+        run_id: "run-e1d",
+        evidences,
+        proposed_clues: [],
+        materials: [],
+      }),
+    ),
+  });
+  const report = await harvestCard(hd, card, "run-e1d", makeBudget(evidences.length + 2));
+  return { captured, report };
+}
+
+describe("E1d D1 ⭐⭐⭐ (harvestCard): the content-anchor trigger is a CARD-side fact, never a worker field", () => {
+  it("⭐⭐⭐ 判据 2 discriminating: all FOUR verbatim worker field layouts ⇒ the SAME authoritative uri@digest", async () => {
+    const { captured, report } = await harvestE1d(E1D_CARD, GT1_REPORTS);
+    // 四条都发布了（⛔ 第四种形态不得因 source 不是 "content" 而走上通用模板）。
+    expect(captured).toHaveLength(4);
+    // 判据 2：四条逐字回报，按各自的 range 归一，其余段**完全相同**。
+    captured.forEach((ev, i) => {
+      expect(ev.anchor).toBe(`${E1D_AUTHORITATIVE}${GT1_LAYOUTS[i].expectedRangeSuffix}`);
+      expect(ev.clue_id).toBe("card_content4");
+    });
+    // uri 与 digest 段四条完全相同（把 `#range` 段切掉后只剩一个值）。
+    expect(new Set(captured.map((e) => e.anchor.split("#")[0])).size).toBe(1);
+    // ⭐ 第四条（GT-1 第四次真跑）逐字：判据 2 点名的那个值。
+    expect(captured[3].anchor).toBe(
+      "web://http://127.0.0.1:50287/e1-material4.png@b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d#L3",
+    );
+    // ⛔ 判据 2 的方向钉反标志：`.png://` / `content://` / `.md` / 16 位截断 digest。
+    for (const ev of captured) {
+      expect(ev.anchor).not.toContain(".png://");
+      expect(ev.anchor).not.toContain("content://");
+      expect(ev.anchor).not.toContain(".md");
+      expect(ev.anchor).not.toContain("@63ac13abaabf5726#");
+      expect(ev.anchor).not.toContain(GT1_RUN3_REVISION);
+      expect(ev.anchor.startsWith(E1D_AUTHORITATIVE)).toBe(true);
+    }
+    // 活性：四条照常发布、零拒发、整卡照常 CAS explored。
+    expect(report.evidencePublished).toBe(4);
+    expect(report.evidenceRejections).toHaveLength(0);
+    expect(report.casExplored).toBe(true);
+  });
+
+  it("⭐⭐⭐ 判据 2 discriminating (counterfactual): an `item.source` gate MISSES the 4th layout and rebuilds GT-2's malformed anchor", () => {
+    const fourth = GT1_LAYOUTS[3].report;
+    // 逐字取证：第四次真跑里 source 是整个 URI、locator 是行号。
+    expect(fourth.source).toBe("web://http://127.0.0.1:50287/e1-material4.png");
+    expect(fourth.source.trim()).not.toBe("content");
+    expect(fourth.locator).toBe("L3");
+    // 卡侧闸门命中（判定只看卡）⇒ 权威锚点。
+    expect(isContentCard(E1D_CARD)).toBe(true);
+    expect(cardAnchorPolicy(E1D_CARD).isContent).toBe(true);
+    expect(anchorForEvidence(fourth, cardAnchorPolicy(E1D_CARD))).toBe(`${E1D_AUTHORITATIVE}#L3`);
+    // ⛔ 反事实：把触发信号改回读 item.source ⇒ 这条落回通用模板，拼出的正是 GT-2 里
+    //    真机上那 10 条证据的**逐字**畸形形态（URI 段被污染成 `…e1-material4.png://L3`）。
+    const ifGatedOnWorkerSource = composeAnchor(
+      fourth.source,
+      fourth.locator,
+      fourth.revision,
+      fourth.range,
+    );
+    expect(ifGatedOnWorkerSource).toBe(
+      "web://http://127.0.0.1:50287/e1-material4.png://L3@b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d#L3",
+    );
+    expect(ifGatedOnWorkerSource).toContain(".png://");
+    // ⇒ 两者必须不同：相同就说明闸门又钉回了 worker 字段。
+    expect(anchorForEvidence(fourth, cardAnchorPolicy(E1D_CARD))).not.toBe(ifGatedOnWorkerSource);
+  });
+
+  it("⭐⭐ D1: on a content card EVERY evidence takes the authoritative path, whatever the worker calls `source`", async () => {
+    // 卡是 content 卡 ⇒ 一律走 contentAnchor：worker 自称 code / web / 空 都不改变路由。
+    const disguised = [
+      { quote: "q", claim: "c", source: "code", locator: "src/x.ts", revision: "abc123", range: "L5" },
+      { quote: "q", claim: "c", source: "web", locator: "http://live.example.com/p", revision: "", range: "7" },
+      { quote: "q", claim: "c", range: "L3" },
+    ];
+    const { captured, report } = await harvestE1d(E1D_CARD, disguised);
+    expect(captured.map((e) => e.anchor)).toEqual([
+      `${E1D_AUTHORITATIVE}#L5`,
+      `${E1D_AUTHORITATIVE}#L7`,
+      `${E1D_AUTHORITATIVE}#L3`,
+    ]);
+    expect(report.evidencePublished).toBe(3);
+    // ⛔ worker 现编的 locator/revision 一个字都不得进 anchor。
+    for (const ev of captured) {
+      expect(ev.anchor).not.toContain("src/x.ts");
+      expect(ev.anchor).not.toContain("abc123");
+      expect(ev.anchor).not.toContain("live.example.com");
+    }
+  });
+
+  it("⭐ D4: the 4th layout's range 'L3' already carries the L prefix ⇒ kept verbatim (no LL3, no #3)", async () => {
+    const { captured } = await harvestE1d(E1D_CARD, [GT1_LAYOUTS[3].report]);
+    expect(captured[0].anchor.endsWith("#L3")).toBe(true);
+    expect(captured[0].anchor).not.toContain("#LL3");
+    expect(captured[0].anchor).not.toContain("#l3");
+    // 配对（活性）：不带 L 前缀的 "3" 归一到同一个 #L3。
+    const bare = await harvestE1d(E1D_CARD, [{ ...GT1_LAYOUTS[3].report, range: "3" }]);
+    expect(bare.captured[0].anchor).toBe(captured[0].anchor);
+  });
+});
+
+describe("E1d D2 ⭐ (harvestCard): the worker/authority mismatch now covers the `source` dimension too", () => {
+  it("⭐ 判据 3 discriminating: the 4th layout ⇒ published with the authoritative anchor AND a mismatch record", async () => {
+    const { captured, report } = await harvestE1d(E1D_CARD, [GT1_LAYOUTS[3].report]);
+    // (a) 证据**照常发布**，anchor 是权威形态（⛔ 不因不一致拒发）。
+    expect(report.evidencePublished).toBe(1);
+    expect(report.evidenceRejections).toHaveLength(0);
+    expect(captured[0].anchor).toBe(`${E1D_AUTHORITATIVE}#L3`);
+    // (b) 同时留下一条可观测的不一致记录，含 clue_id 与两侧的值。
+    expect(report.anchorMismatches).toHaveLength(1);
+    const m = report.anchorMismatches[0];
+    expect(m.clueId).toBe("card_content4");
+    expect(m.index).toBe(0);
+    // ⭐ 新的 source 维度命中（整个 URI 跑进了 source），locator 维度同时命中（行号跑进了 locator）。
+    expect([...m.fields].sort()).toEqual(["locator", "source"]);
+    expect(m.workerSource).toBe("web://http://127.0.0.1:50287/e1-material4.png");
+    expect(m.authoritativeSource).toBe("content");
+    expect(m.workerLocator).toBe("L3");
+    expect(m.authoritativeUri).toBe(E1D_URI);
+    // revision 这一次与权威值相同（clue text 里带着它、worker 照抄了一份——巧合，不是保证）。
+    expect(m.workerRevision).toBe(E1D_DIGEST);
+    expect(m.authoritativeDigest).toBe(E1D_DIGEST);
+    // ⛔ 记录里不得回抄 quote 全文。
+    expect(JSON.stringify(report.anchorMismatches)).not.toContain(GT1_LAYOUTS[3].report.quote);
+  });
+
+  it("⭐ 判据 3 discriminating (pair): all three fields agreeing with the authority ⇒ NO mismatch record", async () => {
+    const consistent = {
+      quote: "q",
+      claim: "c",
+      source: "content",
+      locator: E1D_URI,
+      revision: E1D_DIGEST,
+      range: "L3",
+    };
+    const { captured, report } = await harvestE1d(E1D_CARD, [consistent]);
+    expect(report.anchorMismatches).toHaveLength(0);
+    // 活性：照常发布（不因"无不一致"而漏发）。
+    expect(report.evidencePublished).toBe(1);
+    expect(captured[0].anchor).toBe(`${E1D_AUTHORITATIVE}#L3`);
+  });
+
+  it("⭐ D2: the source dimension alone is enough to raise a record (locator/revision both authoritative)", async () => {
+    const onlySourceDrifted = {
+      quote: "q",
+      claim: "c",
+      source: "web://http://127.0.0.1:50287/e1-material4.png",
+      locator: E1D_URI,
+      revision: E1D_DIGEST,
+      range: "L3",
+    };
+    const { report } = await harvestE1d(E1D_CARD, [onlySourceDrifted]);
+    // ⛔ 删掉 source 维度 ⇒ 本条变红（E1c 只核对 locator/revision，这两个字段这里全对）。
+    expect(report.anchorMismatches).toHaveLength(1);
+    expect(report.anchorMismatches[0].fields).toEqual(["source"]);
+    expect(report.anchorMismatches[0].workerSource).toBe(onlySourceDrifted.source);
+    expect(report.evidencePublished).toBe(1);
+  });
+});
+
+describe("E1d D3 ⭐ (harvestCard): a content card WITHOUT authority fails loudly — never a worker-field fallback", () => {
+  /** content 卡（sources 含 content）但 text 不是 `web://<uri>@<digest>` 形态 ⇒ 无权威值。 */
+  const NO_AUTHORITY_CARD = {
+    clueId: "card_content_noauth",
+    text: "investigate the content material",
+    depth: 0,
+    sources: ["content"],
+  };
+
+  it("⭐ 判据 4 discriminating: no authority ⇒ item-level loud rejection, ZERO evidence published", async () => {
+    const { captured, report } = await harvestE1d(NO_AUTHORITY_CARD, GT1_REPORTS);
+    // ⛔ 一条都不得发布：没有权威 uri@digest 就拼不出可核验的锚点。
+    expect(captured).toHaveLength(0);
+    expect(report.evidencePublished).toBe(0);
+    // 响亮：四条都留下点名 clue_id 与判据的拒发记录（⛔ 不静默丢弃）。
+    expect(report.evidenceRejections).toHaveLength(4);
+    for (const r of report.evidenceRejections) {
+      expect(r.clueId).toBe("card_content_noauth");
+      expect(r.reason).toBe(CONTENT_AUTHORITY_MISSING_REASON);
+    }
+    // ⛔ 记录里不得回抄 quote 全文。
+    expect(JSON.stringify(report.evidenceRejections)).not.toContain(GT1_REPORTS[0].quote);
+    // 条目级：整卡仍 CAS explored（失败粒度下沉，不连坐）。
+    expect(report.casExplored).toBe(true);
+  });
+
+  it("⭐ 判据 4 discriminating: the anchor builder itself refuses (no `<worker source>://<worker locator>@…` fallback)", () => {
+    const policy = cardAnchorPolicy(NO_AUTHORITY_CARD);
+    expect(policy.isContent).toBe(true);
+    expect(policy.authority).toBeNull();
+    // 改成用 worker 字段兜底 ⇒ 本条变红。
+    for (const report of GT1_REPORTS) {
+      expect(() => anchorForEvidence(report, policy)).toThrow(/authority/i);
+    }
+  });
+});
+
+describe("E1d ⭐ regression (判据 5, harvestCard): a code card's anchor is unchanged verbatim", () => {
+  it("source=code on a non-content card ⇒ code://src/dispatch.ts@efebe27#L1287", async () => {
+    const codeCard = {
+      clueId: "card_code",
+      text: "investigate the dispatch path",
+      depth: 0,
+      sources: ["code-local"],
+    };
+    const { captured, report } = await harvestE1d(codeCard, [
+      {
+        quote: "q",
+        claim: "c",
+        source: "code",
+        locator: "src/dispatch.ts",
+        revision: "efebe27",
+        range: "L1287",
+      },
+    ]);
+    // 逐字不变（判据 5）。
+    expect(captured[0].anchor).toBe("code://src/dispatch.ts@efebe27#L1287");
+    expect(report.evidencePublished).toBe(1);
+    expect(report.anchorMismatches).toHaveLength(0);
+  });
+
+  it("safety (unchanged from E1c): a NON-content card whose worker claims source=content ⇒ item-level rejection", async () => {
+    const codeCard = {
+      clueId: "card_code",
+      text: "investigate X",
+      depth: 0,
+      sources: ["code-local"],
+    };
+    const { captured, report } = await harvestE1d(codeCard, [
+      GT1_LAYOUTS[0].report,
+      { quote: "q2", claim: "c2", source: "code", locator: "a", revision: "r" },
+    ]);
+    // ⛔ 绝不落 content://<worker locator>@<worker revision> 这种畸形锚点。
+    expect(captured.every((e) => !e.anchor.startsWith("content://"))).toBe(true);
+    expect(report.evidenceRejections).toHaveLength(1);
+    expect(report.evidenceRejections[0].reason).toBe(CONTENT_AUTHORITY_MISSING_REASON);
+    // 条目级：同卡合规 evidence 照常发布。
+    expect(report.evidencePublished).toBe(1);
+    expect(captured[0].anchor).toBe("code://a@r");
+    expect(report.casExplored).toBe(true);
+  });
+});
+
+// ── E1d D1 ⭐⭐⭐（runChannelWrite 全生产装配链）：真正上 bus 的 anchor ──────────────
+//    ⛔ 判据 6：断言打在**生产组装出的 deps** 上（realCas / publishEvidence / 真实
+//    readWorkerResult），桩只停在 fetch（网络边界）。读的是 publish 请求体里的
+//    payload.anchor —— 即实际落到证据 channel 上的那个值（判据 9 的单机对应物）。
+
+describe("E1d D1/D2 ⭐⭐⭐ (production assembly): the anchors that actually land on the evidence channel", () => {
+  const EVIDENCE_CHANNEL = "research:p02-smoke-1dce60.evidence";
+
+  function setupE1dBoard(evidences: Array<Record<string, unknown>>) {
+    const inFlightMsg = {
+      message_id: "msg_clue_content4",
+      channel_id: WIRE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      // 调度器侧的 content-clue：sources=["content"]、text 携带 web://<uri>@<digest>（E1b D3）。
+      payload: {
+        status: "in_flight",
+        text: `web://${E1D_URI}@${E1D_DIGEST}`,
+        depth: 0,
+        sources: ["content"],
+        run_id: "run-e1d-prod",
+      },
+      entity_id: "card_content4",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-e1d-prod", exit_code: 0 },
+        entity_id: "run-e1d-prod",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_e1d",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-e1d-prod",
+          evidences,
+          proposed_clues: [],
+          materials: [],
+        },
+        entity_id: "run-e1d-prod",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    const publishBodies: Array<{
+      channel?: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      idempotency_key?: string;
+    }> = [];
+    let boardCalls = 0;
+    let runsCalls = 0;
+    const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) return jsonResponse({ head: inFlightMsg });
+      const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+      if (pm) {
+        const body = JSON.parse(String(init?.body));
+        publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+        return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${WIRE_CHANNEL}/messages`)) {
+        boardCalls += 1;
+        return jsonResponse({ messages: boardCalls === 1 ? [inFlightMsg] : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        runsCalls += 1;
+        return jsonResponse({ messages: runsCalls === 1 ? runsMessages : [] });
+      }
+      return jsonResponse({ messages: [] });
+    });
+    return {
+      fetchMock,
+      publishBodies,
+      /** 实际发到证据 channel 的 anchor（取自 publish 请求体）。 */
+      evidenceAnchors: () =>
+        publishBodies
+          .filter((b) => b.kind === "research.evidence.v2" && b.channel === EVIDENCE_CHANNEL)
+          .map((b) => String(b.payload.anchor)),
+      run: () =>
+        runChannelWrite({ channelId: WIRE_CHANNEL, evidenceChannelId: EVIDENCE_CHANNEL }),
+    };
+  }
+
+  it("⭐⭐⭐ 判据 2 discriminating (production): the four verbatim layouts ⇒ four authoritative anchors on the bus", async () => {
+    const ctx = setupE1dBoard(GT1_REPORTS);
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    const anchors = ctx.evidenceAnchors();
+    expect(anchors).toHaveLength(4);
+    // 判据 2：uri 与 digest 段四条完全相同，只有归一后的 range 不同。
+    expect(anchors).toEqual([
+      `${E1D_AUTHORITATIVE}#L9`,
+      `${E1D_AUTHORITATIVE}#L9`,
+      `${E1D_AUTHORITATIVE}#L3:1-43`,
+      `${E1D_AUTHORITATIVE}#L3`,
+    ]);
+    // ⭐ 第四条逐字（判据 2 点名的值；GT-2 里真机上发错的就是它）。
+    expect(anchors[3]).toBe(
+      "web://http://127.0.0.1:50287/e1-material4.png@b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d#L3",
+    );
+    // ⛔ 判据 2：出现 `.png://` / `content://` / `.md` / 16 位截断 digest 任一即方向钉反。
+    for (const a of anchors) {
+      expect(a).not.toContain(".png://");
+      expect(a).not.toContain("content://");
+      expect(a).not.toContain(".md");
+      expect(a).not.toContain("@63ac13abaabf5726#");
+      expect(a.startsWith(E1D_AUTHORITATIVE)).toBe(true);
+    }
+    // 判据 9 的单机对应物：URI 段不含任何 worker 拼进来的残渣。
+    for (const a of anchors) {
+      const uriSegment = a.slice("web://".length, a.lastIndexOf("@"));
+      expect(uriSegment).toBe(E1D_URI);
+    }
+    // 活性：四条都发布了，卡照常 CAS explored。
+    expect(outcome.harvestReports[0].evidencePublished).toBe(4);
+    expect(outcome.harvestReports[0].evidenceRejections).toHaveLength(0);
+    expect(ctx.publishBodies.some((b) => b.payload.status === "explored")).toBe(true);
+  });
+
+  it("⭐ 判据 3 discriminating (production): the 4th layout ⇒ published AND a source-dimension mismatch in the run report", async () => {
+    const ctx = setupE1dBoard([GT1_LAYOUTS[3].report]);
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    expect(ctx.evidenceAnchors()).toEqual([`${E1D_AUTHORITATIVE}#L3`]);
+    const mismatches = outcome.harvestReports[0].anchorMismatches;
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0].clueId).toBe("card_content4");
+    expect(mismatches[0].fields).toContain("source");
+    expect(mismatches[0].workerSource).toBe("web://http://127.0.0.1:50287/e1-material4.png");
+    expect(mismatches[0].authoritativeUri).toBe(E1D_URI);
+    expect(mismatches[0].authoritativeDigest).toBe(E1D_DIGEST);
+    // ⛔ 记录里不得回抄 quote 全文。
+    expect(JSON.stringify(mismatches)).not.toContain(GT1_LAYOUTS[3].report.quote);
   });
 });

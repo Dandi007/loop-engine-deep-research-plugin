@@ -16,12 +16,73 @@ import {
   DEFAULT_AGENT_RESULT_TIMEOUT_MS,
   RunExitedWithoutDocError,
 } from "../src/tick-run";
-import { hasRunExited, type InspectMessage } from "../src/tick-inspect";
-import { DEFAULT_TICK_CONFIG } from "../src/tick";
+import type { InspectMessage } from "../src/tick-inspect";
+import { DEFAULT_TICK_CONFIG, type TerminationState, type BoardState } from "../src/tick";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_YAML = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
 const CHANNEL = "research:p-e0c9-timeout";
+
+const runningBuses: number[] = [];
+afterEach(() => {
+  for (const pid of runningBuses.splice(0)) {
+    try {
+      process.kill(pid);
+    } catch {
+      /* already gone */
+    }
+  }
+});
+
+async function startFakeBus(seed?: Record<string, unknown[]>): Promise<{ port: number; pid: number }> {
+  const { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return new Promise((resolve, reject) => {
+    const fixture = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+    const env: Record<string, string> = { ...process.env, A10B_BUS_PORT: "0" };
+    let seedFile: string | undefined;
+    if (seed) {
+      seedFile = join(mkdtempSync(join(tmpdir(), "e0c9-bus-seed-")), "seed.json");
+      writeFileSync(seedFile, JSON.stringify(seed));
+      env.A10B_SEED = seedFile;
+    }
+    let stdout = "";
+    const child = realSpawn(process.execPath, [fixture], {
+      env,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const pid = child.pid as number;
+    runningBuses.push(pid);
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    const deadline = Date.now() + 5000;
+    const check = (port: number) => {
+      fetch(`http://127.0.0.1:${port}/v1/channels/_probe`)
+        .then(() => resolve({ port, pid }))
+        .catch(() => {
+          if (Date.now() > deadline) reject(new Error("fake bus did not come up"));
+          else setTimeout(() => check(port), 50);
+        });
+    };
+    child.on("error", (err) => reject(err));
+    const parsePort = () => {
+      const m = stdout.match(/fakebus listening on (\d+)/);
+      if (m) {
+        const port = Number(m[1]);
+        if (port > 0) {
+          check(port);
+          return;
+        }
+      }
+      if (Date.now() > deadline) {
+        reject(new Error("fake bus did not output listening port"));
+        return;
+      }
+      setTimeout(parsePort, 50);
+    };
+    setTimeout(parsePort, 50);
+  });
+}
 
 // Mock child_process.spawn to prevent ENOENT for fake agent-run
 function createMockChild() {
@@ -168,6 +229,30 @@ describe("判据 2: node_timeout >= measured max single-tick duration x headroom
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 2a (GT-19): wall clock budget is primary", () => {
+  const BIN = join(ROOT, "bin", "e0-regression.sh");
+  const TEST_BUS_URL = "http://127.0.0.1:7495";
+  const TEST_TOKEN = "/data/agent-bus-test/tokens/uther-tui.token";
+
+  function runScript(env: NodeJS.ProcessEnv): { code: number; out: string; err: string } {
+    try {
+      const out = execFileSync("bash", [BIN], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+      });
+      return { code: 0, out, err: "" };
+    } catch (e) {
+      const err = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+      return {
+        code: err.status ?? -1,
+        out: String(err.stdout ?? ""),
+        err: String(err.stderr ?? ""),
+      };
+    }
+  }
+
   it("wall clock is checked before attempt count in e0-regression.sh", () => {
     const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
     const wallClockIdx = script.indexOf("HIT WALL CLOCK LIMIT");
@@ -204,6 +289,61 @@ describe("判据 2a (GT-19): wall clock budget is primary", () => {
     expect(content).toMatch(/墙钟预算/);
     expect(content).toMatch(/2400\s*\/\s*\(/);
   });
+
+  it("executing e0-regression.sh: with DRAIN_WALL_CLOCK_SECONDS=20 DRAIN_MAX_ATTEMPTS=100, hits wall clock not attempt limit", () => {
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c9-2a-wc-"));
+    const exportRoot = mkdtempSync(join(tmpdir(), "e0c9-2a-exp-"));
+    try {
+      const env = {
+        ...process.env,
+        AGENT_BUS_URL: TEST_BUS_URL,
+        AGENT_BUS_TOKEN_FILE: TEST_TOKEN,
+        E0_RECORD_ROOT: recRoot,
+        LOOP_ENGINE_RUNTIME_ROOT: "/data/loop-engine",
+        DRAIN_WALL_CLOCK_SECONDS: "20",
+        DRAIN_BACKOFF_SECONDS: "5",
+        DRAIN_MAX_ATTEMPTS: "100",
+        MAX_CLUES: "4",
+        MAX_WRITES: "16",
+        TRIAGE_THRESHOLD: "1",
+        EXPORT_ROOT: exportRoot,
+      };
+      const res = runScript(env);
+      expect(res.err).toContain("HIT WALL CLOCK LIMIT");
+      if (res.err.includes("HIT ATTEMPT LIMIT")) {
+        expect(res.err).not.toMatch(/HIT ATTEMPT LIMIT/);
+      }
+    } finally {
+      rmSync(recRoot, { recursive: true, force: true });
+      rmSync(exportRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("discriminant: with DRAIN_MAX_ATTEMPTS=2 DRAIN_WALL_CLOCK_SECONDS=2400, script hits attempt limit (not wall clock)", () => {
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c9-2a-att-"));
+    const exportRoot = mkdtempSync(join(tmpdir(), "e0c9-2a-exp-"));
+    try {
+      const env = {
+        ...process.env,
+        AGENT_BUS_URL: TEST_BUS_URL,
+        AGENT_BUS_TOKEN_FILE: TEST_TOKEN,
+        E0_RECORD_ROOT: recRoot,
+        LOOP_ENGINE_RUNTIME_ROOT: "/data/loop-engine",
+        DRAIN_WALL_CLOCK_SECONDS: "2400",
+        DRAIN_BACKOFF_SECONDS: "5",
+        DRAIN_MAX_ATTEMPTS: "2",
+        MAX_CLUES: "4",
+        MAX_WRITES: "16",
+        TRIAGE_THRESHOLD: "1",
+        EXPORT_ROOT: exportRoot,
+      };
+      const res = runScript(env);
+      expect(res.err).toContain("HIT ATTEMPT LIMIT");
+    } finally {
+      rmSync(recRoot, { recursive: true, force: true });
+      rmSync(exportRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -222,32 +362,63 @@ describe("判据 2b (GT-15/GT-16): seed-board tick well below half node_timeout"
     delete process.env.AGENT_RESULT_POLL_MS;
   });
 
-  it("seed board (1 explored clue) tick completes with timings, totalMs below half node_timeout", async () => {
+  it("seed board (1 explored clue) on real HTTP bus: tick completes with timings, totalMs below half node_timeout, termination readable", async () => {
+    const seed = {
+      [CHANNEL]: [
+        {
+          message_id: "seed_c1",
+          channel_seq: 1,
+          kind: "research.clue.v2",
+          payload: {
+            status: "explored",
+            text: "seed clue",
+            depth: 1,
+            sources: ["code-local"],
+          },
+          entity_id: "c1",
+        },
+      ],
+      "board:agent-runs": [],
+    };
+    const { port, pid } = await startFakeBus(seed);
+
+    const tokenPath = join(mkdtempSync(join(tmpdir(), "e0c9-tok-")), "token");
+    writeFileSync(tokenPath, "test-token\n");
+
+    vi.resetModules();
+    vi.stubEnv("AGENT_BUS_URL", `http://127.0.0.1:${port}`);
+    vi.stubEnv("AGENT_BUS_TOKEN_FILE", tokenPath);
     setEnv("AGENT_RESULT_TIMEOUT_MS", "500");
     setEnv("AGENT_RESULT_POLL_MS", "10");
 
-    const cards = [clueMsg("c1", { status: "explored" }, 1)];
-
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/messages")) return messagesResponse(cards);
-      if (url.includes("/entities")) return jsonResponse({ head: null });
-      return emptyMessagesResponse();
-    });
+    const { runChannelWrite: dynRun } = await import("../src/tick-run");
 
     const yaml = readFileSync(WORKFLOW_YAML, "utf8");
     const doc = parse(yaml) as { limits?: { node_timeout?: number } };
     const nodeTimeout = doc?.limits?.node_timeout ?? 1800;
     const halfTimeout = nodeTimeout * 1000 * 0.5;
 
-    const result = await runChannelWrite({ channelId: CHANNEL });
+    const t0 = Date.now();
+    const result = await dynRun({ channelId: CHANNEL });
+    const elapsed = Date.now() - t0;
 
     expect(result.timings).toBeDefined();
     expect(result.timings.totalMs).toBeGreaterThanOrEqual(0);
     expect(result.timings.totalMs).toBeLessThan(halfTimeout);
+    expect(elapsed).toBeLessThan(halfTimeout);
     expect(result.timings.readPhaseMs).toBeGreaterThanOrEqual(0);
     expect(result.timings.writePhaseMs).toBeGreaterThanOrEqual(0);
-  });
+    expect(result.termination).toBeDefined();
+
+    vi.resetModules();
+    vi.unstubAllEnvs();
+    try {
+      process.kill(pid);
+    } catch {
+      /* already gone */
+    }
+    rmSync(dirname(tokenPath), { recursive: true, force: true });
+  }, 30_000);
 
   it("timings field is present in --run JSON output", async () => {
     setEnv("AGENT_RESULT_TIMEOUT_MS", "500");
@@ -298,7 +469,6 @@ describe("判据 2z (GT-17): triage run exited without result ⇒ tick exits 0 w
       clueMsg("c3", { status: "proposed" }, 3),
     ];
 
-    let capturedTriageRunId = "";
     let agentRunsReads = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -432,9 +602,60 @@ describe("判据 3 (GT-14/§1.2): exited-without-result detection immediately st
     expect(agentRunsReads).toBeLessThanOrEqual(6);
   });
 
-  it("discriminant: hasRunExited deleted from call sites would leave tests green", () => {
-    const code = readFileSync(join(ROOT, "src", "tick-inspect.ts"), "utf8");
-    expect(code).toContain("export function hasRunExited");
+  it("triage readResult stops immediately when run exited without result (polls bounded, returns [])", async () => {
+    setEnv("AGENT_RESULT_TIMEOUT_MS", "900000");
+    setEnv("AGENT_RESULT_POLL_MS", "3000");
+
+    const triageRunId = "e0c9-triage-exited-001";
+    let agentRunsReads = 0;
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        return messagesResponse([
+          {
+            message_id: "msg_exited",
+            channel_id: "board:agent-runs",
+            channel_seq: 1,
+            kind: "agent.run.exited.v2",
+            payload: { run_id: triageRunId, exit_code: 0 },
+            entity_id: triageRunId,
+            supersedes: null,
+            created_at: "2026-08-01T00:00:01Z",
+          },
+        ]);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const { readTriageResult } = await import("../src/tick-inspect");
+    const { resolveAgentResultTimeout } = await import("../src/tick-run");
+
+    const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+    const startTs = Date.now();
+    const deadline = startTs + timeoutMs;
+    let pollCount = 0;
+    let result: unknown = null;
+
+    while (Date.now() < deadline) {
+      pollCount += 1;
+      const triageResult = await readTriageResult(triageRunId);
+      if (triageResult !== null) {
+        result = triageResult;
+        break;
+      }
+      const runsMsgs = await (await import("../src/tick-inspect")).readChannelMessages("board:agent-runs");
+      if ((await import("../src/tick-inspect")).hasRunExited(triageRunId, runsMsgs)) {
+        result = [];
+        break;
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+
+    expect(result).toEqual([]);
+    expect(pollCount).toBeLessThanOrEqual(6);
+    expect(agentRunsReads).toBeLessThanOrEqual(12);
   });
 });
 

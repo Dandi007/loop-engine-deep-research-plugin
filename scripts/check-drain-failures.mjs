@@ -70,11 +70,30 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
+    let journalObj;
+    try {
+      journalObj = JSON.parse(line);
+    } catch {
+      journalObj = null;
+    }
     const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
     if (m) {
       failed = true;
       process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+    }
+    if (!m && journalObj && typeof journalObj === "object" && journalObj !== null) {
+      const result = journalObj.result;
+      const error = journalObj.error;
+      if (typeof result === "string" && /\[外部调用失败 status=TIMEOUT\]/.test(result)) {
+        failed = true;
+        process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} status=TIMEOUT (exec_failed)\n`);
+        process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      } else if (error === "exec" && typeof result === "string" && result.trim() !== "") {
+        failed = true;
+        process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec\n`);
+        process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      }
     }
   }
 }

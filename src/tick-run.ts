@@ -74,7 +74,8 @@ export const DEFAULT_MAX_WRITES = 64;
 
 /**
  * G6 —— 等待 agent 结果的总时间预算（ms），缺省 15 分钟。
- * 观测最大值 390s（dr-triage），900s ≈ 2.3× 最大值，覆盖 triage 与 worker 两个分布的全部样本。
+ * 该值构成单个 worker 结果等待的上界（triage readResult 与 generate readBody 共用）。
+ * 引擎 node_timeout（workflow.yaml limits.node_timeout）必须 ≥ 本值以便一个合法等待能完成。
  * 可由 `AGENT_RESULT_TIMEOUT_MS` 环境变量覆盖。
  */
 export const DEFAULT_AGENT_RESULT_TIMEOUT_MS = 900_000;
@@ -864,7 +865,7 @@ export async function runWrite(
           });
         const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus).catch((err) => {
           if (err instanceof RunExitedWithoutResultError) {
-            process.stderr.write(`[e0-regression] ${err.message}\n`);
+            process.stdout.write(`[deep-research-loop] ${err.message}\n`);
             return { decisions: [] as TriageResultDecision[], runId: "" };
           }
           throw err;
@@ -1733,7 +1734,7 @@ export async function runChannelWrite(
           await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
         } catch (err) {
           if (err instanceof RunExitedWithoutResultError) {
-            process.stderr.write(`[e0-regression] ${err.message}\n`);
+            process.stdout.write(`[deep-research-loop] ${err.message}\n`);
           } else {
             throw err;
           }
@@ -1856,6 +1857,8 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /** E0c8 §1.1b —— 最大 clue 数（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
 }
 
 /**
@@ -1879,6 +1882,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1962,6 +1966,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c8: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1977,6 +1990,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

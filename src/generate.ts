@@ -300,7 +300,7 @@ export async function spawnGenerateRole(
       return { body: await runtime.readBody(runId) };
     } catch (err) {
       if (err instanceof RunExitedWithoutResultError) {
-        throw new RunExitedWithoutResultError(runId, role, 0);
+        throw err;
       }
       throw err;
     }

@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
+import { RunExitedWithoutResultError } from "./tick-run";
 
 /** 单个生成角色：role（persona）。 */
 export interface GenerateRoleSpec {
@@ -295,7 +296,14 @@ export async function spawnGenerateRole(
       promptFile,
     });
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
-    return { body: await runtime.readBody(runId) };
+    try {
+      return { body: await runtime.readBody(runId) };
+    } catch (err) {
+      if (err instanceof RunExitedWithoutResultError) {
+        throw new RunExitedWithoutResultError(runId, role, 0);
+      }
+      throw err;
+    }
   } finally {
     rmSync(inputPath, { force: true });
     rmSync(promptFile, { force: true });

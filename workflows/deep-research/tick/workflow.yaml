@@ -6,7 +6,13 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# E0c8 §1.1 —— node_timeout 是引擎杀叶子的唯一闸刀（与 env 变量无关，GT-15）。
+#   一个 tick 含 spawn + worker 等待（最长角色约 158s）+ harvest + triage + generate
+#   各阶段；实测最大单 tick 耗时约 390s（含 generate 段，timings 埋点覆盖全阶段）。
+#   取 600s = 10min：实测最大 390s 的 1.5×，留有足够余量。保留"超过上界要响亮失败"
+#   的语义而非无限大。—— 依据：src/tick-run.ts runChannelWrite 内 timings 分阶段埋点
+#   （totalMs 含 generate 段，tTerm 为 generate 结束时刻）。
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 600, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

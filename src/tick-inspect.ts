@@ -370,3 +370,21 @@ export async function runInspect(
   write(JSON.stringify(output, null, 2) + "\n");
   return 0;
 }
+
+/**
+ * E0c8 §1.2 —— 检查指定 run 是否已退出（board:agent-runs 上有 agent.run.exited 事件）。
+ * 用于在等待 worker 结果时判断：run 已退出但无 result ⇒ 立即停止等待。
+ */
+export function isRunExited(runId: string, messages: InspectMessage[]): boolean {
+  for (const msg of messages) {
+    if (msg.kind === "agent.run.exited.v1" || msg.kind === "agent.run.exited.v2") {
+      const payload = (msg.payload ?? {}) as Record<string, unknown>;
+      if (payload.run_id === runId) return true;
+    }
+    if (msg.kind.startsWith("agent.run.exited.")) {
+      const parsed = parseRunEvent(msg);
+      if (parsed && parsed.runId === runId && parsed.event.state === "exited") return true;
+    }
+  }
+  return false;
+}

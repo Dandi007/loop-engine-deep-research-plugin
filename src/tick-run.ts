@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findTriageResult,
   findWorkerResult,
+  isRunExited,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
@@ -372,6 +373,20 @@ export class MissingExportRootError extends Error {
       "G4c: EXPORT_ROOT is not configured. Refusing to silently skip the export.",
     );
     this.name = "MissingExportRootError";
+  }
+}
+
+/**
+ * E0c8 §1.2 —— run 已退出但未产出 result ⇒ 立即停止等待并记录诊断。
+ * 点名 run_id、role、已等时长（ms）。调用方应将其作为该条工作的局部失败记录，
+ * 本轮 tick 继续处理其余工作并正常返回（§1.1c）。
+ */
+export class RunExitedWithoutResultError extends Error {
+  constructor(runId: string, role: string, waitedMs: number) {
+    super(
+      `E0c8: run ${runId} (role=${role}) exited without producing a result after ${waitedMs}ms — stopping wait immediately and recording as a local failure`,
+    );
+    this.name = "RunExitedWithoutResultError";
   }
 }
 
@@ -847,7 +862,13 @@ export async function runWrite(
               (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
             );
           });
-        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
+        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus).catch((err) => {
+          if (err instanceof RunExitedWithoutResultError) {
+            process.stderr.write(`[e0-regression] ${err.message}\n`);
+            return { decisions: [] as TriageResultDecision[], runId: "" };
+          }
+          throw err;
+        });
         const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
         const applied = await applyTriageBatch(
           deps,
@@ -1049,6 +1070,21 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E0c8 §1.1 —— 分阶段耗时（ms），覆盖整个 tick 所有阶段（含 generate）。
+   * 用于为 workflow.yaml 的 node_timeout 提供实测依据。
+   * t0=入口开始, t1=读板完成, t2=执行完成, t3=终止判定完成, t4=generate 完成（无 generate 时 = t3）。
+   */
+  timings: TickTimings;
+}
+
+/** E0c8 §1.1 —— 分阶段耗时。 */
+export interface TickTimings {
+  totalMs: number;
+  readMs: number;
+  executeMs: number;
+  termMs: number;
+  generateMs: number;
 }
 
 /**
@@ -1325,6 +1361,11 @@ export function assembleGenerateDeps(
         while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
+          // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
+          const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+          if (isRunExited(runId, runsMsgs)) {
+            throw new RunExitedWithoutResultError(runId, "generate", Date.now() - (deadline - timeoutMs));
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1491,6 +1532,7 @@ export function assembleGenerateDeps(
 export async function runChannelWrite(
   opts: RunWriteOptions,
 ): Promise<RunWriteOutcome> {
+  const t0 = Date.now();
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
@@ -1503,6 +1545,7 @@ export async function runChannelWrite(
   const runsMessages = await readChannelMessages(runsChannelId);
   const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
+  const tRead = Date.now();
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
   //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
   //   （profiles/deploy/agent-harness.env: research:agent-harness.evidence，与板 channel
@@ -1602,6 +1645,11 @@ export async function runChannelWrite(
               while (Date.now() < deadline) {
                 const result = await readTriageResult(runId);
                 if (result !== null) return result;
+                // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
+                const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+                if (isRunExited(runId, runsMsgs)) {
+                  throw new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - (deadline - timeoutMs));
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(
@@ -1619,6 +1667,7 @@ export async function runChannelWrite(
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  const tExecute = Date.now();
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1668,8 +1717,10 @@ export async function runChannelWrite(
     },
     tickConfig,
   );
+  const tTerm = Date.now();
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  let tGenerate = tTerm;
   if (opts.origin) {
     if (decideGenerate(termination)) {
       const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
@@ -1678,11 +1729,20 @@ export async function runChannelWrite(
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
         const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
-        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        try {
+          await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        } catch (err) {
+          if (err instanceof RunExitedWithoutResultError) {
+            process.stderr.write(`[e0-regression] ${err.message}\n`);
+          } else {
+            throw err;
+          }
+        }
         mkdirSync(oneShotDir, { recursive: true });
         writeFileSync(markerPath, "");
       }
     }
+    tGenerate = Date.now();
   }
 
   return {
@@ -1697,6 +1757,13 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    timings: {
+      totalMs: tGenerate - t0,
+      readMs: tRead - t0,
+      executeMs: tExecute - tRead,
+      termMs: tTerm - tExecute,
+      generateMs: tGenerate - tTerm,
+    },
   };
 }
 

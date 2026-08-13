@@ -361,6 +361,11 @@ _print_board_composition() {
 
 # ── E0c2 §1.3 —— 跨 drain 循环：反复跑 deep-research-loop.sh 直到终态收敛。──
 # 每轮：跑 drain → 分类退出码（GT-6）→ 读 termination.state（§1.1）→ 判终态或退避重来。
+# E0c8 §1.1b（GT-19）—— 墙钟为主：只要墙钟没用完就继续退避重试，不得让固定 attempt 次数
+#   先撞线。DRAIN_MAX_ATTEMPTS 是失控兜底（正常情形下不可能先于墙钟触发），
+#   必须显著大于 floor(wall_clock / (最短 drain + backoff))。
+#   自洽校验：DRAIN_WALL_CLOCK_SECONDS=2400, DRAIN_BACKOFF_SECONDS=120, 最短 drain≈3s
+#   ⇒ 2400/(3+120)≈19.5 ⇒ DRAIN_MAX_ATTEMPTS=40 > 19.5×1.5 ⇒ 正常情形下不可能先于墙钟触发。
 WALL_START=$(date +%s)
 DRAIN_ATTEMPT=0
 TERMINATION_STATE="null"
@@ -379,21 +384,7 @@ _drain_fail_echo() {
 }
 
 while true; do
-  # 次数上限检查（先于增量，使 drain_attempts 反映实际执行次数而非 off-by-one）
-  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
-      fi
-    fi
-    LOOP_EXIT=4
-    break
-  fi
-
-  # 墙钟上限检查（先于自增，使 drain_attempts 反映实际执行次数而非 off-by-one）
+  # E0c8 §1.1b（GT-19）—— 墙钟上限检查（先于次数上限，使墙钟成为主限制器）。
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
@@ -405,6 +396,20 @@ while true; do
         if [ -n "$_last_term" ]; then
           _print_board_composition "$_last_term"
         fi
+      fi
+    fi
+    LOOP_EXIT=4
+    break
+  fi
+
+  # 次数上限检查（失控兜底，正常情形下不可能先于墙钟触发）。
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+    if [ -f "$_last_stdout" ]; then
+      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+      if [ -n "$_last_term" ]; then
+        _print_board_composition "$_last_term"
       fi
     fi
     LOOP_EXIT=4

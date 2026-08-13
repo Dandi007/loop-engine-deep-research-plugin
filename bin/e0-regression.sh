@@ -378,22 +378,12 @@ _drain_fail_echo() {
   cat "$RECORD_DIR/drain-rounds/drain-${attempt}.stderr.log" >&2
 }
 
+# E0c7 §1.1b —— 收尾条件以墙钟预算为主，次数上限仅为失控兜底（GT-19）。
+#   自洽式：DRAIN_MAX_ATTEMPTS > DRAIN_WALL_CLOCK_SECONDS ÷ (最短 drain + DRAIN_BACKOFF_SECONDS)
+#   最短 drain 按 drain 本身约 30s 计：2400 / (30 + 120) = 16
+#   DRAIN_MAX_ATTEMPTS=48 是公式值的 3×，正常情形下墙钟必先撞线。
 while true; do
-  # 次数上限检查（先于增量，使 drain_attempts 反映实际执行次数而非 off-by-one）
-  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
-      fi
-    fi
-    LOOP_EXIT=4
-    break
-  fi
-
-  # 墙钟上限检查（先于自增，使 drain_attempts 反映实际执行次数而非 off-by-one）
+  # 墙钟上限检查（先于次数——墙钟是主上限，GT-19）
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
@@ -405,6 +395,20 @@ while true; do
         if [ -n "$_last_term" ]; then
           _print_board_composition "$_last_term"
         fi
+      fi
+    fi
+    LOOP_EXIT=4
+    break
+  fi
+
+  # 次数上限检查（失控兜底，非主上限——GT-19）
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+    if [ -f "$_last_stdout" ]; then
+      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+      if [ -n "$_last_term" ]; then
+        _print_board_composition "$_last_term"
       fi
     fi
     LOOP_EXIT=4

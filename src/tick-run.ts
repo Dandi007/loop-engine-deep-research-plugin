@@ -33,11 +33,14 @@ import {
 import {
   assembleBoard,
   buildRunsFromMessages,
+  findGenerateResult,
   findTriageResult,
   findWorkerResult,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
+  findRunExited,
+  E0c7RunExitedWithoutResultError,
   type InspectMessage,
   type TriageResultDecision,
 } from "./tick-inspect";
@@ -533,6 +536,8 @@ export interface WriteResult {
   harvestReports: HarvestReport[];
   /** G2b——triage 收割报告（一次 triage 一条；含整批预算跳过/校验拒绝计数）。 */
   triageReports: TriageReport[];
+  /** E0c7 §1.2——run 已 exited 但无 result 的诊断（不毙掉 tick，记录并继续）。 */
+  diagnostics: string[];
 }
 
 function generateRunId(): string {
@@ -627,6 +632,7 @@ export async function runWrite(
   const spawns: WriteResult["spawns"] = [];
   const harvestReports: WriteResult["harvestReports"] = [];
   const triageReports: WriteResult["triageReports"] = [];
+  const diagnostics: WriteResult["diagnostics"] = [];
   // ⛔ spawnCalls 是观测计数，不是硬编码字面量：包装 deps.spawnWorker 递增。
   let spawnCalls = 0;
   const spawnWorker = async (
@@ -847,17 +853,34 @@ export async function runWrite(
               (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
             );
           });
-        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
-        const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
-        const applied = await applyTriageBatch(
-          deps,
-          { writes, maxWrites },
-          proposedIds,
-          triageDecisions,
-          triageRunId,
-        );
-        writes = applied.writes;
-        triageReports.push(applied.report);
+        try {
+          const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
+          const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
+          const applied = await applyTriageBatch(
+            deps,
+            { writes, maxWrites },
+            proposedIds,
+            triageDecisions,
+            triageRunId,
+          );
+          writes = applied.writes;
+          triageReports.push(applied.report);
+        } catch (err) {
+          // E0c7 §1.2 —— run 已 exited 但无 result：记录诊断并继续，不毙掉 tick（§1.1c）。
+          if (err instanceof E0c7RunExitedWithoutResultError) {
+            diagnostics.push(err.message);
+            triageReports.push({
+              runId: "",
+              budgetSkipped: true,
+              invalidActions: 0,
+              outOfScopeDropped: 0,
+              casCount: 0,
+              casResults: [],
+            });
+          } else {
+            throw err;
+          }
+        }
         break;
       }
     }
@@ -871,6 +894,7 @@ export async function runWrite(
     spawnCalls,
     harvestReports,
     triageReports,
+    diagnostics,
   };
 }
 
@@ -1049,6 +1073,8 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /** E0c7 §1.2——run 已 exited 但无 result 的诊断（不毙掉 tick，记录并继续）。 */
+  diagnostics: string[];
 }
 
 /**
@@ -1322,9 +1348,15 @@ export function assembleGenerateDeps(
       readBody: async (runId: string) => {
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
         const deadline = Date.now() + timeoutMs;
+        const start = Date.now();
         while (Date.now() < deadline) {
-          const result = await readGenerateResult(runId);
+          const messages = await readChannelMessages(RUNS_CHANNEL_ID);
+          const result = findGenerateResult(runId, messages);
           if (result) return result.body;
+          const exited = findRunExited(runId, messages);
+          if (exited.exited) {
+            throw new E0c7RunExitedWithoutResultError(runId, "generate", Date.now() - start);
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1599,9 +1631,15 @@ export async function runChannelWrite(
             readResult: async (runId) => {
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
               const deadline = Date.now() + timeoutMs;
+              const start = Date.now();
               while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
+                const messages = await readChannelMessages(RUNS_CHANNEL_ID);
+                const result = findTriageResult(runId, messages);
                 if (result !== null) return result;
+                const exited = findRunExited(runId, messages);
+                if (exited.exited) {
+                  throw new E0c7RunExitedWithoutResultError(runId, "dr-triage", Date.now() - start);
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(
@@ -1677,10 +1715,19 @@ export async function runChannelWrite(
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
-        const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
-        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
-        mkdirSync(oneShotDir, { recursive: true });
-        writeFileSync(markerPath, "");
+        try {
+          const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
+          await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+          mkdirSync(oneShotDir, { recursive: true });
+          writeFileSync(markerPath, "");
+        } catch (err) {
+          // E0c7 §1.2 —— run 已 exited 但无 result：记录诊断并继续，不毙掉 tick（§1.1c）。
+          if (err instanceof E0c7RunExitedWithoutResultError) {
+            result.diagnostics.push(err.message);
+          } else {
+            throw err;
+          }
+        }
       }
     }
   }
@@ -1697,6 +1744,7 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    diagnostics: result.diagnostics,
   };
 }
 

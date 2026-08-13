@@ -6,7 +6,15 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# E0c7 §1.1 —— node_timeout 按实测预算给（GT-18/GT-15）：
+#   前一版 profile 声明 TICK_TIMEOUT_MS=600000（10 分钟）作为 tick 内部超时上界，
+#   但引擎真正用来杀叶子的是本行 node_timeout，旧值 30 秒对一个合法要做 bus I/O +
+#   spawn 的 tick 就是太紧。GT-18 实测：背靠背两跑，一次 0 超时、一次 2 超时
+#   （耗时 30.5–39.9 秒，与 node_timeout:30 吻合），说明 30 秒在间歇性超时的边界上。
+#   GT-15 实测：tick 只做决策计算（--inspect）秒级返回，慢的是 --run 的副作用路径。
+#   取 600 秒（10 分钟）：与已声明的 TICK_TIMEOUT_MS 对齐，覆盖实测合法工作（30–40s +
+#   bus I/O + spawn）且有显著余量。⛔ 保留上限语义（非无上限），超时仍响亮失败。
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 600, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

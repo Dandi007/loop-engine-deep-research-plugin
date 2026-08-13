@@ -199,16 +199,11 @@ export const CODE_LOCAL_ROLE = "dr-worker-code-local";
 /** E2b——`content` role（E2b §1.1：content worker 要读 spool 文件，需 `allowed_root`）。 */
 export const CONTENT_ROLE = "dr-worker-content";
 
-/**
- * A8f/E2b —— 需要 `allowed_root` 的 worker role 集合（spec §1.2 / E2b §1.1 W3）。
- * - `dr-worker-code-local`：读 repo 根下的源文件（A8f）。
- * - `dr-worker-content`：读 spool 文件（E2b §1.1 W3：content worker 要读 spool 文件，
- *   spawn 参数里带 `allowed_root`）。
- */
-export const ROLES_REQUIRING_ALLOWED_ROOT = [
-  CODE_LOCAL_ROLE,
-  CONTENT_ROLE,
-] as const;
+// E1c D5 —— 原 `ROLES_REQUIRING_ALLOWED_ROOT`（= [code-local, content]）已删除：
+//   E1b D2 之后 content 分支不再查它（content worker 的 allowed_root 是 spool 根，
+//   由 `spoolContentTranscript` 现算，⛔ 不是 `--allowed-root`），code-local 分支直接比
+//   `role === CODE_LOCAL_ROLE`。该常量既无引用点，其「content 需要 --allowed-root」的
+//   注释又与现行契约（D2）矛盾——留着就是一个没人用又说错话的常量，故清除。
 
 /** G2b —— triage role（agent-runtime 已交付 `dr-triage`）。 */
 export const TRIAGE_ROLE = "dr-triage";
@@ -370,9 +365,13 @@ export class MissingTriageQuestionError extends Error {
 }
 
 /**
- * A8f/E2b——一个 dispatch 决策映射到需要 `allowed_root` 的 role（`dr-worker-code-local` /
- * `dr-worker-content`）而 `allowed_root` 未配置 ⇒ 当场响亮失败（spec §1.2 / E2b §1.1 W3），
+ * A8f——一个 dispatch 决策映射到 `dr-worker-code-local`（读 repo 根下的源文件）而
+ * `--allowed-root` 未配置 ⇒ 当场响亮失败（spec §1.2 / F5），
  * ⛔ 绝不照常 spawn（那会产出零证据且看起来正常）。错误文本点名 `allowed-root`。
+ *
+ * ⛔ E1b D2 / E1c D5——`dr-worker-content` **不**属于本错误的适用范围：content worker 的
+ *    `allowed_root` 是 spool 根（由 `spoolContentTranscript` 现算），与 `--allowed-root` 无关；
+ *    它的失败形态是 `ContentTranscriptMissingError`（该卡 blocked、零 spawn）。
  */
 export class MissingAllowedRootError extends Error {
   constructor(role: string) {
@@ -918,6 +917,9 @@ export async function runWrite(
           hd,
           {
             clueId: decision.clueId,
+            // E1c D1——把**调度器侧**的 clue 文本一并下传：content-clue 的 text 携带
+            //   `web://<uri>@<digest>`，是 content evidence 锚点的唯一可信来源（GT-1b）。
+            text: decision.text,
             depth: decision.depth,
             sources: decision.sources,
           },
@@ -1312,6 +1314,13 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E1c D6 —— 本轮**实际生效**的 content spool 根（`--content-spool-root`，缺省
+   * `DEFAULT_CONTENT_SPOOL_ROOT`）。E1b D7 要求 spool 落位写进 profile **与运行记录**；
+   * profile 侧已交付，但运行记录此前看不出 transcript 落在哪。本字段随 `--run` 的 JSON
+   * 输出（tick-entry 直接 `JSON.stringify(outcome)`）落进运行记录，使人能定位 spool 文件。
+   */
+  contentSpoolRoot: string;
   /**
    * E0c10 D4（GT-D）—— 本轮观察到的「run exited 无 result」诊断列表。
    * 每条含 run_id / role / 已等时长 / phase（triage|generate）。tick 仍以 0 退出；
@@ -1846,6 +1855,10 @@ export async function runChannelWrite(
   //   装配链只接到一半（spec §2 判据 5：断言 max_clues 真的传到了 tick，含终态判定）。
   const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
   const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
+  // E1c D6 —— 本轮生效的 spool 根只解析**一次**：派发 content clue 时用它落 transcript，
+  //   运行记录（RunWriteOutcome.contentSpoolRoot）报的也是它。⛔ 两处不得各自 `??` 兜底，
+  //   否则运行记录可能报一个与实际落盘位置不同的路径（那比不报还坏）。
+  const contentSpoolRoot = opts.contentSpoolRoot ?? DEFAULT_CONTENT_SPOOL_ROOT;
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
@@ -1877,7 +1890,7 @@ export async function runChannelWrite(
           const spool = await spoolContentTranscript({
             clueText: input.clue_text,
             contentChannelId: opts.contentChannelId ?? CONTENT_CHANNEL_ID,
-            spoolRoot: opts.contentSpoolRoot ?? DEFAULT_CONTENT_SPOOL_ROOT,
+            spoolRoot: contentSpoolRoot,
           });
           // D2：content worker 的 allowed_root = spool 根（⛔ 不是 opts.allowedRoot）。
           //   revision 省略（⛔ 不取代码仓 HEAD：GT-1）；content worker 读 spool 文件即可定位 transcript。
@@ -2155,6 +2168,8 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    // E1c D6——本轮生效的 spool 根进运行记录（tick 的 JSON 输出），使人能看出 transcript 落在哪。
+    contentSpoolRoot,
     diagnostics,
     timings: {
       readBoardMs: _tReadBoard,

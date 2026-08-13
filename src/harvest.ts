@@ -20,6 +20,7 @@
  * `runWrite` 在发布全部完成后执行（保证「先发完，才 CAS」）。
  */
 import type { ClueV2, EvidenceV2 } from "./protocol";
+import { parseContentClueText } from "./ingest";
 
 /** worker.result.v1 里一条 evidence 的最小视图（spec §1.3 / §7）。 */
 export interface WorkerEvidenceItem {
@@ -91,9 +92,18 @@ export function assertWorkerResultShape(result: WorkerResultV1): void {
   }
 }
 
-/** 收割所依赖的卡的最小视图（纯映射只需 clueId / depth / sources）。 */
+/**
+ * 收割所依赖的卡的最小视图。
+ *
+ * E1c D1——`text` 是**调度器侧**的 clue 文本（decideTick 从板上读出、随 harvest 决策下传）。
+ * content-clue 的 text 形如 `web://<uri>@<digest>`（`contentClueText`，E1b D3），是本包
+ * 唯一可信的 anchor 三件套来源：该 clue 由调度器自己 propose、transcript 由调度器按 digest
+ * 从 `research:content` 取回并 spool，⛔ 与 worker 现编的 `locator`/`revision` 无关（GT-1b）。
+ */
 export interface HarvestCard {
   clueId: string;
+  /** 卡的 clue 文本（调度器侧权威元数据；content-clue 携带 `web://<uri>@<digest>`）。 */
+  text: string;
   depth: number;
   sources: string[];
 }
@@ -116,13 +126,13 @@ export const OVER_MAX_DEPTH_RATIONALE =
  * 组合 evidence 的 anchor（spec §5.2 / §1.3）：
  * `<source>://<locator>@<revision>#<range>`；range 缺省时**省略 `#` 段**（§1.3 / H4）。
  *
- * E1b D4 / GT-4——content 证据的 locator 已携带 persona 期望的 scheme（`web://<uri>`），
- * 直接 `<source>://` 拼接会得到畸形的双 scheme 值（`content://web://http://…@<dig>#L9`），
- * E3 的 `web://` 核验器永远匹配不上（GT-4）。content worker 的输出形态由 persona 决定，
- * 本包管不着 worker，必须在**收割侧兜住**：当 locator 已自带 scheme（`web://`）时，
- * 不再前置 `<source>://`，直接用 locator 作为 anchor 头部（`<locator>@<revision>#<range>`）。
- *
- * ⛔ `code://` 路径的拼装逐字不变（locator 不带 scheme，仍走 `<source>://<locator>@…`）。
+ * ⛔ E1c D1——本函数**只**做机械拼装，⛔ 不再嗅探 locator 的字符串前缀。
+ *    E1b 曾在这里加过一条 `locator.startsWith("web://")` 的分支，把「该不该前置 scheme」
+ *    的判定交回给了 worker 吐出来的字符串形态；GT-1b 三次真跑证明 worker 每次现编
+ *    （`web://<uri>` / `<digest>.md` / 裸 URI 三种形态），该分支**没命中**，16 条证据全部
+ *    以畸形的 `content://http://…` 发到了无 DELETE 的 append-only 证据 channel 上。
+ *    按宪法第十一条（闸门归代码），content 的锚点判定已上移到 `harvestCard`，
+ *    钉在 **`source` 语义字段 + 调度器侧 clue 元数据**上（见 `contentAnchor`）。
  */
 export function composeAnchor(
   source: string,
@@ -130,26 +140,106 @@ export function composeAnchor(
   revision: string,
   range?: string,
 ): string {
-  // E1b D4 / GT-4：locator 自带 scheme（persona 的 `web://<uri>` 形态）⇒ 不前置 `<source>://`，
-  //   直接拼成 `<locator>@<revision>#<range>`（= `web://<uri>@<digest>#<range>`，spec §5.1 期望形态）。
-  if (locator.startsWith("web://")) {
-    const base = `${locator}@${revision}`;
-    return range ? `${base}#${range}` : base;
-  }
   const base = `${source}://${locator}@${revision}`;
   return range ? `${base}#${range}` : base;
 }
 
 /**
- * 由一条 worker evidence 生成 anchor。
- * ⛔ source/locator/revision 任一缺失/为空 ⇒ **响亮报错**（不静默塞空串）。
- *    缺失时若回退成空串会得到退化的 "://@" 锚——非空故能骗过
- *    assertEvidenceComplete 的「四必填非空」检查，随后被不可回退地发布到
- *    无 DELETE 的 append-only bus。这与本仓「解析不到 secret 不得塞空串」
- *    的纪律同源（src/tick-run.ts）；缺 anchor 组件应响亮失败，绝不落退化的空锚。
+ * E1c D1 ⭐⭐ —— content 类 evidence 的**语义** source 值。
+ * 闸门只认这个字段（worker 的 `source` 由冻结 schema 约束、形态稳定），
+ * ⛔ 不认 `locator` 的字符串前缀（GT-1b：那是 LLM 每次现编的）。
  */
-export function anchorForEvidence(item: WorkerEvidenceItem): string {
+export const CONTENT_SOURCE = "content";
+
+/** E1c D1——content 证据的 anchor scheme（E3 核验器认的形态：`web://<uri>@<digest>#<range>`）。 */
+export const CONTENT_ANCHOR_SCHEME = "web://";
+
+/**
+ * E1c D1 ⭐⭐ —— 一条 content-clue 的**调度器侧权威** anchor 元数据。
+ * 该 content-clue 是调度器自己 propose 的（`buildContentClue`），transcript 是调度器按
+ * 这个 digest 从 `research:content` 取回并 spool 的（`spoolContentTranscript`）——
+ * 两个值全程在调度器手里，⛔ 与 worker 的回报无关。
+ */
+export interface ContentAnchorAuthority {
+  /** transcript 的来源 URI（content-clue text 里的 `<uri>`）。 */
+  uri: string;
+  /** transcript 的权威 digest（content-clue text 里的 `<digest>`，= sha256(取回字节)）。 */
+  digest: string;
+}
+
+/**
+ * E1c D1 ⭐⭐ —— 从卡（调度器侧）解析出 content 证据的权威 `<uri>@<digest>`。
+ *
+ * 判据全部落在调度器侧的事实上：卡的 `sources` 含 `content`（该卡是 content-clue，
+ * 由 `buildContentClue` 落板）且其 text 是 `web://<uri>@<digest>` 形态（`contentClueText`）。
+ * ⛔ 不看 worker 回报的任何字段。派发侧 `spoolContentTranscript` 用的是同一份 clue text
+ * 解析出的同一个 digest，故收割侧拼出的锚点与实际喂给 worker 的 transcript 严格同源。
+ *
+ * @returns 非 content-clue（或 text 非该形态）⇒ null。
+ */
+export function contentAnchorAuthority(card: HarvestCard): ContentAnchorAuthority | null {
+  if (!card.sources.includes(CONTENT_SOURCE)) return null;
+  const parsed = parseContentClueText(card.text ?? "");
+  return parsed ? { uri: parsed.originUri, digest: parsed.digest } : null;
+}
+
+/**
+ * E1c D2b —— `range` 形态归一。
+ *
+ * GT-1b：同一份 input 的三次真跑，worker 分别回了 `"L9"` / `"9"` / `"L3:1-43"`。
+ * 最终 anchor 里必须是统一形态（与 `code://` 现行的 `#L<a>[-L<b>]` 同构）：
+ * 补齐 `L` 前缀即可，⛔ range 的其余部分**原样保留**（`L3:1-43` 的行:字符起-止不得被改写）。
+ *
+ * @returns 归一后的 range；空/缺省 ⇒ undefined（调用方据此省略整个 `#` 段，H4）。
+ */
+export function normalizeAnchorRange(range?: string): string | undefined {
+  const trimmed = (range ?? "").trim();
+  if (!trimmed) return undefined;
+  // 已带 L/l 前缀 ⇒ 只把前缀归一成大写 L；不带 ⇒ 补上 L。其余字符逐字保留。
+  return `L${trimmed.replace(/^[Ll]/, "")}`;
+}
+
+/**
+ * E1c D1 ⭐⭐ —— 由**调度器侧权威值**拼出 content 证据的 anchor：
+ * `web://<uri>@<digest>#<range>`（range 缺省时省略 `#` 段，H4）。
+ * range 经 `normalizeAnchorRange` 归一（D2b）；⛔ worker 的 locator/revision 不参与拼装。
+ */
+export function contentAnchor(
+  authority: ContentAnchorAuthority,
+  range?: string,
+): string {
+  const base = `${CONTENT_ANCHOR_SCHEME}${authority.uri}@${authority.digest}`;
+  const normalized = normalizeAnchorRange(range);
+  return normalized ? `${base}#${normalized}` : base;
+}
+
+/**
+ * 由一条 worker evidence 生成 anchor。
+ *
+ * E1c D1——`source` 是 content 类 ⇒ 一律走 `contentAnchor`（调度器侧权威 `<uri>@<digest>`），
+ * worker 只提供 `range`。⛔ 未传 `authority` 却拿到 content evidence ⇒ **响亮报错**：
+ * 绝不回退成 `content://<worker locator>@<worker revision>`——那正是 GT-1b 里 16 条证据
+ * 被以畸形 scheme 发上 append-only bus 的形态。
+ *
+ * ⛔ 非 content 路径（`code://` / `wiki://` …）逐字不变：source/locator/revision 任一缺失/为空
+ *    ⇒ 响亮报错（不静默塞空串）。缺失时若回退成空串会得到退化的 "://@" 锚——非空故能骗过
+ *    assertEvidenceComplete 的「四必填非空」检查，随后被不可回退地发布到无 DELETE 的
+ *    append-only bus。这与本仓「解析不到 secret 不得塞空串」的纪律同源（src/tick-run.ts）。
+ */
+export function anchorForEvidence(
+  item: WorkerEvidenceItem,
+  authority?: ContentAnchorAuthority | null,
+): string {
   const source = item.source;
+  // E1c D1：闸门钉在 source 语义字段上（⛔ 不嗅探 locator 前缀）。
+  if ((source ?? "").trim() === CONTENT_SOURCE) {
+    if (!authority) {
+      throw new Error(
+        "E1c D1: content evidence requires the dispatcher-side authority (uri@digest from the content-clue); refusing to fall back to the worker-reported locator/revision (GT-1b: the worker invents them anew every run).",
+      );
+    }
+    return contentAnchor(authority, item.range);
+  }
   const locator = item.locator;
   const revision = item.revision;
   if (!source || !locator || !revision) {
@@ -177,14 +267,17 @@ export function assertEvidenceComplete(evidence: EvidenceV2): void {
 /**
  * evidence 的确定性映射（§1.3）：
  * `clue_id ← 卡的 entity_id`（引擎已知，worker 不产出；H5 判别性）。
+ * E1c D1——content evidence 另需 `authority`（调度器侧 `<uri>@<digest>`）；
+ * 其余 source 不传（`anchorForEvidence` 走既有 `<source>://<locator>@<revision>` 路径）。
  */
 export function evidenceFromWorker(
   cardClueId: string,
   item: WorkerEvidenceItem,
+  authority?: ContentAnchorAuthority | null,
 ): EvidenceV2 {
   const evidence: EvidenceV2 = {
     clue_id: cardClueId,
-    anchor: anchorForEvidence(item),
+    anchor: anchorForEvidence(item, authority),
     quote: item.quote,
     claim: item.claim,
   };
@@ -349,6 +442,75 @@ export interface EvidenceRejection {
   revisionShape: "empty" | "fingerprint" | "other";
 }
 
+/**
+ * E1c D1——一条 content evidence 因**卡上没有权威元数据**而被拒发的原因。
+ * 该卡不是 content-clue（或其 text 不是 `web://<uri>@<digest>` 形态）⇒ 无从拼出可核验的锚点，
+ * ⛔ 绝不回退去用 worker 现编的 locator/revision（GT-1b）。条目级拒发，不连坐整卡。
+ */
+export const CONTENT_AUTHORITY_MISSING_REASON =
+  "content evidence has no dispatcher-side anchor authority (the card is not a content-clue carrying web://<uri>@<digest>); refusing to anchor on worker-reported locator/revision";
+
+/**
+ * E1c D2 ⭐ —— worker 回报的 `locator`/`revision` 与调度器侧权威值不一致的**可观测记录**。
+ *
+ * GT-1b：worker 每次现编锚点三件套（`<digest>.md` + 截断 16 位 digest / 裸 URI + 完整 sha256 …）。
+ * 本包以调度器侧的值为准继续发布（`quote` 是对的，锚点由调度器补正即可），但**不得静默丢弃**
+ * 这个不一致——它是持续观察 worker 行为的唯一窗口。
+ *
+ * ⛔ 不回抄 `quote` 全文（与 `EvidenceRejection` 同纪律：不把未经核验的内容再落一遍）。
+ */
+export interface AnchorAuthorityMismatch {
+  /** 不一致所属的卡（点名 clue_id，D2）。 */
+  clueId: string;
+  /** 该条 evidence 在 worker.result.v1.evidences 中的稳定序号（便于回查）。 */
+  index: number;
+  /** 命中不一致的字段（locator / revision，可同时命中）。 */
+  fields: Array<"locator" | "revision">;
+  /** worker 回报的 locator（原样记录，便于观察 worker 行为；⛔ 非 quote 正文）。 */
+  workerLocator: string;
+  /** 调度器侧权威 URI（实际进 anchor 的值）。 */
+  authoritativeUri: string;
+  /** worker 回报的 revision（原样记录）。 */
+  workerRevision: string;
+  /** 调度器侧权威 digest（实际进 anchor 的值）。 */
+  authoritativeDigest: string;
+}
+
+/**
+ * E1c D2 ⭐ —— 交叉核对 worker 回报的锚点三件套与调度器侧权威值。
+ *
+ * 核对规则（只做**等值**核对，不做形态嗅探）：
+ *   - locator：允许 worker 自带 `web://` 前缀（persona 期望的形态），去掉后与权威 uri 逐字比较；
+ *   - revision：与权威 digest 逐字比较（截断的 16 位前缀 ⇒ 不相等 ⇒ 记录）。
+ *
+ * @returns 两侧一致 ⇒ null（⛔ 不产生记录，判据 3 的活性半边）；否则 ⇒ 一条不一致记录。
+ */
+export function anchorAuthorityMismatch(
+  clueId: string,
+  index: number,
+  item: WorkerEvidenceItem,
+  authority: ContentAnchorAuthority,
+): AnchorAuthorityMismatch | null {
+  const workerLocator = (item.locator ?? "").trim();
+  const workerRevision = (item.revision ?? "").trim();
+  const bareLocator = workerLocator.startsWith(CONTENT_ANCHOR_SCHEME)
+    ? workerLocator.slice(CONTENT_ANCHOR_SCHEME.length)
+    : workerLocator;
+  const fields: Array<"locator" | "revision"> = [];
+  if (bareLocator !== authority.uri) fields.push("locator");
+  if (workerRevision !== authority.digest) fields.push("revision");
+  if (fields.length === 0) return null;
+  return {
+    clueId,
+    index,
+    fields,
+    workerLocator,
+    authoritativeUri: authority.uri,
+    workerRevision,
+    authoritativeDigest: authority.digest,
+  };
+}
+
 /** 一张卡收割后的报告（H12/H13 要求显式报告跳过数，不得无声截断）。 */
 export interface HarvestReport {
   clueId: string;
@@ -384,6 +546,12 @@ export interface HarvestReport {
    * 每条点名 clue_id、稳定序号、失败的判据；⛔ 不含 quote 全文。
    */
   evidenceRejections: EvidenceRejection[];
+  /**
+   * E1c D2 ⭐ —— worker 回报的锚点三件套与调度器侧权威值不一致的记录（条目级）。
+   * ⛔ 不一致**不拒发**该条 evidence（quote 是对的，锚点由调度器补正）；
+   * ⛔ 也不得静默丢弃这个不一致（那是持续观察 worker 行为的唯一窗口）。
+   */
+  anchorMismatches: AnchorAuthorityMismatch[];
   /** true ⇒ 上层应在所有发布完成后 CAS 到 explored（§1.1 / H6）。 */
   casExplored: boolean;
 }
@@ -417,6 +585,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      anchorMismatches: [],
       casExplored: false,
     };
   }
@@ -470,6 +639,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      anchorMismatches: [],
       casExplored: false,
     };
   }
@@ -481,6 +651,10 @@ export async function harvestCard(
   let contentCluesBlocked = 0;
   let skippedContentClues = 0;
   const evidenceRejections: EvidenceRejection[] = [];
+  const anchorMismatches: AnchorAuthorityMismatch[] = [];
+  // E1c D1 ⭐⭐——本卡的调度器侧权威 `<uri>@<digest>`（content-clue 才有；其余卡为 null）。
+  //   ⛔ 在循环外算一次：它只取决于**卡**（调度器侧事实），与逐条 worker evidence 无关。
+  const authority = contentAnchorAuthority(card);
   // ⛔ maxClues 运行计数：`boardClueCount` 是**共享可变对象**（runWrite 把同一 `deps.harvest`
   //    传给每张 harvest 卡）。每发一条新 clue 就把 `.value` +1，从而单张卡（或多张卡累计）
   //    都不会把板面冲到 maxClues 之上（§1.6 / H12；attempt 2 major finding：卡间必须累计）。
@@ -493,6 +667,43 @@ export async function harvestCard(
   //    ⛔ 不回抄 quote 全文；同卡合规 evidence 照常发布。
   for (let i = 0; i < evItems.length; i += 1) {
     const item = evItems[i];
+    // E1c D1 ⭐⭐——闸门钉在 `source` 这个**语义字段**上（宪法第十一条：闸门归代码）。
+    //   ⛔ 不看 worker 吐出来的 locator 前缀：GT-1b 三次真跑三种形态，字符串嗅探必然漏。
+    if ((item.source ?? "").trim() === CONTENT_SOURCE) {
+      if (!authority) {
+        // 卡上没有权威元数据 ⇒ 无从拼出可核验的锚点。条目级拒发（不连坐整卡），
+        // ⛔ 绝不回退去用 worker 现编的 locator/revision 拼一个 E3 永远核验不了的锚点。
+        evidenceRejections.push({
+          clueId: card.clueId,
+          index: i,
+          reason: CONTENT_AUTHORITY_MISSING_REASON,
+          source: (item.source ?? "").slice(0, 32),
+          locatorShape: /^https?:\/\//i.test((item.locator ?? "").trim())
+            ? "http-url"
+            : "other",
+          revisionShape: (item.revision ?? "").trim() === ""
+            ? "empty"
+            : isContentFingerprint((item.revision ?? "").trim())
+              ? "fingerprint"
+              : "other",
+        });
+        continue;
+      }
+      // D2——交叉核对：不一致 ⇒ 留一条可观测记录（点名 clue_id 与两侧的值，⛔ 不含 quote），
+      //   但**照常发布**，且 anchor 以调度器侧权威值为准（⛔ 不因不一致拒发整条证据）。
+      const mismatch = anchorAuthorityMismatch(card.clueId, i, item, authority);
+      if (mismatch) anchorMismatches.push(mismatch);
+      // D1/D2b——`web://<uri>@<digest>#<归一 range>`：worker 只提供 range。
+      const evidence = evidenceFromWorker(card.clueId, item, authority);
+      await hd.publishEvidence(
+        hd.evidenceChannelId,
+        evidence,
+        `dr-evidence:${runId}:${i}`,
+      );
+      budget.consume(1);
+      evidencePublished += 1;
+      continue;
+    }
     const rejection = webEvidenceRejectionReason(item);
     if (rejection) {
       evidenceRejections.push({
@@ -575,6 +786,7 @@ export async function harvestCard(
     contentCluesBlocked,
     skippedContentClues,
     evidenceRejections,
+    anchorMismatches,
     casExplored: true,
   };
 }

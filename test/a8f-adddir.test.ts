@@ -32,6 +32,7 @@ import {
   parseDigestFromContentClue,
   CODE_LOCAL_ROLE,
   CONTENT_ROLE,
+  DEFAULT_CONTENT_SPOOL_ROOT,
 } from "../src/tick-run";
 import type { WorkerInputPayload } from "../src/tick-run";
 
@@ -116,16 +117,54 @@ function openClueMsg(clueId: string, text: string, sources: string[]) {
   };
 }
 
-function stubBus(clues: unknown[], contentMessages: unknown[] = []) {
+/** 一次 publish 请求的回录（E1c D3：断言实际写到板上的 clue 载荷，含 status/rationale）。 */
+interface PublishBody {
+  channel?: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  idempotency_key?: string;
+}
+
+function stubBus(clues: unknown[], contentMessages: unknown[] = []): PublishBody[] {
   let clueCalls = 0;
   let runsCalls = 0;
   let contentCalls = 0;
+  // E1c D3——回录每次 publish 的请求体：D5 的两半断言（CAS 目标状态 blocked、rationale 点名
+  //   digest）必须打在**实际写到 bus 上的载荷**上，而不是只看 spawn 记录。
+  const publishBodies: PublishBody[] = [];
+  // ⛔ E1c D3——`head` 必须反映**已发布的最新版本**（真实 bus 的 entity head 语义）。
+  //   原桩对 /entities/<id> 恒返回最初那条 open 消息 ⇒ 同一张卡的第二次 CAS
+  //   （in_flight→blocked）永远读到 open、前置条件不符、返回 conflict 且**不 publish**。
+  //   那会让「CAS 目标状态是 blocked」这类断言无从落地（写从未真正发生）。
+  const heads = new Map<string, Record<string, unknown>>();
+  for (const c of clues) {
+    const msg = c as Record<string, unknown>;
+    heads.set(String(msg.entity_id), msg);
+  }
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (url: unknown) => {
+    vi.fn(async (url: unknown, init?: RequestInit) => {
       const u = String(url);
-      if (u.includes("/entities/")) {
-        return jsonResponse({ head: clues[0] });
+      const em = /\/v1\/entities\/([^/?]+)/.exec(u) ?? /\/entities\/([^/?]+)/.exec(u);
+      if (em) {
+        return jsonResponse({ head: heads.get(decodeURIComponent(em[1])) ?? clues[0] });
+      }
+      const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+      if (pm) {
+        const body = JSON.parse(String(init?.body));
+        publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+        const messageId = `p_${publishBodies.length}`;
+        // 发布即成为该 entity 的新 head（供下一次 CAS 的前置条件校验读到）。
+        if (body.entity_id) {
+          heads.set(String(body.entity_id), {
+            ...(heads.get(String(body.entity_id)) ?? {}),
+            message_id: messageId,
+            kind: body.kind,
+            payload: body.payload,
+            entity_id: body.entity_id,
+          });
+        }
+        return jsonResponse({ message_id: messageId, channel_seq: 99 });
       }
       if (u.includes(`/v1/channels/${WIRE_CHANNEL}/messages`)) {
         clueCalls += 1;
@@ -143,12 +182,15 @@ function stubBus(clues: unknown[], contentMessages: unknown[] = []) {
       return jsonResponse({ messages: [] });
     }),
   );
+  return publishBodies;
 }
 
 interface DispatchResult {
   outcome: Awaited<ReturnType<typeof runChannelWrite>> | null;
   blocks: AgentRunBlock[];
   gitDir: string;
+  /** E1c D3——本次 dispatch 实际发出的 publish 请求体（含 CAS 写的 clue 载荷）。 */
+  publishBodies: PublishBody[];
 }
 
 /**
@@ -184,7 +226,7 @@ async function runDispatch(opts: {
 
   const clueId = opts.clueId ?? "clue_x";
   const clue = openClueMsg(clueId, opts.clueText ?? "investigate A8f", opts.sources);
-  stubBus([clue], opts.contentMessages ?? []);
+  const publishBodies = stubBus([clue], opts.contentMessages ?? []);
 
   try {
     const outcome = await runChannelWrite({
@@ -196,7 +238,12 @@ async function runDispatch(opts: {
     if (existsSync(marker)) {
       readUntilMarker(marker);
     }
-    return { outcome, blocks: readAgentRunBlocks(marker), gitDir: allowedRoot ?? "" };
+    return {
+      outcome,
+      blocks: readAgentRunBlocks(marker),
+      gitDir: allowedRoot ?? "",
+      publishBodies,
+    };
   } finally {
     rmSync(marker, { force: true });
     for (const d of cleanup) rmSync(d, { recursive: true, force: true });
@@ -458,7 +505,7 @@ describe("E1b D5: content clue transcript not found ⇒ blocked, zero spawn", ()
     const digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     const spoolRoot = mkdtempSync(join(tmpdir(), "e1b-spool-miss-"));
     try {
-      const { blocks, outcome } = await runDispatch({
+      const { blocks, outcome, publishBodies } = await runDispatch({
         sources: ["content"],
         clueId: "clue_missing",
         clueText: `web://http://127.0.0.1:50287/missing.png@${digest}`,
@@ -467,7 +514,7 @@ describe("E1b D5: content clue transcript not found ⇒ blocked, zero spawn", ()
         contentSpoolRoot: spoolRoot,
       });
       expect(outcome).toBeTruthy();
-      // 零 spawn（判据 6）：agent-run stub 未被调用（无 block）、spawn 记录 spawned:false。
+      // (c) 零 spawn（判据 4c）：agent-run stub 未被调用（无 block）、spawn 记录 spawned:false。
       expect(blocks).toHaveLength(0);
       const spawnRec = outcome!.spawns.find((s) => s.clueId === "clue_missing");
       expect(spawnRec).toBeTruthy();
@@ -476,9 +523,59 @@ describe("E1b D5: content clue transcript not found ⇒ blocked, zero spawn", ()
       // D5 不静默跳过：该卡经两次 CAS（open→in_flight→blocked），writes ≥ 2（非零、非 skipped）。
       expect(outcome!.writes).toBeGreaterThanOrEqual(2);
       expect(outcome!.skipped).toBe(0);
+      // ⭐ E1c D3 (a)——CAS 的**目标状态**是 blocked（判据 4a）。原用例只断言了「零 spawn」，
+      //   没断言这张卡到底落到了哪个状态；CAS 回 open 同样满足零 spawn，那会重派一个必然
+      //   零证据的 worker。断言打在 CAS **实际写到板上的 clue 载荷**上（比内存记录更硬）。
+      const cluePubs = publishBodies.filter((b) => b.kind === "research.clue.v2");
+      const blockedPubs = cluePubs.filter((b) => b.payload.status === "blocked");
+      expect(blockedPubs).toHaveLength(1);
+      expect(blockedPubs[0].payload.status).toBe("blocked");
+      // ⛔ 不得 CAS 回 open（那会重派一个必然零证据的 worker）：板上没有 status=open 的写。
+      expect(cluePubs.some((b) => b.payload.status === "open")).toBe(false);
+      // 终态是本轮**最后**一次写（open→in_flight→blocked，blocked 收尾）。
+      expect(String(cluePubs[cluePubs.length - 1].payload.status)).toBe("blocked");
+      // ⭐ E1c D3 (b)——发布的 rationale **点名 digest**（判据 4b）：排障时必须能从板上
+      //   直接看出是哪份 transcript 取不到。
+      const rationale = String(blockedPubs[0].payload.rationale ?? "");
+      expect(rationale).toContain(digest);
+      expect(rationale.length).toBeGreaterThan(0);
     } finally {
       rmSync(spoolRoot, { recursive: true, force: true });
     }
+  });
+
+  it("⭐ E1c D6 discriminating: the effective spool root is echoed into the run record (tick JSON)", async () => {
+    // E1b D7 要求 spool 落位写进 profile **与运行记录**；profile 侧已交付，但运行记录此前
+    // 看不出 transcript 落在哪。判据 6：tick 的 JSON 输出里能看到本次生效的 spool 根。
+    const digest = "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b";
+    const body = "# transcript body\n";
+    const spoolRoot = mkdtempSync(join(tmpdir(), "e1c-spool-record-"));
+    try {
+      const { outcome } = await runDispatch({
+        sources: ["content"],
+        clueId: "clue_spool_record",
+        clueText: `web://http://127.0.0.1:50287/e1-material.png@${digest}`,
+        contentMessages: [contentDocMessage(digest, body)],
+        contentSpoolRoot: spoolRoot,
+      });
+      expect(outcome).toBeTruthy();
+      // (a) 运行记录里有本次**生效**的 spool 根（删掉该字段 ⇒ 变红）。
+      expect(outcome!.contentSpoolRoot).toBe(spoolRoot);
+      // (b) tick 的 JSON 输出（tick-entry 直接 JSON.stringify(outcome)）里看得见它。
+      const asJson = JSON.parse(JSON.stringify(outcome)) as Record<string, unknown>;
+      expect(asJson.contentSpoolRoot).toBe(spoolRoot);
+      // (c) 报的就是**实际**落盘位置：transcript 确实落在这个根下（不是一个说得好听的路径）。
+      expect(existsSync(join(String(asJson.contentSpoolRoot), spoolFileName(digest)))).toBe(true);
+    } finally {
+      rmSync(spoolRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("E1c D6: no --content-spool-root ⇒ the run record still reports the effective default", async () => {
+    // 活性配对：未配置时运行记录也不得空着（缺省 DEFAULT_CONTENT_SPOOL_ROOT 同样要可观测）。
+    const { outcome } = await runDispatch({ sources: ["wiki"] });
+    expect(outcome!.contentSpoolRoot).toBe(DEFAULT_CONTENT_SPOOL_ROOT);
+    expect(String(outcome!.contentSpoolRoot).length).toBeGreaterThan(0);
   });
 
   it("D5 unit: ContentTranscriptMissingError carries the digest", () => {

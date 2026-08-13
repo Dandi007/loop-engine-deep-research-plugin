@@ -12,10 +12,13 @@ import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import {
   anchorForEvidence,
+  anchorAuthorityMismatch,
   composeAnchor,
+  contentAnchorAuthority,
   evidenceFromWorker,
   clueFromWorker,
   harvestCard,
+  normalizeAnchorRange,
   MissingEvidenceChannelError,
   OVER_MAX_DEPTH_RATIONALE,
   WorkerResultShapeError,
@@ -91,45 +94,122 @@ describe("H4: range absent ⇒ anchor has no # (separate case)", () => {
   });
 });
 
-// ── E1b D4 / GT-4：content 证据锚点修掉双 scheme（收割侧兜住）──────────
-//    persona 输出形态由 worker 决定，本包管不着；必须在收割侧把
-//    `source:content, locator:web://<uri>` 拼成 `web://<uri>@<digest>#<range>`（spec §5.1）。
+// ── E1c D1/D2/D2b ⭐⭐：content 锚点的闸门钉在 source + 调度器侧 clue 元数据上 ──────
+//    GT-1b：同一份 input 的三次真跑，worker 回的 anchor 三件套形态**完全不同**
+//    （`web://<uri>` / `<digest>.md` + 截断 16 位 digest / 裸 URI + `L3:1-43`）。
+//    E1b 的 `locator.startsWith("web://")` 判定第三次没命中，16 条证据全部以
+//    `content://http://…` 发到了无 DELETE 的证据 channel 上。
+//    ⇒ `<uri>`/`<digest>` 一律取调度器侧的 clue 元数据，worker 只提供 range 与 quote。
 
-describe("E1b D4 / GT-4: content evidence anchor = web://<uri>@<digest>#<range> (no double scheme)", () => {
-  // GT-4 逐字 worker evidence（spec §0 GT-4 真机取证照抄）。
-  const gt4Item = {
-    quote: "H1 工程基建组围绕…",
-    claim: "H1 工程基建组以…为北极星方向。",
-    source: "content",
-    locator: "web://http://127.0.0.1:50287/e1-material.png",
-    revision: "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b",
-    range: "L9",
-  };
+// GT-1b 逐字：该 content-clue 的**调度器侧权威值**（spec §2 判据 2）。
+const AUTH_URI = "http://127.0.0.1:50287/e1-material.png";
+const AUTH_DIGEST = "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b";
+/** 该 content-clue 的 text（由 contentClueText 产出，E1b D3）。 */
+const CONTENT_CLUE_TEXT = `web://${AUTH_URI}@${AUTH_DIGEST}`;
+/** 判据 2 的期望 anchor：输入 A / B 两条都必须产出**同一个**它。 */
+const EXPECTED_ANCHOR = `web://${AUTH_URI}@${AUTH_DIGEST}#L9`;
 
-  it("⭐⭐ D4 discriminating: GT-4 verbatim content evidence ⇒ anchor literally web://<uri>@<digest>#<range>", () => {
-    const anchor = anchorForEvidence(gt4Item);
-    // 判据 4：逐字等于 spec §0 GT-4 期望形态。
-    expect(anchor).toBe(
-      "web://http://127.0.0.1:50287/e1-material.png@63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b#L9",
-    );
-    // ⛔ 断言里不得出现 content://（方向钉反即拒）。
+/** GT-1b 第一次真跑（seq 733）逐字：worker 自带 scheme、完整 sha256、range "L9"。 */
+const WORKER_REPORT_A = {
+  quote: "H1 工程基建组围绕…",
+  claim: "H1 工程基建组以…为北极星方向。",
+  source: "content",
+  locator: "web://http://127.0.0.1:50287/e1-material.png",
+  revision: "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b",
+  range: "L9",
+};
+
+/** GT-1b 第二次真跑（seq 751）逐字：spool 本地文件名、截断 16 位 digest、range "9"。 */
+const WORKER_REPORT_B = {
+  quote: "H1 工程基建组围绕…",
+  claim: "H1 工程基建组以…为北极星方向。",
+  source: "content",
+  locator: "63ac13abaabf5726.md",
+  revision: "63ac13abaabf5726",
+  range: "9",
+};
+
+/** GT-1b 第三次真跑（E1b Z2 全生产链）逐字：裸 URI 无 scheme、完整 sha256、range "L3:1-43"。 */
+const WORKER_REPORT_C = {
+  quote: "H1 工程基建组围绕…",
+  claim: "H1 工程基建组以…为北极星方向。",
+  source: "content",
+  locator: "http://127.0.0.1:50287/e1-material.png",
+  revision: "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b",
+  range: "L3:1-43",
+};
+
+/** 该 content-clue 的卡（调度器侧：sources 含 content、text 携带 web://<uri>@<digest>）。 */
+const CONTENT_CARD = {
+  clueId: "card_content",
+  text: CONTENT_CLUE_TEXT,
+  depth: 0,
+  sources: ["content"],
+};
+
+describe("E1c D1 ⭐⭐: content anchor comes from the dispatcher-side clue metadata (not the worker)", () => {
+  it("⭐⭐ D1 discriminating: GT-1b verbatim reports A and B ⇒ THE SAME authoritative anchor", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    expect(authority).toEqual({ uri: AUTH_URI, digest: AUTH_DIGEST });
+    const anchorA = anchorForEvidence(WORKER_REPORT_A, authority);
+    const anchorB = anchorForEvidence(WORKER_REPORT_B, authority);
+    // 判据 2：两条逐字真实回报必须产出同一个锚点。
+    expect(anchorA).toBe(EXPECTED_ANCHOR);
+    expect(anchorB).toBe(EXPECTED_ANCHOR);
+    expect(anchorB).toBe(anchorA);
+    // ⛔ 判据 2 方向钉反的三个标志：content:// / .md / 截断 16 位 digest。
+    for (const a of [anchorA, anchorB]) {
+      expect(a).not.toContain("content://");
+      expect(a).not.toContain(".md");
+      expect(a).not.toBe(`web://${AUTH_URI}@63ac13abaabf5726#L9`);
+      expect(a.startsWith("web://")).toBe(true);
+    }
+  });
+
+  it("⭐⭐ D1 discriminating: report C (bare URI, range L3:1-43) ⇒ authoritative uri@digest, range kept verbatim", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    const anchor = anchorForEvidence(WORKER_REPORT_C, authority);
+    // 判据 2 输入 C：anchor 结尾为 #L3:1-43（range 原样保留，只归一 L 前缀）。
+    expect(anchor).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}#L3:1-43`);
+    expect(anchor.endsWith("#L3:1-43")).toBe(true);
     expect(anchor).not.toContain("content://");
-    expect(anchor).not.toMatch(/^content:\/\//);
   });
 
-  it("⭐⭐ D4 discriminating (composeAnchor): content + web:// locator ⇒ no content:// prefix", () => {
-    const a = composeAnchor("content", "web://http://x/y.png", "deadbeef", "L1");
-    expect(a).toBe("web://http://x/y.png@deadbeef#L1");
-    expect(a).not.toContain("content://");
+  it("⭐ D1 discriminating: content evidence WITHOUT dispatcher-side authority ⇒ loud error, never a content:// fallback", () => {
+    // ⛔ 回退去用 worker 的 locator/revision 正是 GT-1b 里 16 条畸形证据的成因。
+    expect(() => anchorForEvidence(WORKER_REPORT_C)).toThrow(/authority/i);
+    expect(() => anchorForEvidence(WORKER_REPORT_A, null)).toThrow(/authority/i);
   });
 
-  it("D4 regression: source:code evidence anchor unchanged (code:// path)", () => {
-    // ⛔ code:// 路径的拼装逐字不变（locator 不带 scheme，仍走 <source>://<locator>@…）。
-    const a = composeAnchor("code", "repo/path/File.ts", "abc123", "L10-L20");
-    expect(a).toBe("code://repo/path/File.ts@abc123#L10-L20");
+  it("⭐ D1: the gate is pinned on `source`, NOT on the worker's locator prefix", () => {
+    // 三条回报的 locator 前缀三种形态（web:// / 无 scheme 的文件名 / 裸 URI），
+    // 但 source 都是 content ⇒ 三条都走权威路径。若闸门钉在 locator 前缀上，B/C 必然漏。
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    const anchors = [WORKER_REPORT_A, WORKER_REPORT_B, WORKER_REPORT_C].map((r) =>
+      anchorForEvidence(r, authority),
+    );
+    for (const a of anchors) {
+      expect(a.startsWith(`web://${AUTH_URI}@${AUTH_DIGEST}#`)).toBe(true);
+    }
+    // 反向：composeAnchor 已不再嗅探前缀（纯机械拼装），code:// 路径逐字不变。
+    expect(composeAnchor("code", "repo/path/File.ts", "abc123", "L10-L20")).toBe(
+      "code://repo/path/File.ts@abc123#L10-L20",
+    );
   });
 
-  it("D4 regression: anchorForEvidence on code evidence unchanged", () => {
+  it("D1: contentAnchorAuthority returns null for non-content cards / unparseable text", () => {
+    // 非 content-clue（sources 不含 content）⇒ null（code:// 路径不受影响）。
+    expect(
+      contentAnchorAuthority({ clueId: "c", text: CONTENT_CLUE_TEXT, depth: 0, sources: ["code-local"] }),
+    ).toBeNull();
+    // content 卡但 text 非 web://<uri>@<digest> 形态 ⇒ null（无从拼可核验锚点）。
+    expect(
+      contentAnchorAuthority({ clueId: "c", text: "investigate content", depth: 0, sources: ["content"] }),
+    ).toBeNull();
+  });
+
+  it("D1 regression: code evidence anchor unchanged (authoritative source is the worker's own repo read)", () => {
+    // ⛔ code:// 路径逐字不变：code worker 的 locator/revision 是它从真仓里读的，仍是权威来源。
     const a = anchorForEvidence({
       quote: "q",
       claim: "c",
@@ -139,6 +219,62 @@ describe("E1b D4 / GT-4: content evidence anchor = web://<uri>@<digest>#<range> 
       range: "L5",
     });
     expect(a).toBe("code://src/x.ts@abc123#L5");
+  });
+});
+
+describe("E1c D2b ⭐: range shape is normalized (worker returns 'L9' or '9')", () => {
+  it("⭐ D2b discriminating: range '9' and 'L9' ⇒ both anchors end with #L9", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    const withL = anchorForEvidence({ ...WORKER_REPORT_A, range: "L9" }, authority);
+    const withoutL = anchorForEvidence({ ...WORKER_REPORT_A, range: "9" }, authority);
+    expect(withL.endsWith("#L9")).toBe(true);
+    expect(withoutL.endsWith("#L9")).toBe(true);
+    expect(withoutL).toBe(withL);
+    // ⛔ 原样透传会得到 #9（去掉归一 ⇒ 本条变红）。
+    expect(withoutL).not.toContain("#9");
+  });
+
+  it("D2b: normalizeAnchorRange pure cases (L-prefix only; the rest is kept verbatim)", () => {
+    expect(normalizeAnchorRange("9")).toBe("L9");
+    expect(normalizeAnchorRange("L9")).toBe("L9");
+    expect(normalizeAnchorRange("L3:1-43")).toBe("L3:1-43");
+    expect(normalizeAnchorRange("3:1-43")).toBe("L3:1-43");
+    expect(normalizeAnchorRange("10-20")).toBe("L10-20");
+    // 缺省/空 ⇒ undefined ⇒ 调用方省略整个 # 段（H4）。
+    expect(normalizeAnchorRange(undefined)).toBeUndefined();
+    expect(normalizeAnchorRange("  ")).toBeUndefined();
+  });
+
+  it("D2b: range absent ⇒ content anchor has no # segment (H4 regression)", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    const a = anchorForEvidence({ ...WORKER_REPORT_A, range: undefined }, authority);
+    expect(a).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}`);
+    expect(a).not.toContain("#");
+  });
+});
+
+describe("E1c D2 ⭐: worker/authority mismatch is recorded (but never suppresses the evidence)", () => {
+  it("⭐ D2 discriminating: report B (both fields differ) ⇒ mismatch names clue_id and both sides", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    const m = anchorAuthorityMismatch("card_content", 3, WORKER_REPORT_B, authority);
+    expect(m).not.toBeNull();
+    expect(m!.clueId).toBe("card_content");
+    expect(m!.index).toBe(3);
+    expect([...m!.fields].sort()).toEqual(["locator", "revision"]);
+    // 两侧的值都在记录里（这是持续观察 worker 行为的唯一窗口）。
+    expect(m!.workerLocator).toBe("63ac13abaabf5726.md");
+    expect(m!.authoritativeUri).toBe(AUTH_URI);
+    expect(m!.workerRevision).toBe("63ac13abaabf5726");
+    expect(m!.authoritativeDigest).toBe(AUTH_DIGEST);
+    // ⛔ 不回抄 quote 全文。
+    expect(JSON.stringify(m)).not.toContain(WORKER_REPORT_B.quote);
+  });
+
+  it("⭐ D2 discriminating (pair): report A (both sides agree) ⇒ NO mismatch record", () => {
+    const authority = contentAnchorAuthority(CONTENT_CARD)!;
+    expect(anchorAuthorityMismatch("card_content", 0, WORKER_REPORT_A, authority)).toBeNull();
+    // 输入 C 的裸 URI 与权威 uri 逐字相等、revision 是完整 sha256 ⇒ 同样不算不一致。
+    expect(anchorAuthorityMismatch("card_content", 0, WORKER_REPORT_C, authority)).toBeNull();
   });
 });
 
@@ -231,7 +367,7 @@ describe("anchor missing component fails loudly (no silent empty anchor)", () =>
 describe("H10: proposed_clue ⇒ proposed, depth=父+1, sources inherited, parent=父 id", () => {
   it("maps all four fields", () => {
     const clue = clueFromWorker(
-      { clueId: "card_x", depth: 1, sources: ["code-local", "wiki"] },
+      { clueId: "card_x", text: "investigate X", depth: 1, sources: ["code-local", "wiki"] },
       { clue: "follow-up idea" },
       3,
     );
@@ -245,7 +381,7 @@ describe("H10: proposed_clue ⇒ proposed, depth=父+1, sources inherited, paren
 describe("H11: depth+1 > maxDepth ⇒ clue blocked with non-empty rationale, not dropped", () => {
   it("still produces a clue (publishable), status=blocked, rationale non-empty", () => {
     const clue = clueFromWorker(
-      { clueId: "card_x", depth: 3, sources: ["wiki"] },
+      { clueId: "card_x", text: "investigate X", depth: 3, sources: ["wiki"] },
       { clue: "too deep" },
       3,
     );
@@ -260,7 +396,7 @@ describe("H11: depth+1 > maxDepth ⇒ clue blocked with non-empty rationale, not
 describe("H19: worker reason is not stored; clue has no reason field", () => {
   it("clue payload has no `reason` key even when worker item carries one", () => {
     const clue = clueFromWorker(
-      { clueId: "card_x", depth: 0, sources: ["wiki"] },
+      { clueId: "card_x", text: "investigate X", depth: 0, sources: ["wiki"] },
       { clue: "idea", reason: "because triage" },
       3,
     );
@@ -881,7 +1017,7 @@ describe("harvestCard budget boundary", () => {
       },
     };
     const hd = harvestDeps();
-    const report = await harvestCard(hd, { clueId: "card_x", depth: 0, sources: ["code-local"] }, "run-1", budget);
+    const report = await harvestCard(hd, { clueId: "card_x", text: "investigate X", depth: 0, sources: ["code-local"] }, "run-1", budget);
     expect(report.skipped).toBe(false);
     expect(report.casExplored).toBe(true);
     expect(report.evidencePublished).toBe(2);
@@ -926,7 +1062,7 @@ describe("E1b D6 / GT-5: budget reserves 2 writes per new transcript (doc + clue
       consume: (n) => { used += n; },
     };
     const hd = newTranscriptDeps();
-    const report = await harvestCard(hd, { clueId: "card_d6", depth: 0, sources: ["content"] }, "run-d6", budget);
+    const report = await harvestCard(hd, { clueId: "card_d6", text: "web://http://x/new-transcript.pdf@deadbeef", depth: 0, sources: ["content"] }, "run-d6", budget);
     // 整卡跳过（needed=3 > remaining=2）：零发布、零 CAS。
     expect(report.skipped).toBe(true);
     expect(report.skippedReason).toBe("budget");
@@ -945,7 +1081,7 @@ describe("E1b D6 / GT-5: budget reserves 2 writes per new transcript (doc + clue
       consume: (n) => { used += n; },
     };
     const hd = newTranscriptDeps();
-    const report = await harvestCard(hd, { clueId: "card_d6", depth: 0, sources: ["content"] }, "run-d6", budget);
+    const report = await harvestCard(hd, { clueId: "card_d6", text: "web://http://x/new-transcript.pdf@deadbeef", depth: 0, sources: ["content"] }, "run-d6", budget);
     // needed=3 ≤ remaining=3 ⇒ 放行；发布 1 条 content-clue（新 transcript），consume 2（doc + clue）。
     expect(report.skipped).toBe(false);
     expect(report.contentCluesPublished).toBe(1);
@@ -974,7 +1110,7 @@ describe("E1b D6 / GT-5: budget reserves 2 writes per new transcript (doc + clue
       // D2 复用 ⇒ 返回 null（不 propose、不发 doc）。
       ingestMaterial: vi.fn(async () => null),
     });
-    const report = await harvestCard(hd, { clueId: "card_d6r", depth: 0, sources: ["content"] }, "run-d6-reuse", budget);
+    const report = await harvestCard(hd, { clueId: "card_d6r", text: "web://http://x/existing.pdf@deadbeef", depth: 0, sources: ["content"] }, "run-d6-reuse", budget);
     expect(report.skipped).toBe(false);
     expect(report.contentCluesPublished).toBe(0);
     // 复用路径：实际 0 写（不新发 doc），consume 0。⛔ 不得一律 +1。
@@ -992,7 +1128,7 @@ const EV_ITEM = (i: number): { quote: string; claim: string; source: string; loc
   revision: "r",
 });
 
-const HARVEST_CARD = { clueId: "card_x", depth: 0, sources: ["code-local"] };
+const HARVEST_CARD = { clueId: "card_x", text: "investigate X", depth: 0, sources: ["code-local"] };
 
 function makeBudget(total: number): HarvestBudget {
   let used = 0;
@@ -1898,5 +2034,265 @@ describe("E1 production assembly (runChannelWrite): full ingest success path", (
     // (c) evidence 照常发布。
     const evidencePubs = ctx.publishBodies.filter((b) => b.kind === "research.evidence.v2");
     expect(evidencePubs).toHaveLength(1);
+  });
+});
+// ── E1c D4 ⭐⭐：驱动 harvestCard，断言 **publishEvidence 实际收到的** anchor ──────
+//    ⛔ spec §2 判据 5：只断言 composeAnchor / anchorForEvidence 的返回值**不算**交付。
+//    这里驱动生产收割函数 harvestCard，从 publishEvidence 的捕获参数里取 anchor。
+
+describe("E1c D4 ⭐⭐ (harvestCard): the anchor handed to publishEvidence, not composeAnchor's return", () => {
+  /** 一张 content 卡 + 一条 worker 回报 ⇒ 收割一次，返回 publishEvidence 捕获到的 evidence。 */
+  async function harvestOne(report: Record<string, unknown>) {
+    const captured: EvidenceV2[] = [];
+    const hd = harvestDeps({
+      publishEvidence: vi.fn(async (_channel, evidence) => {
+        captured.push(evidence);
+      }),
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-c",
+          evidences: [report],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const result = await harvestCard(hd, CONTENT_CARD, "run-c", makeBudget(5));
+    return { captured, result, hd };
+  }
+
+  it("⭐⭐ D4/D1 discriminating: report A ⇒ publishEvidence receives the authoritative anchor", async () => {
+    const { captured, result } = await harvestOne(WORKER_REPORT_A);
+    expect(captured).toHaveLength(1);
+    // ⛔ 从捕获参数取 anchor（不是从 composeAnchor 的返回值）。
+    expect(captured[0].anchor).toBe(EXPECTED_ANCHOR);
+    expect(captured[0].clue_id).toBe("card_content");
+    expect(result.evidencePublished).toBe(1);
+    expect(result.casExplored).toBe(true);
+  });
+
+  it("⭐⭐ D4/D1 discriminating: report B (worker invents locator/revision) ⇒ SAME authoritative anchor on the wire", async () => {
+    const { captured, result } = await harvestOne(WORKER_REPORT_B);
+    expect(captured).toHaveLength(1);
+    // 判据 2：把 <uri>@<digest> 改回取 worker 的 locator/revision ⇒ 本条必变红。
+    expect(captured[0].anchor).toBe(EXPECTED_ANCHOR);
+    expect(captured[0].anchor).not.toContain("content://");
+    expect(captured[0].anchor).not.toContain(".md");
+    // D2：证据**照常发布**（⛔ 不因不一致拒发整条）。
+    expect(result.evidencePublished).toBe(1);
+    expect(result.evidenceRejections).toHaveLength(0);
+  });
+
+  it("⭐⭐ D4/D1 discriminating: report C (bare URI + L3:1-43) ⇒ authoritative uri@digest, range verbatim", async () => {
+    const { captured } = await harvestOne(WORKER_REPORT_C);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].anchor).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}#L3:1-43`);
+  });
+
+  it("⭐ D2 discriminating: report B ⇒ an observable mismatch record (clue_id + both sides, no quote)", async () => {
+    const { result } = await harvestOne(WORKER_REPORT_B);
+    expect(result.anchorMismatches).toHaveLength(1);
+    const m = result.anchorMismatches[0];
+    expect(m.clueId).toBe("card_content");
+    expect(m.index).toBe(0);
+    expect(m.workerLocator).toBe("63ac13abaabf5726.md");
+    expect(m.workerRevision).toBe("63ac13abaabf5726");
+    expect(m.authoritativeUri).toBe(AUTH_URI);
+    expect(m.authoritativeDigest).toBe(AUTH_DIGEST);
+    // ⛔ 不含 quote 全文。
+    expect(JSON.stringify(result.anchorMismatches)).not.toContain(WORKER_REPORT_B.quote);
+  });
+
+  it("⭐ D2 discriminating (pair): report A ⇒ NO mismatch record (both sides agree)", async () => {
+    const { result } = await harvestOne(WORKER_REPORT_A);
+    expect(result.anchorMismatches).toHaveLength(0);
+    // 活性：证据照发（不因"无不一致"而漏发）。
+    expect(result.evidencePublished).toBe(1);
+  });
+
+  it("⭐ D2b discriminating (harvestCard): range '9' and 'L9' ⇒ the anchor on the wire ends with #L9 both times", async () => {
+    const withoutL = await harvestOne({ ...WORKER_REPORT_A, range: "9" });
+    const withL = await harvestOne({ ...WORKER_REPORT_A, range: "L9" });
+    expect(withoutL.captured[0].anchor.endsWith("#L9")).toBe(true);
+    expect(withL.captured[0].anchor.endsWith("#L9")).toBe(true);
+    expect(withoutL.captured[0].anchor).toBe(withL.captured[0].anchor);
+  });
+
+  it("⭐ D1 safety: content evidence on a card WITHOUT authority ⇒ item-level rejection, no malformed anchor published", async () => {
+    // 卡不是 content-clue（text 非 web://<uri>@<digest>）⇒ 无从拼可核验锚点。
+    const captured: EvidenceV2[] = [];
+    const hd = harvestDeps({
+      publishEvidence: vi.fn(async (_c, evidence) => {
+        captured.push(evidence);
+      }),
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-c",
+          evidences: [
+            WORKER_REPORT_A,
+            { quote: "q2", claim: "c2", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const result = await harvestCard(
+      hd,
+      { clueId: "card_x", text: "investigate X", depth: 0, sources: ["code-local"] },
+      "run-c",
+      makeBudget(5),
+    );
+    // ⛔ 绝不落 content://<worker locator>@<worker revision> 这种畸形锚点。
+    expect(captured.every((e) => !e.anchor.startsWith("content://"))).toBe(true);
+    expect(result.evidenceRejections).toHaveLength(1);
+    expect(result.evidenceRejections[0].clueId).toBe("card_x");
+    // ⛔ 条目级：同卡合规 evidence 照常发布，整卡照常 CAS explored（不连坐）。
+    expect(result.evidencePublished).toBe(1);
+    expect(captured[0].anchor).toBe("code://a@r");
+    expect(result.casExplored).toBe(true);
+  });
+});
+
+// ── E1c D1/D4 ⭐⭐（runChannelWrite 全生产装配链）：真正上 bus 的 anchor ──────────
+//    ⛔ spec §2 判据 7：断言打在**生产组装出的 deps** 上（realCas / publishEvidence / 真实
+//    readWorkerResult），桩只停在 fetch（网络边界）。这里读的是 publish 请求体里的
+//    payload.anchor —— 即实际落到证据 channel 上的那个值。
+
+describe("E1c D1/D4 ⭐⭐ (production assembly): the anchor that actually lands on the evidence channel", () => {
+  const EVIDENCE_CHANNEL = "research:p02-smoke-1dce60.evidence";
+
+  function setupContentBoard(evidences: Array<Record<string, unknown>>) {
+    const inFlightMsg = {
+      message_id: "msg_clue_content",
+      channel_id: WIRE_CHANNEL,
+      channel_seq: 1,
+      kind: "research.clue.v2",
+      // 调度器侧的 content-clue：sources=["content"]、text 携带 web://<uri>@<digest>（E1b D3）。
+      payload: {
+        status: "in_flight",
+        text: CONTENT_CLUE_TEXT,
+        depth: 0,
+        sources: ["content"],
+        run_id: "run-c",
+      },
+      entity_id: "card_content",
+      supersedes: null,
+      created_at: "2026-01-01T00:00:00Z",
+    };
+    const runsMessages = [
+      {
+        message_id: "run_exit",
+        channel_id: "board:agent-runs",
+        channel_seq: 1,
+        kind: "agent.run.exited.v1",
+        payload: { run_id: "run-c", exit_code: 0 },
+        entity_id: "run-c",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+      {
+        message_id: "result_c",
+        channel_id: "board:agent-runs",
+        channel_seq: 2,
+        kind: "worker.result.v1",
+        payload: {
+          run_id: "run-c",
+          evidences,
+          proposed_clues: [],
+          materials: [],
+        },
+        entity_id: "run-c",
+        supersedes: null,
+        created_at: "2026-01-01T00:00:00Z",
+      },
+    ];
+    const publishBodies: Array<{
+      channel?: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      idempotency_key?: string;
+    }> = [];
+    let boardCalls = 0;
+    let runsCalls = 0;
+    const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/entities/")) return jsonResponse({ head: inFlightMsg });
+      const pm = /\/v1\/channels\/([^/]+)\/publish/.exec(u);
+      if (pm) {
+        const body = JSON.parse(String(init?.body));
+        publishBodies.push({ channel: decodeURIComponent(pm[1]), ...body });
+        return jsonResponse({ message_id: `p_${publishBodies.length}`, channel_seq: 99 });
+      }
+      if (u.includes(`/v1/channels/${WIRE_CHANNEL}/messages`)) {
+        boardCalls += 1;
+        return jsonResponse({ messages: boardCalls === 1 ? [inFlightMsg] : [] });
+      }
+      if (u.includes("/v1/channels/board:agent-runs/messages")) {
+        runsCalls += 1;
+        return jsonResponse({ messages: runsCalls === 1 ? runsMessages : [] });
+      }
+      return jsonResponse({ messages: [] });
+    });
+    return {
+      fetchMock,
+      publishBodies,
+      /** 实际发到证据 channel 的 evidence（anchor 取自 publish 请求体）。 */
+      evidenceAnchors: () =>
+        publishBodies
+          .filter((b) => b.kind === "research.evidence.v2" && b.channel === EVIDENCE_CHANNEL)
+          .map((b) => String(b.payload.anchor)),
+      run: () =>
+        runChannelWrite({ channelId: WIRE_CHANNEL, evidenceChannelId: EVIDENCE_CHANNEL }),
+    };
+  }
+
+  it("⭐⭐ D1 discriminating (judgment criterion 2): reports A, B and C ⇒ authoritative anchors on the bus", async () => {
+    const ctx = setupContentBoard([WORKER_REPORT_A, WORKER_REPORT_B, WORKER_REPORT_C]);
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    const anchors = ctx.evidenceAnchors();
+    expect(anchors).toHaveLength(3);
+    // 判据 2：A 与 B 产出**同一个**权威 anchor；C 保留自己的 range。
+    expect(anchors[0]).toBe(EXPECTED_ANCHOR);
+    expect(anchors[1]).toBe(EXPECTED_ANCHOR);
+    expect(anchors[2]).toBe(`web://${AUTH_URI}@${AUTH_DIGEST}#L3:1-43`);
+    // ⛔ 判据 2：出现 content:// / .md / 截断 16 位 digest 任一即方向钉反。
+    for (const a of anchors) {
+      expect(a).not.toContain("content://");
+      expect(a).not.toContain(".md");
+      expect(a).not.toContain(`@63ac13abaabf5726#`);
+      expect(a.startsWith(`web://${AUTH_URI}@${AUTH_DIGEST}`)).toBe(true);
+    }
+    // 活性：三条都发布了，卡照常 CAS explored。
+    expect(outcome.harvestReports[0].evidencePublished).toBe(3);
+    expect(outcome.harvestReports[0].evidenceRejections).toHaveLength(0);
+    expect(
+      ctx.publishBodies.some((b) => b.payload.status === "explored"),
+    ).toBe(true);
+  });
+
+  it("⭐ D2 discriminating (production): report B ⇒ published AND a mismatch record in the run report", async () => {
+    const ctx = setupContentBoard([WORKER_REPORT_B]);
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    // 证据照常发布，anchor 是权威形态。
+    expect(ctx.evidenceAnchors()).toEqual([EXPECTED_ANCHOR]);
+    // 同时产出一条可观测的不一致记录（含 clue_id 与两侧的值）。
+    const mismatches = outcome.harvestReports[0].anchorMismatches;
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0].clueId).toBe("card_content");
+    expect(mismatches[0].workerLocator).toBe("63ac13abaabf5726.md");
+    expect(mismatches[0].authoritativeDigest).toBe(AUTH_DIGEST);
+    // ⛔ 记录里不得回抄 quote 全文。
+    expect(JSON.stringify(mismatches)).not.toContain(WORKER_REPORT_B.quote);
+  });
+
+  it("⭐ D2 discriminating (pair, production): report A ⇒ NO mismatch record", async () => {
+    const ctx = setupContentBoard([WORKER_REPORT_A]);
+    vi.stubGlobal("fetch", ctx.fetchMock);
+    const outcome = await ctx.run();
+    expect(ctx.evidenceAnchors()).toEqual([EXPECTED_ANCHOR]);
+    expect(outcome.harvestReports[0].anchorMismatches).toHaveLength(0);
   });
 });

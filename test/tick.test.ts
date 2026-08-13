@@ -9,10 +9,7 @@ import {
   SOURCE_ENUM,
   roleForSources,
   SOURCE_TO_ROLE,
-  WEB_BLOCK_RATIONALE,
   INVALID_SOURCES_RATIONALE,
-  UNMAPPED_SOURCE_RATIONALE,
-  isWebSource,
 } from "../src/tick";
 import type {
   BoardState,
@@ -314,6 +311,7 @@ describe("E0c3b 判据 2: e0-regression profile TRIAGE_THRESHOLD=1 makes 1 propo
 describe("source enum sanity", () => {
   it("isValidSources accepts only closed enum members", () => {
     expect(isValidSources(["code-local", "web-search"])).toBe(true);
+    expect(isValidSources(["content"])).toBe(true);
     expect(isValidSources(["wiki"])).toBe(true);
     expect(isValidSources(["bogus"])).toBe(false);
     expect(isValidSources(["code-local", "bogus"])).toBe(false);
@@ -323,6 +321,7 @@ describe("source enum sanity", () => {
       "wiki",
       "feishu",
       "web-search",
+      "content",
     ]);
   });
 });
@@ -345,43 +344,66 @@ describe("N6: out-of-enum sources ⇒ card blocked, no dispatch", () => {
   });
 });
 
-// ── N7：sources 含 web ⇒ blocked 且 rationale 非空，不 spawn（与 N6 分开）──
+// ── E2b §1.1 W1 ⭐ 判别性：web-search ⇒ 派给 dr-worker-web（不再 blocked）──
+//   旧的 N7（`web` 卡 blocked、`WEB_BLOCK_RATIONALE`）死路径已在 E2b §1.2 删除：
+//   `dr-worker-web` 已由 E2a 在 agent-runtime 合入并真机验证，web 线索现在有 role、应当被正常派发。
 
-describe("N7: sources contains web ⇒ blocked with non-empty rationale, no dispatch", () => {
-  it("open card with sources ['web'] ⇒ block(web_unimplemented), no dispatch", () => {
-    expect(isWebSource(["web"])).toBe(true);
-    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
+describe("W1 ⭐: sources ['web-search'] ⇒ dispatch to dr-worker-web (no longer blocked)", () => {
+  it("web-search maps to dr-worker-web role", () => {
+    expect(roleForSources(["web-search"])).toBe("dr-worker-web");
+  });
+
+  it("open card with sources ['web-search'] ⇒ dispatch(dr-worker-web), NOT block", () => {
+    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web-search"] })] });
     const d = decideTick(s, cfg);
     expect(d).toEqual([
       {
-        kind: "block",
+        kind: "dispatch",
         clueId: "w",
-        reason: "web_unimplemented",
-        rationale: WEB_BLOCK_RATIONALE,
+        role: "dr-worker-web",
+        text: "investigate X",
+        depth: 0,
+        sources: ["web-search"],
       },
     ]);
-    expect(d.some((x) => x.kind === "dispatch")).toBe(false);
+    expect(d.some((x) => x.kind === "block")).toBe(false);
   });
 
-  it("the web block decision carries a non-empty rationale on the card", () => {
-    // ⛔ 判别性（spec §4.1 纪律 4/7）：不能只断言常量的长度/内容本身，
-    // 必须断言 decideTick 产出的 web block 决策真的携带该 rationale（会写进卡）。
-    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
-    const d = decideTick(s, cfg);
-    const block = d.find((x) => x.kind === "block");
-    expect(block?.kind).toBe("block");
-    if (block?.kind === "block") {
-      expect(block.reason).toBe("web_unimplemented");
-      expect(typeof block.rationale).toBe("string");
-      expect(block.rationale.length).toBeGreaterThan(0);
-      expect(block.rationale).toBe(WEB_BLOCK_RATIONALE);
-    }
+  it("DISCRIMINATING: removing the web-search→dr-worker-web mapping turns this red", () => {
+    // ⛔ 判别性（spec §2 W1）：把 SOURCE_TO_ROLE 的 web-search 映射删掉 ⇒ 这条断言变红。
+    //    用一个本地副本模拟「映射被删」：roleForSources(['web-search']) 必须真的解析到角色。
+    expect(SOURCE_TO_ROLE["web-search"]).toBe("dr-worker-web");
+    expect(roleForSources(["web-search"])).not.toBeNull();
   });
 });
 
-// ── N8：role 映射正确（四条各一例）────────────────────────────────
+// ── E2b §1.1 W7 ⭐ 判别性：content ⇒ 派给 dr-worker-content ──
 
-describe("N8: sources→role mapping is correct for the four roles", () => {
+describe("W7 ⭐: sources ['content'] ⇒ dispatch to dr-worker-content", () => {
+  it("content maps to dr-worker-content role", () => {
+    expect(roleForSources(["content"])).toBe("dr-worker-content");
+  });
+
+  it("open card with sources ['content'] ⇒ dispatch(dr-worker-content), NOT block", () => {
+    const s = state({ cards: [card({ clueId: "c", status: "open", sources: ["content"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([
+      {
+        kind: "dispatch",
+        clueId: "c",
+        role: "dr-worker-content",
+        text: "investigate X",
+        depth: 0,
+        sources: ["content"],
+      },
+    ]);
+    expect(d.some((x) => x.kind === "block")).toBe(false);
+  });
+});
+
+// ── N8：role 映射正确（六条各一例）────────────────────────────────
+
+describe("N8: sources→role mapping is correct for all six roles", () => {
   it("code-local → dr-worker-code-local", () => {
     expect(roleForSources(["code-local"])).toBe("dr-worker-code-local");
   });
@@ -394,11 +416,19 @@ describe("N8: sources→role mapping is correct for the four roles", () => {
   it("feishu → dr-worker-feishu", () => {
     expect(roleForSources(["feishu"])).toBe("dr-worker-feishu");
   });
-  it("SOURCE_TO_ROLE contains exactly the four roles", () => {
+  it("web-search → dr-worker-web (E2b)", () => {
+    expect(roleForSources(["web-search"])).toBe("dr-worker-web");
+  });
+  it("content → dr-worker-content (E2b)", () => {
+    expect(roleForSources(["content"])).toBe("dr-worker-content");
+  });
+  it("SOURCE_TO_ROLE contains exactly the six roles", () => {
     expect(Object.keys(SOURCE_TO_ROLE).sort()).toEqual([
       "code-local",
       "code-remote",
+      "content",
       "feishu",
+      "web-search",
       "wiki",
     ]);
   });
@@ -418,19 +448,48 @@ describe("N8: sources→role mapping is correct for the four roles", () => {
   });
 });
 
-describe("no-role enum member (web-search) ⇒ blocked (unmapped_source)", () => {
-  it("web-search is in-enum but has no role ⇒ block, no dispatch", () => {
-    expect(roleForSources(["web-search"])).toBeNull();
-    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web-search"] })] });
+// ── E2b §1.2 回归 ⛔：仓内不再有裸 "web" token / WEB_SOURCE / isWebSource 死路径 ──
+
+describe("E2b §1.2: dead web-block path removed; no bare 'web' source token", () => {
+  it("src/tick.ts has no WEB_SOURCE / isWebSource / WEB_BLOCK_RATIONALE / web_unimplemented", () => {
+    const srcPath = fileURLToPath(new URL("../src/tick.ts", import.meta.url));
+    const source = readFileSync(srcPath, "utf8");
+    expect(source).not.toMatch(/\bWEB_SOURCE\b/);
+    expect(source).not.toMatch(/\bisWebSource\b/);
+    expect(source).not.toMatch(/\bWEB_BLOCK_RATIONALE\b/);
+    expect(source).not.toMatch(/web_unimplemented/);
+  });
+
+  it("a bare 'web' source (not in enum) is treated as invalid_sources, not web_unimplemented", () => {
+    // ⛔ 判别性（spec §1.2）：裸 'web' 不在封闭枚举里（枚举 token 是 'web-search'），
+    //    所以它走 INVALID_SOURCES_RATIONALE，而不是已删除的 WEB_BLOCK_RATIONALE。
+    const s = state({ cards: [card({ clueId: "w", status: "open", sources: ["web"] })] });
     const d = decideTick(s, cfg);
     expect(d).toEqual([
       {
         kind: "block",
         clueId: "w",
-        reason: "unmapped_source",
-        rationale: UNMAPPED_SOURCE_RATIONALE,
+        reason: "invalid_sources",
+        rationale: INVALID_SOURCES_RATIONALE,
       },
     ]);
     expect(d.some((x) => x.kind === "dispatch")).toBe(false);
+  });
+});
+
+// ── W5 回归 ⛔：枚举外 / 枚举内无映射 role 仍走 blocked（不得放宽）──
+
+describe("W5: out-of-enum and in-enum-no-role sources still block (not relaxed by new roles)", () => {
+  it("out-of-enum source ⇒ block(invalid_sources) with INVALID_SOURCES_RATIONALE", () => {
+    const s = state({ cards: [card({ clueId: "x", status: "open", sources: ["bogus"] })] });
+    const d = decideTick(s, cfg);
+    expect(d).toEqual([
+      {
+        kind: "block",
+        clueId: "x",
+        reason: "invalid_sources",
+        rationale: INVALID_SOURCES_RATIONALE,
+      },
+    ]);
   });
 });

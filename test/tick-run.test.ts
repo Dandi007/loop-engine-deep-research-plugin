@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { decideTick, DEFAULT_TICK_CONFIG, WEB_BLOCK_RATIONALE } from "../src/tick";
+import { decideTick, DEFAULT_TICK_CONFIG, INVALID_SOURCES_RATIONALE } from "../src/tick";
 import type { BoardCard, BoardState, Decision } from "../src/tick";
 import {
   runWrite,
@@ -968,7 +968,7 @@ describe("N7: block rationale is written into the card on the real write path", 
 
     const result = await realCas(
       WIRE_CLUE_CHANNEL,
-      { clueId: "x", to: "blocked", from: "open", rationale: WEB_BLOCK_RATIONALE },
+      { clueId: "x", to: "blocked", from: "open", rationale: INVALID_SOURCES_RATIONALE },
       "nonce-block",
     );
 
@@ -978,7 +978,7 @@ describe("N7: block rationale is written into the card on the real write path", 
     expect(payload.status).toBe("blocked");
     expect(typeof payload.rationale).toBe("string");
     expect(String(payload.rationale).length).toBeGreaterThan(0);
-    expect(payload.rationale).toBe(WEB_BLOCK_RATIONALE);
+    expect(payload.rationale).toBe(INVALID_SOURCES_RATIONALE);
   });
 });
 

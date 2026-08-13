@@ -28,6 +28,7 @@ import {
   resolveRevision,
   MissingAllowedRootError,
   CODE_LOCAL_ROLE,
+  CONTENT_ROLE,
 } from "../src/tick-run";
 import type { WorkerInputPayload } from "../src/tick-run";
 
@@ -344,6 +345,66 @@ describe("F7: non-code-local roles are not blocked by missing allowed_root", () 
       expect(outcome?.spawns[0].spawned).toBe(true);
     });
   }
+});
+
+// ── E2b §1.1 W3：content worker 需要 allowed_root（读 spool 文件）──
+//    与 F5/F6 同构：无 root ⇒ 响亮失败零 spawn；有 root ⇒ spawn 参数带 allowed_root。
+
+describe("E2b W3: content role requires allowed_root (loud failure + zero spawn when missing)", () => {
+  it("content dispatch without allowed_root ⇒ MissingAllowedRootError naming allowed-root, zero spawn", async () => {
+    const marker = join(tmpdir(), `e2b-w3-miss-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+    const stub = makeAgentRunStub(marker);
+    const prevBin = process.env.AGENT_RUN_BIN;
+    process.env.AGENT_RUN_BIN = stub;
+    const clue = openClueMsg("clue_c", "investigate content", ["content"]);
+    stubBus([clue]);
+    try {
+      let err: unknown;
+      try {
+        await runChannelWrite({ channelId: WIRE_CHANNEL });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(MissingAllowedRootError);
+      expect((err as Error).message).toMatch(/allowed-root/);
+      // 零 spawn：marker 未创建。
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(marker, { force: true });
+      rmSync(dirname(stub), { recursive: true, force: true });
+      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
+      else process.env.AGENT_RUN_BIN = prevBin;
+    }
+  });
+
+  it("DISCRIMINATING: content dispatch WITH allowed_root ⇒ spawns once as dr-worker-content with allowed_root in argv/input", async () => {
+    const d = mkdtempSync(join(tmpdir(), "e2b-w3-content-"));
+    try {
+      const { blocks, outcome } = await runDispatch({ sources: ["content"], allowedRoot: d });
+      expect(blocks).toHaveLength(1);
+      expect(outcome?.spawns).toHaveLength(1);
+      expect(outcome?.spawns[0].spawned).toBe(true);
+      expect(outcome?.spawns[0].role).toBe(CONTENT_ROLE);
+      // ⛔ 判别性（spec §1.1 W3）：spawn 参数里带 allowed_root（argv --add-dir + input.allowed_root）。
+      expect(blocks[0].args).toContain("--add-dir");
+      const addDirIdx = blocks[0].args.indexOf("--add-dir");
+      expect(blocks[0].args[addDirIdx + 1]).toBe(d);
+      const parsed = JSON.parse(blocks[0].inputContent ?? "{}") as Record<string, unknown>;
+      expect(parsed.allowed_root).toBe(d);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("E2b W1: web-search dispatch spawns dr-worker-web (no allowed_root requirement)", () => {
+  it("web-search dispatch without allowed_root ⇒ spawns once as dr-worker-web", async () => {
+    const { blocks, outcome } = await runDispatch({ sources: ["web-search"] });
+    expect(blocks).toHaveLength(1);
+    expect(outcome?.spawns).toHaveLength(1);
+    expect(outcome?.spawns[0].spawned).toBe(true);
+    expect(outcome?.spawns[0].role).toBe("dr-worker-web");
+  });
 });
 
 // ── F8 + F9：非 git 目录 ⇒ 省略 revision；绝不填空串 ──────────────

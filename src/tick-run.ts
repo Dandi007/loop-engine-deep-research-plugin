@@ -4,7 +4,7 @@
  * 对已交付的 Decision 执行写动作（spec §1.2 / §3.2 第 2–3 步）：
  *   reclaim  → CAS 该卡到目标 status（open / explored / blocked）
  *   dispatch → CAS open → in_flight，把 `run_id` 写进卡（M7），CAS 成功后按 role 真正 spawn（A8c）
- *   block    → CAS 到 blocked（invalid_sources / web_unimplemented / unmapped_source）
+ *   block    → CAS 到 blocked（invalid_sources / unmapped_source）
  *
  * ⛔ 先 CAS 成功才算认领；CAS 失败（409）跳过该卡且不 spawn（M8 / N4）。
  * ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿，N5）。
@@ -183,8 +183,22 @@ export function isFrozenChannel(channelId: string): boolean {
   return FROZEN_CHANNEL_PATTERNS.some((re) => re.test(channelId));
 }
 
-/** A8f——`code-local` role：唯一需要 `allowed_root` 的 worker（spec §1.2）。 */
+/** A8f——`code-local` role（spec §1.2）。 */
 export const CODE_LOCAL_ROLE = "dr-worker-code-local";
+
+/** E2b——`content` role（E2b §1.1：content worker 要读 spool 文件，需 `allowed_root`）。 */
+export const CONTENT_ROLE = "dr-worker-content";
+
+/**
+ * A8f/E2b —— 需要 `allowed_root` 的 worker role 集合（spec §1.2 / E2b §1.1 W3）。
+ * - `dr-worker-code-local`：读 repo 根下的源文件（A8f）。
+ * - `dr-worker-content`：读 spool 文件（E2b §1.1 W3：content worker 要读 spool 文件，
+ *   spawn 参数里带 `allowed_root`）。
+ */
+export const ROLES_REQUIRING_ALLOWED_ROOT = [
+  CODE_LOCAL_ROLE,
+  CONTENT_ROLE,
+] as const;
 
 /** G2b —— triage role（agent-runtime 已交付 `dr-triage`）。 */
 export const TRIAGE_ROLE = "dr-triage";
@@ -346,14 +360,14 @@ export class MissingTriageQuestionError extends Error {
 }
 
 /**
- * A8f——一个 dispatch 决策映射到 `dr-worker-code-local` 而 `allowed_root` 未配置 ⇒
- * 当场响亮失败（spec §1.2），⛔ 绝不照常 spawn（那会产出零证据且看起来正常）。
- * 错误文本点名 `allowed-root`。
+ * A8f/E2b——一个 dispatch 决策映射到需要 `allowed_root` 的 role（`dr-worker-code-local` /
+ * `dr-worker-content`）而 `allowed_root` 未配置 ⇒ 当场响亮失败（spec §1.2 / E2b §1.1 W3），
+ * ⛔ 绝不照常 spawn（那会产出零证据且看起来正常）。错误文本点名 `allowed-root`。
  */
 export class MissingAllowedRootError extends Error {
   constructor(role: string) {
     super(
-      `A8f: dispatch mapped to "${role}" requires --allowed-root (the code-local worker reads sources from the repo root). Refusing to spawn a zero-evidence worker.`,
+      `A8f: dispatch mapped to "${role}" requires --allowed-root (the ${role} worker reads sources/spool files under the repo root). Refusing to spawn a zero-evidence worker.`,
     );
     this.name = "MissingAllowedRootError";
   }
@@ -847,8 +861,9 @@ export async function runWrite(
             // ⛔ spec §1.4 / P8：`agent-run` 解析不到 ⇒ **响亮失败**（非零退出 + 点名 agent-run），
             //    绝不静默 CAS 回 open（评审 finding：静默回退会让调度器看到 spawned:false、exit 0，
             //    而实际什么都没跑，形成 §0.1 的震荡危害）。仅对**其他** spawn 失败做 S2 补偿。
-            //    A8f：`code-local` 无 `allowed_root` 同样属配置错误 ⇒ 响亮失败（点名 allowed-root），
-            //    不 CAS 回 open、不静默产出零证据（spec §1.2 / F5）。
+            //    A8f/E2b：需要 `allowed_root` 的 role（code-local / content）无 `allowed_root`
+            //    同样属配置错误 ⇒ 响亮失败（点名 allowed-root），不 CAS 回 open、不静默产出零证据
+            //    （spec §1.2 / F5 / E2b §1.1 W3）。
             if (
               err instanceof AgentRunUnresolvedError ||
               err instanceof MissingAllowedRootError
@@ -882,7 +897,7 @@ export async function runWrite(
         break;
       }
       case "block": {
-        // block 决策源自 open 卡（invalid_sources / web_unimplemented / unmapped_source）⇒ 前置条件为 open。
+        // block 决策源自 open 卡（invalid_sources / unmapped_source）⇒ 前置条件为 open。
         // ⛔ 把 decision.rationale 写进卡（spec §1.2 N7：blocked 且 rationale 非空）。
         const result = await perform({
           clueId: decision.clueId,
@@ -1682,9 +1697,10 @@ export async function runChannelWrite(
     spawnWorker:
       opts.spawnWorker ??
       ((clueId, role, runId, input) => {
-        // A8f——`code-local` 无 `allowed_root` ⇒ 当场响亮失败（spec §1.2 / F5），零 spawn。
+        // A8f/E2b——需要 `allowed_root` 的 role（code-local / content）未配置 ⇒ 当场响亮失败
+        //    （spec §1.2 / E2b §1.1 W3：content worker 要读 spool 文件，spawn 参数带 allowed_root），零 spawn。
         const allowedRoot = opts.allowedRoot;
-        if (role === CODE_LOCAL_ROLE && !allowedRoot) {
+        if ((ROLES_REQUIRING_ALLOWED_ROOT as readonly string[]).includes(role) && !allowedRoot) {
           throw new MissingAllowedRootError(role);
         }
         // A8f——生产调用点真实传入 allowedRoot，并取引擎权威 revision（spec §1.3 / F3/F4）。

@@ -18,6 +18,8 @@ import {
   MissingEvidenceChannelError,
   OVER_MAX_DEPTH_RATIONALE,
   WorkerResultShapeError,
+  webEvidenceRejectionReason,
+  isContentFingerprint,
   type HarvestDeps,
   type HarvestBudget,
   type WorkerResultV1,
@@ -988,6 +990,210 @@ describe("B8: result exists + evidences empty array ⇒ casExplored true (discri
     });
     const deps = writeDeps(hd);
     const result = await runWrite(deps, [HARVEST_DECISION], 10);
+    expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
+  });
+});
+
+// ── E2b §1.3 ⭐ 活 URL 证据机械拒发（本包最重要的一条）───────────────
+//
+// 真机实证：dr-worker-web 会把活 URL 当证据出处交差（source:"web" + locator:"https://…"
+// + 空 revision + 引文摘自实时页面）。这道闸必须机械化在发布路径上。
+// ⛔ 条目级：一条不合规不得连坐整卡；⛔ 拒发记录不得回抄 quote 全文。
+
+describe("E2b §1.3 ⭐: webEvidenceRejectionReason shape predicates", () => {
+  it("web source + empty revision ⇒ rejected (live-page shape)", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "web",
+        locator: "https://ziglang.org/download/",
+        revision: "",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("web-search source + date revision ⇒ rejected (non-fingerprint)", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "web-search",
+        locator: "https://example.com",
+        revision: "2026-04-13",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("web source + 'latest' revision ⇒ rejected (non-fingerprint)", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "web",
+        locator: "https://example.com",
+        revision: "latest",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("bare http URL locator + empty revision (non-web source) ⇒ rejected (判据 B)", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "misc",
+        locator: "https://example.com",
+        revision: "",
+      }),
+    ).not.toBeNull();
+  });
+
+  it("web source + sha256 hex revision ⇒ NOT rejected (content fingerprint shape)", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "web",
+        locator: "web://example.com/snapshot",
+        revision: "a".repeat(64),
+      }),
+    ).toBeNull();
+  });
+
+  it("code source + non-URL locator + non-empty revision ⇒ NOT rejected", () => {
+    expect(
+      webEvidenceRejectionReason({
+        quote: "q",
+        claim: "c",
+        source: "code",
+        locator: "repo/File.ts",
+        revision: "abc123",
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("isContentFingerprint: hex + sha-family length", () => {
+  it("empty ⇒ false", () => {
+    expect(isContentFingerprint("")).toBe(false);
+  });
+  it("date / url / 'latest' ⇒ false", () => {
+    expect(isContentFingerprint("2026-04-13")).toBe(false);
+    expect(isContentFingerprint("https://example.com")).toBe(false);
+    expect(isContentFingerprint("latest")).toBe(false);
+  });
+  it("sha256 (64 hex) / sha1 (40 hex) / md5 (32 hex) ⇒ true", () => {
+    expect(isContentFingerprint("a".repeat(64))).toBe(true);
+    expect(isContentFingerprint("a".repeat(40))).toBe(true);
+    expect(isContentFingerprint("a".repeat(32))).toBe(true);
+  });
+  it("non-hex string of length 64 ⇒ false", () => {
+    expect(isContentFingerprint("z".repeat(64))).toBe(false);
+  });
+});
+
+describe("E2b §1.3 ⭐: harvestCard rejects live-URL evidence item-level (no whole-card veto)", () => {
+  it("one bad web evidence + one compliant evidence ⇒ bad NOT published, good published, card still CAS-explored", async () => {
+    // 真机实证形态：一条 source=web、locator=https://…、revision="" 的活 URL evidence，
+    // 同卡另一条合规 evidence（code://、非空 revision）。
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-1",
+          evidences: [
+            {
+              quote: "0.16.0 — 2026-04-13",
+              claim: "live url quote",
+              source: "web",
+              locator: "https://ziglang.org/download/",
+              revision: "",
+            },
+            {
+              quote: "static quote",
+              claim: "compliant",
+              source: "code",
+              locator: "repo/File.ts",
+              revision: "abc123",
+            },
+          ],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const report = await harvestCard(hd, HARVEST_CARD, "run-1", makeBudget(5));
+    // ⛔ 判别性（§1.3）：活 URL evidence 不发布。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(1);
+    expect(report.evidencePublished).toBe(1);
+    // ⛔ 拒发记录存在：含 clue_id 与失败判据，不含 quote 全文。
+    expect(report.evidenceRejections).toHaveLength(1);
+    const rej = report.evidenceRejections[0];
+    expect(rej.clueId).toBe("card_x");
+    expect(rej.index).toBe(0);
+    expect(typeof rej.reason).toBe("string");
+    expect(rej.reason.length).toBeGreaterThan(0);
+    expect(JSON.stringify(rej)).not.toContain("0.16.0 — 2026-04-13");
+    // ⛔ 不连坐：同卡合规 evidence 照常发布，整卡照常可 CAS explored。
+    expect(report.casExplored).toBe(true);
+    expect(report.skipped).toBe(false);
+  });
+
+  it("DISCRIMINATING: removing the rejection (all compliant) ⇒ 2 evidence published, 0 rejections", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-1",
+          evidences: [
+            { quote: "q1", claim: "c1", source: "code", locator: "a", revision: "r" },
+            { quote: "q2", claim: "c2", source: "wiki", locator: "P", revision: "v" },
+          ],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const report = await harvestCard(hd, HARVEST_CARD, "run-1", makeBudget(5));
+    expect(report.evidencePublished).toBe(2);
+    expect(report.evidenceRejections).toHaveLength(0);
+  });
+});
+
+describe("E2b §1.3 ⭐ (runWrite): live-URL web evidence not on bus; rejection recorded", () => {
+  it("web evidence with bare URL + empty revision ⇒ not published, rejection in harvestReports", async () => {
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-1",
+          evidences: [
+            {
+              quote: "live quote",
+              claim: "live claim",
+              source: "web",
+              locator: "https://example.com/page",
+              revision: "",
+            },
+            { quote: "q2", claim: "c2", source: "code", locator: "a", revision: "r" },
+          ],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const deps = writeDeps(hd);
+    const result = await runWrite(deps, [HARVEST_DECISION], 10);
+    // ⛔ 判别性：活 URL evidence 不上 bus；只有 1 条合规 evidence 发布。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(1);
+    expect(result.harvestReports).toHaveLength(1);
+    expect(result.harvestReports[0].evidencePublished).toBe(1);
+    expect(result.harvestReports[0].evidenceRejections).toHaveLength(1);
+    // 拒发记录点名 clue_id 与判据；不回抄 quote。
+    const rej = result.harvestReports[0].evidenceRejections[0];
+    expect(rej.clueId).toBe("card_x");
+    expect(rej.locatorShape).toBe("http-url");
+    expect(rej.revisionShape).toBe("empty");
+    expect(JSON.stringify(result.harvestReports[0].evidenceRejections)).not.toContain("live quote");
+    // 活性：同卡合规 evidence 照常发布，整卡 CAS explored。
     expect(result.casResults.some((c) => c.to === "explored")).toBe(true);
   });
 });

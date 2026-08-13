@@ -11,48 +11,44 @@ import { randomUUID } from "node:crypto";
 import type { ClueV2 } from "./protocol";
 import type { WorkerInputPayload } from "./tick-run";
 
-/** 封闭枚举：sources 取值只能来自这里（spec §4）。 */
+/** 封闭枚举：sources 取值只能来自这里（spec §4 / E2b §1.1：新增 `content`）。 */
 export const SOURCE_ENUM = [
   "code-local",
   "code-remote",
   "wiki",
   "feishu",
   "web-search",
+  "content",
 ] as const;
 
 /**
- * A8c —— R1a 的 4 个 worker role 的 sources→role 映射（spec §1.2）。
- * ⛔ `web` 暂无对应 role（`dr-worker-web` 未做，spec §4.3 机制未定）；
- *    枚举内但无 role 的 source（如 `web` / `web-search`）⇒ 卡 blocked，不得派给别的 role。
+ * sources→role 映射（spec §1.2 / E2b §1.1）。
+ * E2a 已在 agent-runtime 合入 `dr-worker-web`、`dr-worker-content` 两个 role；
+ * 本包把这两个 role 在调度侧接上：
+ *   - `web-search → dr-worker-web`
+ *   - `content → dr-worker-content`
+ * ⛔ 既有四条映射逐字不变（spec §1.1：⛔ 既有四条映射逐字不变）。
+ * ⛔ 不得把一个无 role 的 source 静默派给别的 role。
  */
 export const SOURCE_TO_ROLE: Record<string, string> = {
   "code-local": "dr-worker-code-local",
   "code-remote": "dr-worker-code-remote",
   "wiki": "dr-worker-wiki",
   "feishu": "dr-worker-feishu",
+  "web-search": "dr-worker-web",
+  "content": "dr-worker-content",
 };
 
-/** `web` source 的识别 token（spec §1.2：枚举内但暂无 role）。 */
-export const WEB_SOURCE = "web";
-
-/** `web` 卡 blocked 时的明确 rationale（N7：非空）。 */
-export const WEB_BLOCK_RATIONALE =
-  "source 'web' has no worker role (dr-worker-web not implemented; spec §4.3 mechanism undecided)";
 /** 枚举外 `sources` 卡 blocked 时的明确 rationale（N6：blocked 且可解释）。 */
 export const INVALID_SOURCES_RATIONALE =
   "source list contains values outside the closed enum (spec §4); cannot map to a worker role";
-/** 枚举内但无已映射 role 的 `sources` 卡 blocked 时的明确 rationale。 */
+/** 枚举内但无已映射 role 的 `sources` 卡 blocked 时的 rationale。 */
 export const UNMAPPED_SOURCE_RATIONALE =
   "source list has no mapped worker role; cannot dispatch (spec §1.2)";
 
-/** `web` 是否出现在 sources 中（spec §1.2：必须走 blocked 分支，不得静默跳过/派给别的 role）。 */
-export function isWebSource(sources: string[]): boolean {
-  return sources.includes(WEB_SOURCE);
-}
-
 /**
  * 把 clue 的 `sources` 映射到唯一 role（spec §1.2）。
- * 命中任一已映射 source 即返回其 role；无任何已映射 source（如 `web` / `web-search`）⇒ null，
+ * 命中任一已映射 source 即返回其 role；无任何已映射 source（枚举内但无 role）⇒ null，
  * 由调用方决定该卡 blocked。⛔ 不得把一个无 role 的 source 静默派给别的 role。
  */
 export function roleForSources(sources: string[]): string | null {
@@ -147,7 +143,7 @@ export type Decision =
   | {
       kind: "block";
       clueId: string;
-      reason: "invalid_sources" | "web_unimplemented" | "unmapped_source";
+      reason: "invalid_sources" | "unmapped_source";
       /** 该卡 blocked 的明确 rationale（N7：blocked 且 rationale 非空，写进卡）。 */
       rationale: string;
     }
@@ -255,15 +251,6 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
   let dispatched = 0;
   for (const card of open) {
     if (dispatched >= n) break;
-    if (isWebSource(card.sources)) {
-      decisions.push({
-        kind: "block",
-        clueId: card.clueId,
-        reason: "web_unimplemented",
-        rationale: WEB_BLOCK_RATIONALE,
-      });
-      continue;
-    }
     if (!isValidSources(card.sources)) {
       decisions.push({
         kind: "block",
@@ -275,7 +262,7 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
     }
     const role = roleForSources(card.sources);
     if (!role) {
-      // 枚举内但无任何已映射 role 的 source（如 `web-search`）⇒ blocked（不 spawn）。
+      // 枚举内但无任何已映射 role 的 source ⇒ blocked（不 spawn）。
       decisions.push({
         kind: "block",
         clueId: card.clueId,

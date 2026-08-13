@@ -241,6 +241,79 @@ export interface HarvestBudget {
   consume(n: number): void;
 }
 
+/**
+ * E2b §1.3 ⭐ —— 一条 web 类 evidence 被机械拒发的判据（本包最重要的一条）。
+ *
+ * 真机实证：`dr-worker-web` 会把活 URL 当证据出处交差（`source:"web"` + `locator:"https://…"`
+ * + 空 `revision` + 引文直接摘自实时页面）。按宪法第十一条（闸门归代码），这道闸必须机械化
+ * 在发布路径上。本函数是**形态**判定（不查存在性——存在性核验属 E3）：
+ *
+ *   - source 为 web 类（含 "web"、"web-search"）且 `revision` 非内容指纹形态 ⇒ 拒发；
+ *   - locator 为裸 `http(s)://` URL 而 `revision` 为空（"直接引用活页面"的形状）⇒ 拒发；
+ *   - 命中 ⇒ 该条 evidence 不发布，⛔ 不连坐整张卡的其余 evidence（与既有失败粒度纪律同构）。
+ *
+ * 「内容指纹形态」= 纯十六进制、长度落在常见内容摘要（sha256=64 / sha1=40 / md5=32）语义内。
+ * 空串、日期、URL、"latest" 一类一律视为非指纹形态。
+ *
+ * @returns 拒发原因（字符串，不含 quote 全文）；返回 null 表示合规、可发布。
+ */
+export function webEvidenceRejectionReason(item: WorkerEvidenceItem): string | null {
+  const source = (item.source ?? "").trim();
+  const locator = (item.locator ?? "").trim();
+  const revision = (item.revision ?? "").trim();
+  const isWebClass = source === "web" || source === "web-search" || source === "web-search-engine";
+  const isHttpLocator = /^https?:\/\//i.test(locator);
+
+  // 判据 A：web 类 source 的 revision 必须是内容指纹形态。
+  if (isWebClass) {
+    if (!isContentFingerprint(revision)) {
+      return "web evidence revision is not a content fingerprint (hex, sha256/sha1/md5 length); refusing to publish a live-URL-sourced evidence with no replayable snapshot";
+    }
+  }
+
+  // 判据 B：裸 http(s):// locator + 空 revision ⇒ 正是"直接引用活页面"的形状，拒发。
+  if (isHttpLocator && revision === "") {
+    return "evidence locator is a bare http(s) URL with empty revision (live-page citation shape); refusing to publish without a replayable snapshot";
+  }
+
+  return null;
+}
+
+/**
+ * E2b §1.3 —— 判定一个字符串是否为「内容指纹形态」：纯小写十六进制、长度落在常见摘要算法范围内。
+ * sha256=64、sha1=40、md5=32（以及其它偶数长度 32..64 的纯十六进制串一律放行，留出向后兼容）。
+ * ⛔ 空串、日期、URL、"latest"、含非十六进制字符的串一律视为非指纹形态。
+ */
+export function isContentFingerprint(s: string): boolean {
+  if (!s) return false;
+  // 纯小写十六进制（允许大写归一化为小写比较）。
+  if (!/^[0-9a-fA-F]+$/.test(s)) return false;
+  const len = s.length;
+  // 常见摘要长度：md5(32) / sha1(40) / sha256(64)；以及偶数长度 32..64 的纯十六进制兼容放行。
+  if (len === 32 || len === 40 || len === 64) return true;
+  if (len >= 32 && len <= 64 && len % 2 === 0) return true;
+  return false;
+}
+
+/**
+ * E2b §1.3 ⭐ —— 一条 evidence 被机械拒发的记录（写进运行记录，便于排障）。
+ * ⛔ 不得回抄 quote 全文（避免把未经核验的内容再落一遍）。只记 clue_id / 判据 / source/locator 形态摘要。
+ */
+export interface EvidenceRejection {
+  /** 被拒发的 evidence 所属的卡（点名 clue_id，spec §1.3）。 */
+  clueId: string;
+  /** 该条 evidence 在 worker.result.v1.evidences 中的稳定序号（便于回查，不回抄 quote）。 */
+  index: number;
+  /** 拒发原因（与 webEvidenceRejectionReason 返回值一致，点名失败的判据）。 */
+  reason: string;
+  /** source 字段值（用于排障；非 quote 正文）。 */
+  source: string;
+  /** locator 形态摘要（仅记是否 http(s) URL，不回抄完整 URL 正文，避免再落活链接）。 */
+  locatorShape: "http-url" | "other";
+  /** revision 形态摘要（是否为指纹形态、长度；不回抄 revision 正文）。 */
+  revisionShape: "empty" | "fingerprint" | "other";
+}
+
 /** 一张卡收割后的报告（H12/H13 要求显式报告跳过数，不得无声截断）。 */
 export interface HarvestReport {
   clueId: string;
@@ -255,6 +328,11 @@ export interface HarvestReport {
   cluesPublished: number;
   /** 因 maxClues 封顶被跳过的 clue 条数（H12：显式报告）。 */
   skippedClues: number;
+  /**
+   * E2b §1.3 ⭐ —— 被机械拒发的 evidence 记录（条目级，不连坐整卡）。
+   * 每条点名 clue_id、稳定序号、失败的判据；⛔ 不含 quote 全文。
+   */
+  evidenceRejections: EvidenceRejection[];
   /** true ⇒ 上层应在所有发布完成后 CAS 到 explored（§1.1 / H6）。 */
   casExplored: boolean;
 }
@@ -284,6 +362,7 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
+      evidenceRejections: [],
       casExplored: false,
     };
   }
@@ -318,6 +397,7 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: clueItems.length,
+      evidenceRejections: [],
       casExplored: false,
     };
   }
@@ -325,6 +405,7 @@ export async function harvestCard(
   let evidencePublished = 0;
   let cluesPublished = 0;
   let skippedClues = clueItems.length;
+  const evidenceRejections: EvidenceRejection[] = [];
   // ⛔ maxClues 运行计数：`boardClueCount` 是**共享可变对象**（runWrite 把同一 `deps.harvest`
   //    传给每张 harvest 卡）。每发一条新 clue 就把 `.value` +1，从而单张卡（或多张卡累计）
   //    都不会把板面冲到 maxClues 之上（§1.6 / H12；attempt 2 major finding：卡间必须累计）。
@@ -332,8 +413,30 @@ export async function harvestCard(
   const boardClueCount = hd.boardClueCount;
 
   // 先发 evidence（幂等键：dr-evidence:<run_id>:<index>，§1.2 / H8 / H9）。
+  // E2b §1.3 ⭐——条目级机械拒发：活 URL evidence 不发布，但**不连坐**整张卡的其余 evidence。
+  //    命中 ⇒ 该条不发布，把拒发原因写进 evidenceRejections（点名 clue_id 与失败判据），
+  //    ⛔ 不回抄 quote 全文；同卡合规 evidence 照常发布。
   for (let i = 0; i < evItems.length; i += 1) {
-    const evidence = evidenceFromWorker(card.clueId, evItems[i]);
+    const item = evItems[i];
+    const rejection = webEvidenceRejectionReason(item);
+    if (rejection) {
+      evidenceRejections.push({
+        clueId: card.clueId,
+        index: i,
+        reason: rejection,
+        source: (item.source ?? "").slice(0, 32),
+        locatorShape: /^https?:\/\//i.test((item.locator ?? "").trim())
+          ? "http-url"
+          : "other",
+        revisionShape: (item.revision ?? "").trim() === ""
+          ? "empty"
+          : isContentFingerprint((item.revision ?? "").trim())
+            ? "fingerprint"
+            : "other",
+      });
+      continue;
+    }
+    const evidence = evidenceFromWorker(card.clueId, item);
     await hd.publishEvidence(
       hd.evidenceChannelId,
       evidence,
@@ -362,6 +465,7 @@ export async function harvestCard(
     evidencePublished,
     cluesPublished,
     skippedClues,
+    evidenceRejections,
     casExplored: true,
   };
 }

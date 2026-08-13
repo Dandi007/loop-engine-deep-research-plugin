@@ -348,6 +348,81 @@ describe("Y3: 多 tick 中任一失败即失败，且报告全部失败的 run_d
   });
 });
 
+describe("Y5: tick 以 exec_failed / status=TIMEOUT 死亡 ⇒ 响亮失败并点名 run_dir 与 status", () => {
+  it("tick journal contains [外部调用失败 status=TIMEOUT] ⇒ non-zero exit, reports run_dir and status", () => {
+    const drainId = "test-drain-y5";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y5");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeJournal(
+      join(runDir, "journal.jsonl"),
+      "[外部调用失败 status=TIMEOUT]",
+    );
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y5",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("status=TIMEOUT");
+    expect(res.err).toContain("[外部调用失败 status=TIMEOUT]");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("Y5 reverse: if exec_failed treated as not-yet-converged, script exits 0", () => {
+    const drainId = "test-drain-y5-reverse";
+    const { dir, cli, storeCli, engineRoot, runsRoot, runDir } =
+      setUpFakeEnv("y5-reverse");
+
+    writeFakeCli(cli, drainJson(drainId, runsRoot), 0);
+    writeFakeStoreCli(storeCli);
+    writeIndexEntry(join(engineRoot, "index.jsonl"), {
+      drain_id: drainId,
+      lane: "tick",
+      run_dir: runDir,
+      tick: 1,
+    });
+    writeJournal(
+      join(runDir, "journal.jsonl"),
+      "[外部调用失败 status=TIMEOUT]",
+    );
+
+    const res = runScript({
+      LOOP_ENGINE_CLI: cli,
+      LOOP_STORE_CLI: storeCli,
+      LOOP_ENGINE_RUNNER: "node",
+      LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      TICK_CHANNEL: "research:test-y5-reverse",
+      RESEARCH_QUESTION: "test research question",
+    });
+
+    // The fix makes this non-zero; if the implementation were broken
+    // (only matching [bash 非零退出]), this would be 0 instead.
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("TICK FAILURE");
+    expect(res.err).toContain(runDir);
+    expect(res.err).toContain("status=TIMEOUT");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("Y4: 痕迹不可读 ⇒ 响亮失败", () => {
   it("index.jsonl missing ⇒ non-zero exit and names index.jsonl", () => {
     const drainId = "test-drain-y4a";

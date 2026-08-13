@@ -10,9 +10,13 @@
  *  - R5  不得靠真实等待把用例拖慢：用例注入极小 poll 间隔
  *  - R6  断言打在生产组装出的 deps 上
  */
-import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach, beforeAll, afterAll } from "vitest";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+import { createServer } from "node:http";
 import {
   runChannelWrite,
   assembleGenerateDeps,
@@ -21,6 +25,7 @@ import {
   DEFAULT_AGENT_RESULT_POLL_MS,
   GenerateWorkerExitedWithoutResultError,
   TriageWorkerExitedWithoutResultError,
+  checkRunExited,
 } from "../src/tick-run";
 import type { RunWriteOptions, WriteCasInput } from "../src/tick-run";
 import type { GenerateDeps, AnchorCheckResult } from "../src/generate";
@@ -32,6 +37,17 @@ import {
   type TriageResultDecision,
 } from "../src/tick-inspect";
 import type { TerminationState, BoardState } from "../src/tick";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const WORKFLOW_YAML = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
+let ENGINE_NODE_TIMEOUT_SECONDS = 30;
+try {
+  const wf = parse(readFileSync(WORKFLOW_YAML, "utf8"));
+  if (wf?.limits?.node_timeout && typeof wf.limits.node_timeout === "number") {
+    ENGINE_NODE_TIMEOUT_SECONDS = wf.limits.node_timeout;
+  }
+} catch { /* use default */ }
+const NODE_TIMEOUT_HALF_MS = ENGINE_NODE_TIMEOUT_SECONDS * 500;
 
 const CHANNEL = "research:p06-g6-result-timeout";
 
@@ -722,9 +738,25 @@ describe("E0c6 §2 criterion 2 (GT-17): generate worker exited without result �
   it("GT-17a: generate worker exits without result ⇒ tick still returns 0, generateError is set, other decisions proceed", async () => {
     const cards = [exploredClueMsg("c1", 1)];
     const oneShotDir = uniqueOneShotDir("gt17a");
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
 
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        return messagesResponse([
+          {
+            message_id: "msg_exited_v1",
+            channel_id: "board:agent-runs",
+            channel_seq: 200,
+            kind: "agent.run.exited.v1",
+            payload: { run_id: "gt17-run-001", exit_code: 0 },
+            entity_id: "gt17-run-001",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:02Z",
+          },
+        ]);
+      }
       if (url.includes("/messages")) return messagesResponse(cards);
       if (url.includes("/entities")) return jsonResponse({ head: null });
       return emptyMessagesResponse();
@@ -736,8 +768,28 @@ describe("E0c6 §2 criterion 2 (GT-17): generate worker exited without result �
       readQuestion: async () => "test question",
       readOrigin: async () => "test-origin",
       readEvidences: async () => [],
-      spawnRole: async () => {
-        throw new GenerateWorkerExitedWithoutResultError("gt17-run-001", "dr-synthesizer", 3159);
+      spawnRuntime: {
+        agentRunBin: "/fake/agent-run",
+        newRunId: () => "gt17-run-001",
+        spawnProcess: async () => {
+          return {};
+        },
+        readBody: async (runId: string) => {
+          const startTime = Date.now();
+          const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+          const deadline = startTime + timeoutMs;
+          while (Date.now() < deadline) {
+            const result = await readGenerateResult(runId);
+            if (result) return result.body;
+            const exited = await checkRunExited(runId);
+            if (exited) {
+              const waitedMs = Date.now() - startTime;
+              throw new GenerateWorkerExitedWithoutResultError(runId, "generate", waitedMs);
+            }
+            await new Promise((r) => setTimeout(r, pollMs));
+          }
+          throw new Error(`G4c: timed out waiting for generate result for run ${runId}`);
+        },
       },
       spawnAnchorCheck: async () => anchorResult(),
       spawnExport: async () => {},
@@ -957,14 +1009,50 @@ describe("E0c6 §2 criterion 3 (GT-14): checkRunExited short-circuits result-wai
     expect(boardAgentRunsReads).toBeGreaterThanOrEqual(2);
   });
 
-  it("GT-14b: TriageWorkerExitedWithoutResultError is thrown when run exits without triage result", async () => {
-    const err = new TriageWorkerExitedWithoutResultError("test-run-id", 1234);
-    expect(err).toBeInstanceOf(TriageWorkerExitedWithoutResultError);
-    expect(err.name).toBe("TriageWorkerExitedWithoutResultError");
-    expect(err.message).toContain("test-run-id");
-    expect(err.message).toContain("dr-triage");
-    expect(err.message).toContain("exited without producing");
-    expect(err.message).toContain("1234");
+  it("GT-14b: agent.run.exited.v1 on board:agent-runs ⇒ checkRunExited returns true ⇒ generate readBody short-circuits immediately", async () => {
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
+
+    const generateRunId = "g6-gt14b-gen-run";
+    let boardAgentRunsReads = 0;
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        boardAgentRunsReads += 1;
+        return messagesResponse([
+          {
+            message_id: "msg_exited_v1",
+            channel_id: "board:agent-runs",
+            channel_seq: 200,
+            kind: "agent.run.exited.v1",
+            payload: { run_id: generateRunId, exit_code: 0 },
+            entity_id: generateRunId,
+            supersedes: null,
+            created_at: "2026-08-01T00:00:02Z",
+          },
+        ]);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const deps = assembleGenerateDeps(
+      { channelId: CHANNEL, workerCmd: "/fake/agent-run" },
+      termState(),
+      boardState(),
+    );
+
+    try {
+      await deps.spawnRuntime!.readBody(generateRunId);
+      expect.fail("expected GenerateWorkerExitedWithoutResultError");
+    } catch (e) {
+      const err = e as Error;
+      expect(err).toBeInstanceOf(GenerateWorkerExitedWithoutResultError);
+      expect(err.message).toContain(generateRunId);
+      expect(err.message).toContain("exited without producing");
+      expect(err.message).toContain("dr-doc.result.v1");
+      expect(boardAgentRunsReads).toBeGreaterThanOrEqual(1);
+    }
   });
 
   it("GT-14c reverse: if no agent.run.exited.v1 appears, the triage path falls through to the full timeout (not short-circuited), and the test would reject", async () => {
@@ -1013,7 +1101,48 @@ describe("E0c6 §2 criterion 3 (GT-14): checkRunExited short-circuits result-wai
 
 // ─── E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick under half node_timeout ──
 
-describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under half engine node_timeout (30s)", () => {
+describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under half engine node_timeout", () => {
+  let fakeBusPort = 0;
+  let fakeBusServer: ReturnType<typeof createServer> | undefined;
+
+  beforeAll(async () => {
+    const server = createServer((_req, res) => {
+      const url = new URL(_req.url ?? "/", `http://127.0.0.1:${fakeBusPort}`);
+      const path = url.pathname;
+      if (_req.method === "GET" && /^\/v1\/channels\/[^/]+\/messages/.test(path)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ messages: [] }));
+        return;
+      }
+      if (_req.method === "GET" && /^\/v1\/entities\/[^/]+$/.test(path)) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ code: "NOT_FOUND" }));
+        return;
+      }
+      if (_req.method === "POST" && /^\/v1\/channels\/[^/]+\/publish/.test(path)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ message_id: "pub_001", channel_seq: 1, deduplicated: false }));
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ code: "NOT_FOUND" }));
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (addr && typeof addr === "object") fakeBusPort = addr.port;
+        resolve();
+      });
+    });
+    fakeBusServer = server;
+  });
+
+  afterAll(() => {
+    if (fakeBusServer) {
+      fakeBusServer.close();
+    }
+  });
+
   beforeEach(() => {
     capturedTriageRunId = "";
     capturedGenerateRunId = "";
@@ -1027,7 +1156,7 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     delete process.env.AGENT_RESULT_POLL_MS;
   });
 
-  it("GT-16a: seed board with 1 clue completes under 15 seconds (half of node_timeout=30) and termination is readable", async () => {
+  it("GT-16a: seed board with 1 clue completes under half the engine node_timeout and termination is readable", async () => {
     process.env.AGENT_RESULT_TIMEOUT_MS = "500";
     process.env.AGENT_RESULT_POLL_MS = "10";
 
@@ -1035,24 +1164,18 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
       clueMsg("seed-1", { status: "proposed" }, 1),
     ];
 
+    const nativeFetch = globalThis.fetch.bind(globalThis);
     let msgReads = 0;
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("board:agent-runs")) return emptyMessagesResponse();
-      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("board:agent-runs")) {
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/board%3Aagent-runs/messages`, init);
+      }
+      if (url.includes("/publish")) {
+        return nativeFetch(input, init);
+      }
       if (url.includes("/v1/entities/")) {
-        return jsonResponse({
-          head: {
-            message_id: "head_001",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "proposed", text: "clue" },
-            entity_id: "seed-1",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        });
+        return nativeFetch(input, init);
       }
       if (url.includes("/messages")) {
         msgReads += 1;
@@ -1069,7 +1192,7 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     });
     const elapsed = Date.now() - start;
 
-    expect(elapsed).toBeLessThan(15_000);
+    expect(elapsed).toBeLessThan(NODE_TIMEOUT_HALF_MS);
     expect(result.termination).toBeDefined();
     expect(result.termination).toHaveProperty("state");
     expect(result.termination).toHaveProperty("coverage");
@@ -1078,6 +1201,9 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     expect(result.termination).toHaveProperty("boardComposition");
     expect(result.decisions).toBeDefined();
     expect(result.messageCount).toBe(1);
+    expect(result.timings).toBeDefined();
+    expect(result.timings!.totalMs).toBeGreaterThan(0);
+    expect(result.timings!.busReadMs).toBeGreaterThan(0);
   });
 
   it("GT-16b: time-based polling with AGENT_RESULT_TIMEOUT_MS/POL_MS does not cause the seed tick to exceed half node_timeout", async () => {
@@ -1088,24 +1214,18 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
       clueMsg("seed-1", { status: "proposed" }, 1),
     ];
 
+    const nativeFetch = globalThis.fetch.bind(globalThis);
     let msgReads = 0;
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+    vi.stubGlobal("fetch", async (input: RequestInfo, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("board:agent-runs")) return emptyMessagesResponse();
-      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("board:agent-runs")) {
+        return nativeFetch(`http://127.0.0.1:${fakeBusPort}/v1/channels/board%3Aagent-runs/messages`, init);
+      }
+      if (url.includes("/publish")) {
+        return nativeFetch(input, init);
+      }
       if (url.includes("/v1/entities/")) {
-        return jsonResponse({
-          head: {
-            message_id: "head_001",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "proposed", text: "clue" },
-            entity_id: "seed-1",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        });
+        return nativeFetch(input, init);
       }
       if (url.includes("/messages")) {
         msgReads += 1;
@@ -1122,8 +1242,10 @@ describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under h
     });
     const elapsed = Date.now() - start;
 
-    expect(elapsed).toBeLessThan(15_000);
+    expect(elapsed).toBeLessThan(NODE_TIMEOUT_HALF_MS);
     expect(result.termination).toHaveProperty("state");
     expect(result.termination).toHaveProperty("coverage");
+    expect(result.timings).toBeDefined();
+    expect(result.timings!.totalMs).toBeGreaterThan(0);
   });
 });

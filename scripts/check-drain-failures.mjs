@@ -70,10 +70,16 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
-    const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
-    if (m) {
+    const bashMatch = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
+    if (bashMatch) {
       failed = true;
-      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${bashMatch[1]}\n`);
+      process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+    }
+    const extMatch = line.match(/\[外部调用失败 status=(\S+)\]/);
+    if (extMatch) {
+      failed = true;
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} status=${extMatch[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
     }
   }

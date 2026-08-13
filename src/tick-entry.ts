@@ -46,7 +46,7 @@ usage:
                      重复播种不会翻倍。channel 不存在 ⇒ 响亮失败并点名；零线索 ⇒ 响亮失败。
                      E0c1 §1.4 / GT-2：--source 必填且非空（真机：sources=[] 的 clue 会被结构性
                      卡为 blocked、派不出 worker）；缺失 ⇒ 响亮失败，⛔ 不静默播一条 sources:[] 的线索。
-... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>]
+... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>] [--triage-threshold <n>] [--max-clues <n>]
                      写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
                      G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经
                              本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；
@@ -70,6 +70,8 @@ usage:
        --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；
        --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；
        --prev-coverage/--prev-zero-growth 上一 tick 的覆盖度/零增长轮数（跨 tick 终止计数，由续投 trigger body 承载）；
+       --triage-threshold 触发 triage 的 proposed 最小数量（缺省 3）；
+       --max-clues 研究范围收窄，触顶上限（缺省 64，由 profile 声明）。
         拒绝写 v1 冻结 channel。
   JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。
   JSON 输出含 termination：本轮终态判定（G4b，用本轮真实板面调用 decideTermination；coverage/zeroGrowthRounds 续投时写入下一条 trigger body）。

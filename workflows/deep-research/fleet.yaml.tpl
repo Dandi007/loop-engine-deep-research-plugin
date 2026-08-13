@@ -23,6 +23,9 @@ pipelines:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），
       # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
       triage_threshold: ${TRIAGE_THRESHOLD}
+      # E0c6 §2 —— 研究范围收窄（--max-clues）：由 bin 导出 MAX_CLUES（缺省 64），
+      # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
+      max_clues: ${MAX_CLUES}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

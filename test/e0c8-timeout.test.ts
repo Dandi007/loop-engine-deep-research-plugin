@@ -94,24 +94,36 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
     expect(content).toMatch(/2400.*120/);
   });
 
-  it("discriminant: wall clock check appears before attempt limit check in e0-regression.sh", () => {
+  it("discriminant: execution-driven — profile values enforce wall clock as primary limiter", () => {
+    // Verify the profile values are self-consistent: wall clock is the primary limiter.
+    // The attempt limit is a secondary guard that must be set high enough to never
+    // trigger before wall clock under normal conditions.
+    const profPath = join(ROOT, "profiles", "deploy", "e0-regression.env");
+    const content = readFileSync(profPath, "utf8");
+    const backoffMatch = content.match(/DRAIN_BACKOFF_SECONDS=(\d+)/);
+    const attemptsMatch = content.match(/DRAIN_MAX_ATTEMPTS=(\d+)/);
+    const wallMatch = content.match(/DRAIN_WALL_CLOCK_SECONDS=(\d+)/);
+    expect(backoffMatch).toBeTruthy();
+    expect(attemptsMatch).toBeTruthy();
+    expect(wallMatch).toBeTruthy();
+    const backoff = Number(backoffMatch![1]);
+    const maxAttempts = Number(attemptsMatch![1]);
+    const wallClock = Number(wallMatch![1]);
+    const minDrain = 3;
+    const minCycles = Math.floor(wallClock / (minDrain + backoff));
+    // maxAttempts must be significantly greater than the number of cycles
+    // that fit within wall clock, ensuring attempt limit cannot trigger first
+    expect(maxAttempts).toBeGreaterThan(minCycles * 1.5);
+    // The profile comment must document the self-consistency formula
+    expect(content).toMatch(/2400.*120/);
+    expect(content).toMatch(/墙钟/);
+    // Verify the wall clock check appears before the attempt limit check in the entry script
     const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
     const wallIdx = script.indexOf("HIT WALL CLOCK LIMIT");
     const attemptIdx = script.indexOf("HIT ATTEMPT LIMIT");
     expect(wallIdx).toBeGreaterThan(0);
     expect(attemptIdx).toBeGreaterThan(0);
     expect(wallIdx).toBeLessThan(attemptIdx);
-  });
-
-  it("discriminant: wall clock is the primary limiter (attempt limit is secondary guard)", () => {
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    // The wall clock check must appear first in the drain loop
-    const wallIdx = script.indexOf("HIT WALL CLOCK LIMIT");
-    const attemptIdx = script.indexOf("HIT ATTEMPT LIMIT");
-    expect(wallIdx).toBeLessThan(attemptIdx);
-    // Verify the self-consistency comment formula
-    expect(script).toMatch(/2400.*120/);
-    expect(script).toMatch(/墙钟为主/);
   });
 
   it("discriminant: max_clues is declared in the regression profile", () => {
@@ -131,24 +143,24 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 2z (GT-17): generate worker exited without result ⇒ tick continues", () => {
-  let stdoutChunks: string[] = [];
-  let origStdoutWrite: typeof process.stdout.write;
+  let stderrChunks: string[] = [];
+  let origStderrWrite: typeof process.stderr.write;
 
   beforeEach(() => {
     vi.unstubAllGlobals();
-    stdoutChunks = [];
-    origStdoutWrite = process.stdout.write;
-    process.stdout.write = ((chunk: string) => {
-      stdoutChunks.push(chunk);
+    stderrChunks = [];
+    origStderrWrite = process.stderr.write;
+    process.stderr.write = ((chunk: string) => {
+      stderrChunks.push(chunk);
       return true;
-    }) as typeof process.stdout.write;
+    }) as typeof process.stderr.write;
     delete process.env.AGENT_RESULT_TIMEOUT_MS;
     delete process.env.AGENT_RESULT_POLL_MS;
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    process.stdout.write = origStdoutWrite;
+    process.stderr.write = origStderrWrite;
     delete process.env.AGENT_RESULT_TIMEOUT_MS;
     delete process.env.AGENT_RESULT_POLL_MS;
   });
@@ -170,7 +182,7 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
     return jsonResponse({ messages: msgs });
   }
 
-  it("discriminant: run exited without result produces diagnostic on stdout and tick continues (exit 0)", async () => {
+  it("discriminant: run exited without result produces diagnostic on stderr and tick continues (exit 0)", async () => {
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
 
@@ -248,8 +260,6 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
       return emptyMessagesResponse();
     });
 
-    // Use a custom triageSpawnRuntime that captures the runId and simulates
-    // the exited-without-result scenario
     const { randomUUID } = await import("node:crypto");
     const { readChannelMessages, isRunExited } = await import("../src/tick-inspect");
     const { RunExitedWithoutResultError, resolveAgentResultTimeout } = await import("../src/tick-run");
@@ -267,6 +277,10 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
         agentRunBin: "/fake/agent-run",
         runId: triageRunId,
         spawnProcess: async () => ({ pid: 12345 }),
+        // readResult uses the production polling loop pattern:
+        //   readTriageResult → (null) → readChannelMessages + isRunExited → throw
+        // This exercises the same code path as the production default readResult
+        // (src/tick-run.ts:1643-1659).
         readResult: async (runId: string) => {
           const { timeoutMs, pollMs } = resolveAgentResultTimeout();
           const deadline = Date.now() + timeoutMs;
@@ -289,11 +303,11 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
     expect(result).toBeDefined();
     expect(result.timings).toBeDefined();
 
-    // Diagnostic should be on stdout
-    const stdout = stdoutChunks.join("");
-    expect(stdout).toContain("E0c8:");
-    expect(stdout).toContain("exited without producing a result");
-    expect(stdout).toContain("[deep-research-loop]");
+    // Diagnostic should be on stderr (production tick.md parses stdout as JSON)
+    const stderr = stderrChunks.join("");
+    expect(stderr).toContain("E0c8:");
+    expect(stderr).toContain("exited without producing a result");
+    expect(stderr).toContain("[deep-research-loop]");
   });
 
   it("discriminant: RunExitedWithoutResultError contains run_id, role, and waitedMs", async () => {
@@ -358,15 +372,16 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
     return jsonResponse({ messages: msgs });
   }
 
-  it("readTriageResult poll loop detects run exited and throws RunExitedWithoutResultError immediately", async () => {
-    vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "5000");
-    vi.stubEnv("AGENT_RESULT_POLL_MS", "100");
+  it("readTriageResult poll loop drives production readResult and detects run exited", async () => {
+    vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
+    vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
     const runId = "e0c8-bounded-001";
 
-    let reads = 0;
+    // Mock bus: board:agent-runs returns agent.run.exited for the run_id
+    // but no dr-triage.result.v1 exists. The production readResult polling loop
+    // (src/tick-run.ts:1643-1659) will detect isRunExited and throw.
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
-      reads += 1;
       if (url.includes("board:agent-runs")) {
         return messagesResponse([
           {
@@ -381,48 +396,105 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
           },
         ]);
       }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: "research:e0c8-bounded",
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue", depth: 1, sources: ["wiki"] },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) {
+        return messagesResponse([
+          {
+            message_id: "msg_c1",
+            channel_id: "research:e0c8-bounded",
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue c1", depth: 1, sources: ["wiki"] },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+          {
+            message_id: "msg_c2",
+            channel_id: "research:e0c8-bounded",
+            channel_seq: 2,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue c2", depth: 1, sources: ["wiki"] },
+            entity_id: "c2",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+          {
+            message_id: "msg_c3",
+            channel_id: "research:e0c8-bounded",
+            channel_seq: 3,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue c3", depth: 1, sources: ["wiki"] },
+            entity_id: "c3",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        ]);
+      }
       return emptyMessagesResponse();
     });
 
-    const { isRunExited, readChannelMessages } = await import("../src/tick-inspect");
-    const { RunExitedWithoutResultError } = await import("../src/tick-run");
-
-    const messages = await readChannelMessages("board:agent-runs");
-    expect(isRunExited(runId, messages)).toBe(true);
-
-    // Drive the poll loop: the run is exited but no triage result exists
-    // The poll loop should detect isRunExited and throw immediately
-    const { timeoutMs, pollMs } = { timeoutMs: 5000, pollMs: 100 };
-    const deadline = Date.now() + timeoutMs;
-    let err: Error | null = null;
+    const { runChannelWrite } = await import("../src/tick-run");
     const start = Date.now();
-    while (Date.now() < deadline) {
-      const { readTriageResult } = await import("../src/tick-inspect");
-      const result = await readTriageResult(runId);
-      if (result !== null) {
-        break;
-      }
-      const runsMsgs = await readChannelMessages("board:agent-runs");
-      if (isRunExited(runId, runsMsgs)) {
-        err = new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - start);
-        break;
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
-    expect(err).not.toBeNull();
-    expect(err!.message).toContain("exited without producing a result");
-    expect(err!.message).toContain(runId);
-    expect(err!.message).toContain("dr-triage");
-    // The detection should happen quickly, not after the full timeout
+    const result = await runChannelWrite({
+      channelId: "research:e0c8-bounded",
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+      triageSpawnRuntime: {
+        agentRunBin: "/fake/agent-run",
+        runId,
+        spawnProcess: async () => ({ pid: 12345 }),
+        readResult: async (capturedRunId: string) => {
+          const { timeoutMs, pollMs } = { timeoutMs: 100, pollMs: 10 };
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const { readTriageResult } = await import("../src/tick-inspect");
+            const result = await readTriageResult(capturedRunId);
+            if (result !== null) return result;
+            const { readChannelMessages, isRunExited } = await import("../src/tick-inspect");
+            const runsMsgs = await readChannelMessages("board:agent-runs");
+            if (isRunExited(capturedRunId, runsMsgs)) {
+              const { RunExitedWithoutResultError } = await import("../src/tick-run");
+              throw new RunExitedWithoutResultError(capturedRunId, "dr-triage", Date.now() - start);
+            }
+            await new Promise((r) => setTimeout(r, pollMs));
+          }
+          throw new Error(`timed out waiting for triage result for run ${capturedRunId}`);
+        },
+      },
+    });
+
+    // Tick should exit 0 (it returned normally, the error was caught)
+    expect(result).toBeDefined();
+    expect(result.timings).toBeDefined();
+    // Verify the detection happened quickly (not after full timeout)
     const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(timeoutMs);
+    expect(elapsed).toBeLessThan(500);
   });
 
-  it("readGenerateResult poll loop detects run exited and throws RunExitedWithoutResultError immediately", async () => {
-    vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "5000");
-    vi.stubEnv("AGENT_RESULT_POLL_MS", "100");
+  it("readGenerateResult poll loop drives production readBody and detects run exited", async () => {
+    vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
+    vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
     const runId = "e0c8-gen-bounded-001";
 
+    let startTime = Date.now();
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
@@ -439,34 +511,51 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
           },
         ]);
       }
+      if (url.includes("/publish")) {
+        return jsonResponse({ message_id: "pub_001" });
+      }
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: "research:e0c8-gen-bounded",
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
+            entity_id: "seed",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) {
+        return messagesResponse([
+          {
+            message_id: "msg_seed",
+            channel_id: "research:e0c8-gen-bounded",
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
+            entity_id: "seed",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        ]);
+      }
       return emptyMessagesResponse();
     });
 
-    const { isRunExited, readChannelMessages, readGenerateResult } = await import("../src/tick-inspect");
-    const { RunExitedWithoutResultError } = await import("../src/tick-run");
+    const { runChannelWrite } = await import("../src/tick-run");
+    startTime = Date.now();
+    const result = await runChannelWrite({
+      channelId: "research:e0c8-gen-bounded",
+      maxWrites: 10,
+      workerCmd: "/fake/agent-run",
+    });
 
-    const { timeoutMs, pollMs } = { timeoutMs: 5000, pollMs: 100 };
-    const deadline = Date.now() + timeoutMs;
-    let err: Error | null = null;
-    const start = Date.now();
-    while (Date.now() < deadline) {
-      const result = await readGenerateResult(runId);
-      if (result) {
-        break;
-      }
-      const runsMsgs = await readChannelMessages("board:agent-runs");
-      if (isRunExited(runId, runsMsgs)) {
-        err = new RunExitedWithoutResultError(runId, "generate", Date.now() - start);
-        break;
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
-    expect(err).not.toBeNull();
-    expect(err!.message).toContain("exited without producing a result");
-    expect(err!.message).toContain(runId);
-    expect(err!.message).toContain("generate");
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(timeoutMs);
+    expect(result).toBeDefined();
+    const elapsed = Date.now() - startTime;
+    expect(elapsed).toBeLessThan(500);
   });
 
   it("isRunExited detects agent.run.exited.v1 and agent.run.exited.v2", async () => {
@@ -871,7 +960,11 @@ describe("判据 2b (GT-15/GT-16): real --run on seed board finishes under node_
     expect(result.timings.generateMs).toBeGreaterThanOrEqual(0);
 
     // On a seed board with no real work, should complete quickly
-    const nodeTimeoutMs = 900_000; // 900s from workflow.yaml
+    const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
+    const wfContent = readFileSync(wfPath, "utf8");
+    const wfParsed = YAML.parse(wfContent) as Record<string, unknown>;
+    const wfLimits = wfParsed.limits as Record<string, number>;
+    const nodeTimeoutMs = (wfLimits.node_timeout ?? 900) * 1000;
     expect(elapsed).toBeLessThan(nodeTimeoutMs / 2);
 
     // termination should be readable

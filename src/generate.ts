@@ -296,14 +296,7 @@ export async function spawnGenerateRole(
       promptFile,
     });
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
-    try {
-      return { body: await runtime.readBody(runId) };
-    } catch (err) {
-      if (err instanceof RunExitedWithoutResultError) {
-        throw err;
-      }
-      throw err;
-    }
+    return { body: await runtime.readBody(runId) };
   } finally {
     rmSync(inputPath, { force: true });
     rmSync(promptFile, { force: true });

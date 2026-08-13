@@ -865,7 +865,7 @@ export async function runWrite(
           });
         const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus).catch((err) => {
           if (err instanceof RunExitedWithoutResultError) {
-            process.stdout.write(`[deep-research-loop] ${err.message}\n`);
+            process.stderr.write(`[deep-research-loop] ${err.message}\n`);
             return { decisions: [] as TriageResultDecision[], runId: "" };
           }
           throw err;
@@ -1569,6 +1569,7 @@ export async function runChannelWrite(
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
+    ...(opts.maxClues !== undefined ? { maxClues: opts.maxClues } : {}),
   };
   const decisions = decideTick(state, tickConfig);
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
@@ -1734,7 +1735,7 @@ export async function runChannelWrite(
           await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
         } catch (err) {
           if (err instanceof RunExitedWithoutResultError) {
-            process.stdout.write(`[deep-research-loop] ${err.message}\n`);
+            process.stderr.write(`[deep-research-loop] ${err.message}\n`);
           } else {
             throw err;
           }

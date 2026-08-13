@@ -706,13 +706,24 @@ describe("H1: exited(0) + worker.result.v1 ⇒ one research.evidence.v2 per evid
     expect(evidencePubs.every((b) => b.channel === "research:p02-smoke-1dce60.evidence")).toBe(true);
     // 新 clue 发往板。
     const cluePubs = publishBodies.filter((b) => b.kind === "research.clue.v2");
-    expect(cluePubs).toHaveLength(2); // 1 条新 clue + 1 条 explored CAS
+    // E1 D3/D6：1 条新 clue（"idea"）+ 1 条 content-clue（material m1 取材失败 ⇒ 出生即 blocked）
+    //   + 1 条 explored CAS = 3。content-clue 也走板（content-clue 是 clue）。
+    expect(cluePubs).toHaveLength(3);
     // 最后的写是 explored CAS（H6）。
     const last = publishBodies[publishBodies.length - 1];
     expect(last.kind).toBe("research.clue.v2");
     expect((last.payload as Record<string, unknown>).status).toBe("explored");
     expect(outcome.harvestReports).toHaveLength(1);
     expect(outcome.harvestReports[0].evidencePublished).toBe(2);
+    // E1 D3/D6：content-clue 落板（取材失败 ⇒ blocked）。
+    expect(outcome.harvestReports[0].contentCluesPublished).toBe(1);
+    expect(outcome.harvestReports[0].contentCluesBlocked).toBe(1);
+    const contentClue = cluePubs.find(
+      (b) => (b.payload as Record<string, unknown>).parent === "card_x"
+        && ((b.payload as Record<string, unknown>).sources as string[]).includes("content"),
+    );
+    expect(contentClue).toBeDefined();
+    expect((contentClue!.payload as Record<string, unknown>).status).toBe("blocked");
   });
 });
 

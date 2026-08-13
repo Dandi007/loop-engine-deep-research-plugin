@@ -38,6 +38,15 @@ export interface WorkerProposedClue {
 }
 
 /**
+ * E1 D3——worker.result.v1 里一条 material（profiles/roles/schemas/worker-result.v1.json）。
+ * `digest` 是 worker 上报的提示，⛔ 不再当去重键（D1/GT-3）。
+ */
+export interface WorkerMaterialItem {
+  uri: string;
+  digest?: string;
+}
+
+/**
  * worker.result.v1 的 payload（发布在 board:agent-runs，payload 带 run_id，spec §7）。
  *
  * ⛔ A10a：权威形状（已冻结的 `profiles/roles/schemas/worker-result.v1.json`）是
@@ -49,7 +58,7 @@ export interface WorkerResultV1 {
   run_id?: string;
   evidences?: WorkerEvidenceItem[];
   proposed_clues?: WorkerProposedClue[];
-  materials?: unknown[];
+  materials?: WorkerMaterialItem[];
 }
 
 /** 形状守卫失败——响亮报错，绝不当成「空产物」静默通过（A10a §1.3）。 */
@@ -225,6 +234,18 @@ export interface HarvestDeps {
     clue: ClueV2,
     idempotencyKey: string,
   ): Promise<void>;
+  /**
+   * E1 D3——对一条 material 执行 ingest 并按结果落 content-clue（D4/D5/D6）。
+   * 由 harvest 在「materials 非空」时对每条 material 调用（D3）。
+   * ⛔ 未接线（undefined）⇒ 行为与 base 逐字一致：materials 数组只读校验形状、不发布（GT-2）。
+   * 该 dep 已在内部负责 maxClues 封顶（D9：content-clue 也走同一个 boardClueCount 实时累加）。
+   */
+  ingestMaterial?: (
+    material: WorkerMaterialItem,
+    parentClueId: string,
+    parentDepth: number,
+    idempotencyKey: string,
+  ) => Promise<ClueV2 | null>;
 }
 
 /** 写入预算接口（由上层 runWrite 提供共享计数，见 §1.7）。 */
@@ -329,7 +350,17 @@ export interface HarvestReport {
   /** 因 maxClues 封顶被跳过的 clue 条数（H12：显式报告）。 */
   skippedClues: number;
   /**
-   * E2b §1.3 ⭐ —— 被机械拒发的 evidence 记录（条目级，不连坐整卡）。
+   * E1 D3/D4——本卡 ingest 落板的 content-clue 数（含 proposed 与 blocked）。
+   * D2 复用路径不计（D5 幂等）；maxClues 封顶未落板不计（D9）。
+   */
+  contentCluesPublished: number;
+  /**
+   * E1 D6——本卡因 ingest 失败而出生即 blocked 的 content-clue 数。
+   * 父 clue 不连坐（照常 explored）；该计数便于排障。
+   */
+  contentCluesBlocked: number;
+  /**
+   * E1 E2b §1.3 ⭐ —— 被机械拒发的 evidence 记录（条目级，不连坐整卡）。
    * 每条点名 clue_id、稳定序号、失败的判据；⛔ 不含 quote 全文。
    */
   evidenceRejections: EvidenceRejection[];
@@ -362,6 +393,8 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: 0,
+      contentCluesPublished: 0,
+      contentCluesBlocked: 0,
       evidenceRejections: [],
       casExplored: false,
     };
@@ -372,7 +405,9 @@ export async function harvestCard(
   assertWorkerResultShape(result);
   const evItems = result.evidences ?? [];
   const clueItems = result.proposed_clues ?? [];
-  // materials 是 worker 的输入/产出清单，本收割步只读取校验形状，不发布（§1）。
+  const matItems = result.materials ?? [];
+  // E1 D3——materials 接线时逐条 ingest；未接线 ⇒ 与 base 逐字一致（GT-2：只读校验形状，不发布）。
+  const ingestEnabled = typeof hd.ingestMaterial === "function" && matItems.length > 0;
   // ⛔ maxClues 封顶必须随发布递增（§1.6 / H12），不能只看 pre-tick 快照：
   //    boardClueCount 是快照，clue 一条条发出时要实时累加，否则多张 harvest 卡
   //    会把板面冲到 maxClues 之上。这里先算「本卡最多还能发几条 clue」，
@@ -380,7 +415,9 @@ export async function harvestCard(
   const headroom = Math.max(0, hd.maxClues - hd.boardClueCount.value);
   const cluesAllowed = Math.min(clueItems.length, headroom);
   // 整卡所需写数：evidence 条数 + 将新增的 clue 条数 + 最终 CAS（§1.7）。
-  const needed = evItems.length + cluesAllowed + 1;
+  // E1 D3——content-clue 也是 clue，计入预算（最坏：每条 material 都落一条 content-clue）。
+  const contentClueBudgetMax = ingestEnabled ? matItems.length : 0;
+  const needed = evItems.length + cluesAllowed + contentClueBudgetMax + 1;
 
   if (budget.remaining() < needed) {
     // ⛔ A10c §1.2——预算不足 ⇒ 整卡跳过：不发、不 CAS，留 in_flight，响亮报告（§1.7 / H13）。
@@ -397,6 +434,8 @@ export async function harvestCard(
       evidencePublished: 0,
       cluesPublished: 0,
       skippedClues: clueItems.length,
+      contentCluesPublished: 0,
+      contentCluesBlocked: 0,
       evidenceRejections: [],
       casExplored: false,
     };
@@ -405,6 +444,8 @@ export async function harvestCard(
   let evidencePublished = 0;
   let cluesPublished = 0;
   let skippedClues = clueItems.length;
+  let contentCluesPublished = 0;
+  let contentCluesBlocked = 0;
   const evidenceRejections: EvidenceRejection[] = [];
   // ⛔ maxClues 运行计数：`boardClueCount` 是**共享可变对象**（runWrite 把同一 `deps.harvest`
   //    传给每张 harvest 卡）。每发一条新 clue 就把 `.value` +1，从而单张卡（或多张卡累计）
@@ -457,6 +498,25 @@ export async function harvestCard(
     skippedClues -= 1;
   }
 
+  // E1 D3——对该卡 worker 结果里的**每条 material** 调 ingest（D3）。
+  //   接线（hd.ingestMaterial）且 materials 非空才执行；否则与 base 逐字一致（GT-2）。
+  //   ingestMaterial 内部负责 D1（权威 digest）/ D2（复用）/ D4（propose）/ D5（复用不 propose）/
+  //   D6（失败出生即 blocked，父 clue 不连坐）/ D9（maxClues 封顶走同一 boardClueCount）。
+  //   落板的 content-clue 计入 boardClueCount（D9：content-clue 也是 clue）与 budget。
+  if (ingestEnabled) {
+    for (let i = 0; i < matItems.length; i += 1) {
+      const m = matItems[i];
+      const clue = await hd.ingestMaterial!(m, card.clueId, card.depth, `dr-content:${runId}:${i}`);
+      if (clue) {
+        contentCluesPublished += 1;
+        if (clue.status === "blocked") contentCluesBlocked += 1;
+        // D9：content-clue 落板 ⇒ 计入 boardClueCount（与既有 clue 封顶同构）。
+        boardClueCount.value += 1;
+        budget.consume(1);
+      }
+    }
+  }
+
   // 全部发布成功 ⇒ 由上层执行最后的 CAS 到 explored（此处仅预留其预算，§1.7）。
   return {
     clueId: card.clueId,
@@ -465,6 +525,8 @@ export async function harvestCard(
     evidencePublished,
     cluesPublished,
     skippedClues,
+    contentCluesPublished,
+    contentCluesBlocked,
     evidenceRejections,
     casExplored: true,
   };

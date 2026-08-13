@@ -47,8 +47,16 @@ import {
   MissingEvidenceChannelError,
   type HarvestDeps,
   type HarvestReport,
+  type WorkerMaterialItem,
 } from "./harvest";
-import { casUpdateClue, getEntity, publishClue, publishEvidence, publishDoc } from "./bus";
+import { casUpdateClue, getEntity, getMessages, publishClue, publishEvidence, publishDoc } from "./bus";
+import {
+  ingestMaterial as ingestMaterialImpl,
+  readExistingTranscript,
+  fetchMaterialHttp,
+  type IngestDeps,
+} from "./ingest";
+import { fileParse } from "./mineru";
 import {
   RunExitedWithoutResultError,
   type RunExitWithoutResultDiagnostic,
@@ -66,7 +74,7 @@ import {
   MissingAnchorCheckRepoRootError,
 } from "./generate";
 import { runExport, slugify, type ExportInput } from "./export";
-import { RUNS_CHANNEL_ID } from "./run-channels";
+import { RUNS_CHANNEL_ID, CONTENT_CHANNEL_ID } from "./run-channels";
 
 /**
  * --max-writes 默认值。⛔ A10c §1.1——缺省值必须**足以收割一张真实卡**（真实 worker 产出
@@ -1106,6 +1114,12 @@ export interface RunWriteOptions {
    */
   docChannelId?: string;
   /**
+   * E1 D2/D4——content channel（doc(transcript) 的发布/去重 channel）。
+   * 缺省 `CONTENT_CHANNEL_ID`（`research:content`）。
+   * ingest 把 doc(transcript) 发到这条 channel，并以权威 digest 做全局去重（D2）。
+   */
+  contentChannelId?: string;
+  /**
    * G4c —— 一次性标记文件目录（跨进程持久）。
    * 缺省 `join(tmpdir(), "deep-research-generated")`。
    */
@@ -1735,6 +1749,41 @@ export async function runChannelWrite(
         publishEvidence(channelId, evidence, key).then(() => undefined),
       publishClue: (channelId, clue, key) =>
         publishClue(channelId, clue, key).then(() => undefined),
+      // E1 D3——对该卡 worker 结果里的每条 material 调 ingest（D1 权威 digest / D2 复用 /
+      //   D4 propose content-clue / D5 复用不 propose / D6 失败出生即 blocked / D9 maxClues 封顶）。
+      //   生产装配：用真实 bus（research:content）+ MinerU + 生产 fetchMaterialHttp。
+      ingestMaterial: (material, parentClueId, parentDepth, key) => {
+        const contentChannel = opts.contentChannelId ?? CONTENT_CHANNEL_ID;
+        const ingestDeps: IngestDeps = {
+          readExistingTranscript: (digest) =>
+            readExistingTranscript(
+              (afterSeq) =>
+                getMessages(
+                  contentChannel,
+                  afterSeq !== null ? { afterSeq } : {},
+                ),
+              digest,
+            ),
+          fetchMaterial: (uri) => fetchMaterialHttp(uri),
+          transcribe: (filename, bytes) => fileParse(filename, bytes),
+          publishDoc: (doc) =>
+            publishDoc(contentChannel, doc, key).then(() => undefined),
+          proposeContentClue: (clue) => {
+            // D9：content-clue 封顶走同一个 boardClueCount（与既有 clue 封顶同构）。
+            const bc = deps.harvest!.boardClueCount;
+            if (bc.value >= maxClues) {
+              return Promise.resolve(null);
+            }
+            return publishClue(opts.channelId, clue, key).then(() => clue);
+          },
+        };
+        return ingestMaterialImpl(
+          ingestDeps,
+          { uri: material.uri, digest: material.digest ?? "", clueId: parentClueId },
+          parentDepth,
+          key,
+        );
+      },
     },
     // G2b —— triage：研究主问题（--question）；缺省走生产 spawnTriageRole（真实 agent-run）。
     readQuestion: async () => {
@@ -1825,7 +1874,7 @@ export async function runChannelWrite(
   //   新发布的 clue 一并计入：任一张卡发布了 clue（harvestReports[].cluesPublished>0）即视为仍有待处理
   //   工作（新 clue 非终态 proposed，须由下一 tick 探索），不得只依赖写前快照上的旧卡重建。
   const cluesPublished = result.harvestReports.reduce(
-    (n, r) => n + r.cluesPublished,
+    (n, r) => n + r.cluesPublished + (r.contentCluesPublished - r.contentCluesBlocked),
     0,
   );
   // G4b —— 用本轮真实（写后）板面调用 decideTermination（spec §1.1）。

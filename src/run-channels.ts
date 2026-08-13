@@ -20,6 +20,15 @@ import { createHash } from "node:crypto";
 export const RUNS_CHANNEL_ID = "board:agent-runs";
 
 /**
+ * E1 D2/D4——`research:content` 的唯一字面量真相源。
+ *
+ * ingest 把 doc(transcript) 发到这条全局 channel（spec §1 D2/D4、GT-7：测试总线 7495 上已建，
+ * head_seq=0）；content-clue 的全局去重（D2）就是扫这条 channel 上已有 doc(transcript)。
+ * ⛔ 仓内其他位置一律 `import { CONTENT_CHANNEL_ID }` 引用，不得再写 `"research:content"` 字面量。
+ */
+export const CONTENT_CHANNEL_ID = "research:content";
+
+/**
  * E0c1 §1.3 —— 把任意 run_id 规范成 channel 名安全的形式（去掉 channel_id 不允许的字符）。
  *
  * bus channel_id 允许的字符集较宽，但为确定性 + 跨 run 不碰撞，这里把 run_id 取 sha256 前 16 hex

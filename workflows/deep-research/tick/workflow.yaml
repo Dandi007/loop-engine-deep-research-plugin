@@ -6,7 +6,20 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# E0c8 §1.1 —— node_timeout 是引擎杀叶子的唯一闸刀（与 env 变量无关，GT-15）。
+#   实测依据（spec 地面真相，逐字可溯源）：
+#   - GT-13: E0c3b 真机长跑，单 tick 耗时 904.2s（board:agent-runs 27→159，head_seq 70）
+#     run_id=e0-1786589921832979147-1672191，run.meta 记录，派发方 2026-08-13 01:52–04:05
+#   - GT-15: 真机实录，tick 以 status=TIMEOUT 死亡，时长 30.5s 与 39.9s（node_timeout=30）
+#     run_id=e0-1786591650752241473-1751345，run.meta 记录，派发方 2026-08-13 05:27
+#   - GT-18: E0c3b 长跑，worker 耗时 221.084s 与 36.109s（agent.run.exited.v2 exit=0）
+#     同 GT-13 的 run_id，run.meta 记录
+#   - 仓内 timings 埋点（src/tick-run.ts:1783-1789）：totalMs = tGenerate - t0 覆盖整个 tick
+#     所有阶段（含 read/execute/term/generate），分阶段字段可独立取证。
+#   取 node_timeout = 2000s ≈ 33.3min，≥ 2.0× 实测最大单 tick 耗时（904.2s × 2.0 = 1808.4s，
+#   取 2000s ≈ 2.21×，给足余量保证合法工作可在引擎闸刀前完成）。
+#   保留"超过上界要响亮失败"的语义而非无限大。
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 2000, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:
@@ -30,6 +43,10 @@ seed:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 fleet input 注入 tick.md，
       # 再传给 tick-entry --run。与 MAX_WRITES 同款装配链（缺省 3）。
       triage_threshold: "{{triage_threshold}}"
+      # E0c8 §1.1b —— 最大 clue 数（--max-clues）：由 fleet input 注入 tick.md，
+      # 再传给 tick-entry --run。与 MAX_WRITES 同款装配链（缺省 DEFAULT_TICK_CONFIG.maxClues=64）。
+      # 回归 profile 可声明收窄此值以便在预算内收敛。
+      max_clues: "{{max_clues}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

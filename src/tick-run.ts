@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findTriageResult,
   findWorkerResult,
+  isRunExited,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
@@ -73,7 +74,8 @@ export const DEFAULT_MAX_WRITES = 64;
 
 /**
  * G6 —— 等待 agent 结果的总时间预算（ms），缺省 15 分钟。
- * 观测最大值 390s（dr-triage），900s ≈ 2.3× 最大值，覆盖 triage 与 worker 两个分布的全部样本。
+ * 该值构成单个 worker 结果等待的上界（triage readResult 与 generate readBody 共用）。
+ * 引擎 node_timeout（workflow.yaml limits.node_timeout）必须 ≥ 本值以便一个合法等待能完成。
  * 可由 `AGENT_RESULT_TIMEOUT_MS` 环境变量覆盖。
  */
 export const DEFAULT_AGENT_RESULT_TIMEOUT_MS = 900_000;
@@ -203,8 +205,8 @@ export interface TriageSpawnRuntime {
    *    缺省/缺失即响亮失败，绝不静默构建 argv 后丢弃、返回一个从未启动的假成功。
    */
   spawnProcess: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
-  /** 从 worker 结果读回 `dr-triage.result.v1` 的决策列表。 */
-  readResult: (runId: string) => Promise<TriageResultDecision[]>;
+  /** 从 worker 结果读回 `dr-triage.result.v1` 的决策列表。缺省使用生产 polling 循环（readTriageResult + readChannelMessages + isRunExited）。 */
+  readResult?: (runId: string) => Promise<TriageResultDecision[]>;
 }
 
 /**
@@ -232,6 +234,9 @@ export async function spawnTriageRole(
       promptFile,
     });
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+    if (!runtime.readResult) {
+      throw new Error("spawnTriageRole: readResult is not provided — a triage result reader is required");
+    }
     return await runtime.readResult(runtime.runId);
   } finally {
     rmSync(inputPath, { force: true });
@@ -372,6 +377,26 @@ export class MissingExportRootError extends Error {
       "G4c: EXPORT_ROOT is not configured. Refusing to silently skip the export.",
     );
     this.name = "MissingExportRootError";
+  }
+}
+
+/**
+ * E0c8 §1.2 —— run 已退出但未产出 result ⇒ 立即停止等待并记录诊断。
+ * 点名 run_id、role、已等时长（ms）。调用方应将其作为该条工作的局部失败记录，
+ * 本轮 tick 继续处理其余工作并正常返回（§1.1c）。
+ */
+export class RunExitedWithoutResultError extends Error {
+  public readonly runId: string;
+  public readonly role: string;
+  public readonly waitedMs: number;
+  constructor(runId: string, role: string, waitedMs: number) {
+    super(
+      `E0c8: run ${runId} (role=${role}) exited without producing a result after ${waitedMs}ms — stopping wait immediately and recording as a local failure`,
+    );
+    this.name = "RunExitedWithoutResultError";
+    this.runId = runId;
+    this.role = role;
+    this.waitedMs = waitedMs;
   }
 }
 
@@ -847,7 +872,19 @@ export async function runWrite(
               (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
             );
           });
-        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
+        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus).catch((err) => {
+          if (err instanceof RunExitedWithoutResultError) {
+            process.stderr.write(`[deep-research-loop] ${err.message}\n`);
+            // E0c8 §1.1c —— 该批 proposed 卡的 triage 失败，逐条标注 dropped 并写明原因。
+            const dropDecisions: TriageResultDecision[] = decision.proposedClues.map((c) => ({
+              clue_id: c.clueId,
+              action: "drop" as const,
+              rationale: `triage worker exited without producing a result (runId=${err.runId}). Card dropped to reflect triage failure.`,
+            }));
+            return { decisions: dropDecisions, runId: err.runId };
+          }
+          throw err;
+        });
         const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
         const applied = await applyTriageBatch(
           deps,
@@ -1049,6 +1086,21 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E0c8 §1.1 —— 分阶段耗时（ms），覆盖整个 tick 所有阶段（含 generate）。
+   * 用于为 workflow.yaml 的 node_timeout 提供实测依据。
+   * t0=入口开始, t1=读板完成, t2=执行完成, t3=终止判定完成, t4=generate 完成（无 generate 时 = t3）。
+   */
+  timings: TickTimings;
+}
+
+/** E0c8 §1.1 —— 分阶段耗时。 */
+export interface TickTimings {
+  totalMs: number;
+  readMs: number;
+  executeMs: number;
+  termMs: number;
+  generateMs: number;
 }
 
 /**
@@ -1325,6 +1377,11 @@ export function assembleGenerateDeps(
         while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
+          // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
+          const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+          if (isRunExited(runId, runsMsgs)) {
+            throw new RunExitedWithoutResultError(runId, "generate", Date.now() - (deadline - timeoutMs));
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1491,6 +1548,7 @@ export function assembleGenerateDeps(
 export async function runChannelWrite(
   opts: RunWriteOptions,
 ): Promise<RunWriteOutcome> {
+  const t0 = Date.now();
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
@@ -1503,6 +1561,7 @@ export async function runChannelWrite(
   const runsMessages = await readChannelMessages(runsChannelId);
   const runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
+  const tRead = Date.now();
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
   //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
   //   （profiles/deploy/agent-harness.env: research:agent-harness.evidence，与板 channel
@@ -1525,6 +1584,7 @@ export async function runChannelWrite(
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
+    ...(opts.maxClues !== undefined ? { maxClues: opts.maxClues } : {}),
   };
   const decisions = decideTick(state, tickConfig);
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
@@ -1581,34 +1641,45 @@ export async function runChannelWrite(
     spawnTriage:
       opts.spawnTriage ??
       ((corpus) => {
+        const defaultReadResult = async (runId: string) => {
+          const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const result = await readTriageResult(runId);
+            if (result !== null) return result;
+            // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
+            const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+            if (isRunExited(runId, runsMsgs)) {
+              throw new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - (deadline - timeoutMs));
+            }
+            await new Promise((r) => setTimeout(r, pollMs));
+          }
+          throw new Error(
+            `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
+          );
+        };
         const runtime: TriageSpawnRuntime =
-          opts.triageSpawnRuntime ?? {
-            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
-            runId: randomUUID(),
-            // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
-            //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
-            spawnProcess: async (argv, env) => {
-              await spawnWorkerProcess({
-                cmd: argv[0],
-                args: argv.slice(1),
-                env,
-                onExit: () => {},
-              });
-              return {};
-            },
-            readResult: async (runId) => {
-              const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
-              while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
-                if (result !== null) return result;
-                await new Promise((r) => setTimeout(r, pollMs));
+          opts.triageSpawnRuntime
+            ? {
+                ...opts.triageSpawnRuntime,
+                readResult: opts.triageSpawnRuntime.readResult ?? defaultReadResult,
               }
-              throw new Error(
-                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
-              );
-            },
-          };
+            : {
+                agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+                runId: randomUUID(),
+                // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
+                //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
+                spawnProcess: async (argv, env) => {
+                  await spawnWorkerProcess({
+                    cmd: argv[0],
+                    args: argv.slice(1),
+                    env,
+                    onExit: () => {},
+                  });
+                  return {};
+                },
+                readResult: defaultReadResult,
+              };
         return spawnTriageRole(corpus, runtime).then(
             (decisions) => ({ decisions, runId: runtime.runId }),
           );
@@ -1619,6 +1690,7 @@ export async function runChannelWrite(
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  const tExecute = Date.now();
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1668,8 +1740,10 @@ export async function runChannelWrite(
     },
     tickConfig,
   );
+  const tTerm = Date.now();
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  let tGenerate = tTerm;
   if (opts.origin) {
     if (decideGenerate(termination)) {
       const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
@@ -1678,11 +1752,20 @@ export async function runChannelWrite(
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
         const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
-        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        try {
+          await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        } catch (err) {
+          if (err instanceof RunExitedWithoutResultError) {
+            process.stderr.write(`[deep-research-loop] ${err.message}\n`);
+          } else {
+            throw err;
+          }
+        }
         mkdirSync(oneShotDir, { recursive: true });
         writeFileSync(markerPath, "");
       }
     }
+    tGenerate = Date.now();
   }
 
   return {
@@ -1697,6 +1780,13 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    timings: {
+      totalMs: tGenerate - t0,
+      readMs: tRead - t0,
+      executeMs: tExecute - tRead,
+      termMs: tTerm - tExecute,
+      generateMs: tGenerate - tTerm,
+    },
   };
 }
 
@@ -1789,6 +1879,10 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /** E0c8 §1.1b —— 最大 clue 数（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
+  /** E0c8 —— worker 可执行路径（--worker-cmd）；缺省 `resolveAgentRunBin()`。 */
+  workerCmd?: string;
 }
 
 /**
@@ -1812,6 +1906,8 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
+  let workerCmd: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1895,6 +1991,23 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c8: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
+    } else if (args[i] === "--worker-cmd") {
+      workerCmd = args[i + 1];
+      if (!workerCmd) {
+        throw new Error(
+          "E0c8: invalid --worker-cmd (must specify the worker executable path).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1910,6 +2023,8 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
+    workerCmd,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

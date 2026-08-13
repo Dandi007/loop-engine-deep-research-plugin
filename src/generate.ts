@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
+import { RunExitedWithoutResultError } from "./tick-run";
 
 /** 单个生成角色：role（persona）。 */
 export interface GenerateRoleSpec {

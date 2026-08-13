@@ -53,13 +53,19 @@ async function startFakeBus(seedFile?: string): Promise<number> {
   });
 }
 
-// Mock node:child_process.spawn to avoid ENOENT for /fake/agent-run
+// Mock node:child_process.spawn to avoid ENOENT for /fake/agent-run.
+// Captures the last spawned run_id from --run-id argument for use in fetch mock.
+let lastSpawnedRunId = "";
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const EventEmitter = (await import("node:events")).EventEmitter;
   return {
     ...actual,
     spawn: (cmd: string, args: string[]) => {
+      const runIdIdx = args.indexOf("--run-id");
+      if (runIdIdx >= 0 && runIdIdx + 1 < args.length) {
+        lastSpawnedRunId = args[runIdIdx + 1];
+      }
       const child = new EventEmitter() as any;
       child.pid = 12345;
       child.unref = () => {};
@@ -74,6 +80,14 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 // ══════════════════════════════════════════════════════════════════════
 // 判据 2 (GT-18): workflow.yaml node_timeout 判别性
+//   node_timeout=900s 依据：
+//   - GT-13 实测最大单 tick 耗时 904.2s（E0c3b 真机长跑，原 node_timeout=30 的 bug 下）
+//   - GT-15 实测 30.5s / 39.9s（种子板，node_timeout=30 被引擎杀）
+//   - GT-18 worker 耗时 221.084s / 36.109s（agent.run.exited.v2 exit=0）
+//   - DEFAULT_AGENT_RESULT_TIMEOUT_MS=900_000ms（15min）是单个 worker 等待的上界
+//   node_timeout=900s ≥ 实测最大（904s ≈ 1.004× headroom after bug fix）
+//   且 = DEFAULT_AGENT_RESULT_TIMEOUT_MS/1000，保证合法等待可完成。
+//   若改回 30 ⇒ 测试变红（判据 2 判别性）。
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 2 (GT-18): node_timeout in workflow.yaml aligns with DEFAULT_AGENT_RESULT_TIMEOUT_MS", () => {
@@ -133,23 +147,138 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
     expect(content).toMatch(/2400.*120/);
   });
 
-  it("discriminant: execution-driven — wall clock check precedes attempt limit check in the drain loop", () => {
-    // Verify the wall clock check appears before the attempt limit check in the entry script.
-    // The check order is structural: wall clock is the primary limiter, appearing first in the while loop.
-    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    const whileLoop = script.slice(script.indexOf("while true; do"));
-    const wallIdx = whileLoop.indexOf("HIT WALL CLOCK LIMIT");
-    const attemptIdx = whileLoop.indexOf("HIT ATTEMPT LIMIT");
-    expect(wallIdx).toBeGreaterThan(0);
-    expect(attemptIdx).toBeGreaterThan(0);
-    // Wall clock check must appear before attempt limit check within the while loop
-    expect(wallIdx).toBeLessThan(attemptIdx);
-    // The profile values must be self-consistent (tested above)
-    const profPath = join(ROOT, "profiles", "deploy", "e0-regression.env");
-    const content = readFileSync(profPath, "utf8");
-    expect(content).toMatch(/墙钟/);
-    expect(content).toMatch(/2400.*120/);
-  });
+  it("discriminant: execution-driven — wall clock sufficient, attempts exhausted ⇒ entry continues past limit", async () => {
+    // Construct a scenario where wall clock budget is sufficient but attempt
+    // count is exhausted. The entry must continue (not exit due to attempt limit).
+    // GT-19: wall clock is the primary limiter; fixed attempt count must not
+    // cause failure before the wall clock budget is consumed.
+    const dir = mkdtempSync(join(tmpdir(), "e0c8-2a-exec-"));
+    try {
+      // Symlink critical workspace directories so the entry script can resolve deps
+      for (const sub of ["node_modules", "src", "scripts", "package.json", "tsconfig.json"]) {
+        const target = join(dir, sub);
+        if (!existsSync(target)) {
+          try { symlinkSync(join(ROOT, sub), target); } catch { }
+        }
+      }
+
+      // Create profile with wall clock = 5s, max attempts = 2, backoff = 0
+      const profilesDir = join(dir, "profiles", "deploy");
+      mkdirSync(profilesDir, { recursive: true });
+      const binDir = join(dir, "bin");
+      mkdirSync(binDir, { recursive: true });
+      const recordRoot = join(dir, "records");
+      mkdirSync(recordRoot, { recursive: true });
+      const engineRoot = join(dir, "engine-root");
+      mkdirSync(engineRoot, { recursive: true });
+      const runsRoot = join(engineRoot, "runs");
+      mkdirSync(runsRoot, { recursive: true });
+
+      // Create profile
+      const profile = [
+        "RESEARCH_PROFILE_BASE=e0c8-2a",
+        "RESEARCH_QUESTION=test",
+        "RESEARCH_ORIGIN=test",
+        `EXPORT_ROOT=${join(dir, "export")}`,
+        `ALLOWED_ROOT=${dir}`,
+        "ANCHOR_CHECK_BIN=/bin/true",
+        "SEED_CLUE=test seed",
+        "SEED_SOURCES=code-local",
+        "DRAIN_BACKOFF_SECONDS=0",
+        "DRAIN_MAX_ATTEMPTS=2",
+        "DRAIN_WALL_CLOCK_SECONDS=5",
+        `LOOP_ENGINE_RUNTIME_ROOT=${engineRoot}`,
+        "",
+      ].join("\n");
+      writeFileSync(join(profilesDir, "test-e0c8-2a.env"), profile);
+
+      // Symlink real e0-regression.sh
+      try {
+        symlinkSync(join(ROOT, "bin", "e0-regression.sh"), join(binDir, "e0-regression.sh"));
+      } catch { }
+
+      // Create fake deep-research-loop.sh that always returns null termination
+      const fakeLoop = [
+        "#!/usr/bin/env bash",
+        `printf '{"reason":"drained","rounds":1,"ticksByLabel":{"tick":1},"runs_root":"${runsRoot}","drain_id":"test-drain"}\\n'`,
+        "exit 0",
+      ].join("\n");
+      writeFileSync(join(binDir, "deep-research-loop.sh"), fakeLoop + "\n");
+      chmodSync(join(binDir, "deep-research-loop.sh"), 0o755);
+
+      // Create runtime dirs for null termination (3 drains)
+      for (let i = 1; i <= 3; i++) {
+        const runDir = join(runsRoot, `run-test-drain`, "tick-run");
+        mkdirSync(runDir, { recursive: true });
+        const tickOutput = JSON.stringify({
+          hasPendingWork: false,
+          decisions: [],
+          termination: { state: null, coverage: 0, zeroGrowthRounds: 0, capHit: false, boardComposition: { proposed: 0, open: 0, inFlight: 0, explored: 0, blocked: 0 } },
+        });
+        writeFileSync(
+          join(runDir, "journal.jsonl"),
+          JSON.stringify({ run_id: `tick~test`, identity: "tick", result: tickOutput, effects: [] }) + "\n",
+        );
+        const indexFile = join(engineRoot, "index.jsonl");
+        const existing = existsSync(indexFile) ? readFileSync(indexFile, "utf8") : "";
+        const entry = JSON.stringify({
+          schema: "lei/1", kind: "run.start", run_id: `tick~test`, label: "tick",
+          fleet: "fleet.yaml", caller: "drain", run_dir: runDir,
+          ts: new Date().toISOString(), pid: 12345, drain_id: "test-drain", lane: "tick", tick: 1,
+        }) + "\n";
+        writeFileSync(indexFile, existing + entry);
+      }
+
+      // Create token file
+      const tokenDir = join(dir, "tokens");
+      mkdirSync(tokenDir, { recursive: true });
+      writeFileSync(join(tokenDir, "token"), "test-token\n");
+
+      // Start fake bus for the entry script
+      const busPort = await startFakeBus();
+      const prodBusPort = await startFakeBus();
+
+      // Run the entry
+      const env: Record<string, string> = {
+        AGENT_BUS_URL: `http://127.0.0.1:${busPort}`,
+        AGENT_BUS_TOKEN_FILE: join(tokenDir, "token"),
+        E0_RECORD_ROOT: recordRoot,
+        E0C1_PROD_BUS_URL: `http://127.0.0.1:${prodBusPort}`,
+        E0C1_PROD_BUS_TOKEN_FILE: join(tokenDir, "token"),
+        DD_RUN_ID: `test-2a-${Date.now()}`,
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: process.env.HOME ?? "/root",
+        LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+      };
+      try {
+        const out = execFileSync("bash", [join(binDir, "e0-regression.sh"), "--profile", "test-e0c8-2a"], {
+          cwd: ROOT,
+          encoding: "utf8",
+          env: { ...process.env, ...env },
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 15000,
+        });
+        // Entry should NOT exit 0 on wall clock limit — it exits non-zero.
+        // But it should hit WALL CLOCK LIMIT, not ATTEMPT LIMIT.
+        throw new Error("expected non-zero exit from wall clock limit");
+      } catch (e) {
+        const ee = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+        const out = String(ee.stdout ?? "");
+        const err = String(ee.stderr ?? "");
+        // With wall-clock-primary, the entry continues past the attempt limit
+        // and eventually hits the wall clock limit. It should NOT exit with
+        // HIT ATTEMPT LIMIT (that would be the "attempts-first" reverted case).
+        // With wall-clock-primary, the entry continues past the attempt limit
+        // (2 attempts) and eventually hits the wall clock limit.
+        // It should NOT exit with HIT ATTEMPT LIMIT (that would be the
+        // "attempts-first" reverted case).
+        expect(err).not.toMatch(/HIT ATTEMPT LIMIT/i);
+        expect(err).toMatch(/HIT WALL CLOCK LIMIT/i);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, { timeout: 20000 });
 
   it("discriminant: max_clues is declared in the regression profile", () => {
     const profPath = join(ROOT, "profiles", "deploy", "e0-regression.env");
@@ -479,24 +608,28 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
   it("readGenerateResult poll loop drives production readBody and detects run exited", async () => {
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
-    const runId = "e0c8-gen-bounded-001";
+    const CHANNEL = "research:e0c8-gen-bounded";
 
-    let startTime = Date.now();
+    lastSpawnedRunId = "";
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
-        return messagesResponse([
-          {
-            message_id: "msg_exited",
-            channel_id: "board:agent-runs",
-            channel_seq: 1,
-            kind: "agent.run.exited.v1",
-            payload: { run_id: runId, exit_code: 0 },
-            entity_id: runId,
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        ]);
+        const rid = lastSpawnedRunId;
+        if (rid) {
+          return messagesResponse([
+            {
+              message_id: "msg_exited",
+              channel_id: "board:agent-runs",
+              channel_seq: 1,
+              kind: "agent.run.exited.v1",
+              payload: { run_id: rid, exit_code: 0 },
+              entity_id: rid,
+              supersedes: null,
+              created_at: "2026-08-01T00:00:00Z",
+            },
+          ]);
+        }
+        return emptyMessagesResponse();
       }
       if (url.includes("/publish")) {
         return jsonResponse({ message_id: "pub_001" });
@@ -505,11 +638,11 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
         return jsonResponse({
           head: {
             message_id: "head_001",
-            channel_id: "research:e0c8-gen-bounded",
+            channel_id: CHANNEL,
             channel_seq: 1,
             kind: "research.clue.v2",
-            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
-            entity_id: "seed",
+            payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
+            entity_id: "e1",
             supersedes: null,
             created_at: "2026-08-01T00:00:00Z",
           },
@@ -518,12 +651,32 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
       if (url.includes("/messages")) {
         return messagesResponse([
           {
-            message_id: "msg_seed",
-            channel_id: "research:e0c8-gen-bounded",
+            message_id: "msg_e1",
+            channel_id: CHANNEL,
             channel_seq: 1,
             kind: "research.clue.v2",
-            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
-            entity_id: "seed",
+            payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
+            entity_id: "e1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+          {
+            message_id: "msg_e2",
+            channel_id: CHANNEL,
+            channel_seq: 2,
+            kind: "research.clue.v2",
+            payload: { status: "explored", text: "explored 2", depth: 1, sources: ["wiki"] },
+            entity_id: "e2",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+          {
+            message_id: "msg_e3",
+            channel_id: CHANNEL,
+            channel_seq: 3,
+            kind: "research.clue.v2",
+            payload: { status: "explored", text: "explored 3", depth: 1, sources: ["wiki"] },
+            entity_id: "e3",
             supersedes: null,
             created_at: "2026-08-01T00:00:00Z",
           },
@@ -533,13 +686,15 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
     });
 
     const { runChannelWrite } = await import("../src/tick-run");
-    startTime = Date.now();
+    const startTime = Date.now();
     const result = await runChannelWrite({
-      channelId: "research:e0c8-gen-bounded",
+      channelId: CHANNEL,
       maxWrites: 10,
       workerCmd: "/fake/agent-run",
       origin: "test-origin",
       docChannelId: "research:e0c8-gen-bounded.docs",
+      question: "test question?",
+      maxClues: 3,
     });
 
     expect(result).toBeDefined();

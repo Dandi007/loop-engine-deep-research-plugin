@@ -402,18 +402,25 @@ while true; do
     break
   fi
 
-  # 次数上限检查（失控兜底，正常情形下不可能先于墙钟触发）。
+  # 次数上限检查（失控兜底：仅当墙钟也已耗尽时才触发，正常情形下不可能先于墙钟触发）。
+  # GT-19：墙钟为主限制器，attempt 次数不得独立决定退出。
   if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - WALL_START))
+    if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
+      echo "[e0-regression] HIT WALL CLOCK LIMIT (also hit attempt limit): wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+      _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+      if [ -f "$_last_stdout" ]; then
+        _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+        if [ -n "$_last_term" ]; then
+          _print_board_composition "$_last_term"
+        fi
       fi
+      LOOP_EXIT=4
+      break
     fi
-    LOOP_EXIT=4
-    break
+    # 墙钟仍充足 ⇒ 不退出，继续退避重试。
+    echo "[e0-regression] attempt limit ${DRAIN_MAX_ATTEMPTS} reached but wall clock still has $((DRAIN_WALL_CLOCK_SECONDS - ELAPSED))s remaining — continuing" >&2
   fi
 
   DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))

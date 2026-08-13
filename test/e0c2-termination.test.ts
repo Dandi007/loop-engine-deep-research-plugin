@@ -1047,17 +1047,19 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh)", () => {
-  it("always null ⇒ hits attempt limit, non-zero exit naming the limit", async () => {
+  it("always null ⇒ hits wall clock limit (not attempt limit), non-zero exit naming the limit", async () => {
+    // E0c8 §1.1b (GT-19): wall clock is the primary limiter. When attempts
+    // are exhausted but wall clock is still sufficient, the entry continues.
+    // This test verifies that the entry ultimately hits the wall clock limit
+    // (not the attempt limit). With wallClockSeconds=0, the entry hits the
+    // wall clock limit immediately.
     const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 30,
+        wallClockSeconds: 0,
         backoffSeconds: 0,
-        terminationStates: [
-          { drainId: "fake-drain-null-1", state: null },
-          { drainId: "fake-drain-null-2", state: null },
-        ],
+        terminationStates: [],
       },
     );
     const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
@@ -1066,10 +1068,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
-      expect(res.err).toMatch(/HIT ATTEMPT LIMIT|HIT WALL CLOCK LIMIT/i);
-      expect(res.err).toMatch(/drain_attempts=2\b/);
-      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
-      expect(attempts).toBe(2);
+      expect(res.err).toMatch(/HIT WALL CLOCK LIMIT/i);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1129,16 +1128,22 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
 // ══════════════════════════════════════════════════════════════════════
 
 describe("E0c3b 判据 4: board composition and triage deadlock naming on limit hit", () => {
-  it("HIT ATTEMPT LIMIT with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
+  it("HIT WALL CLOCK LIMIT (also hit attempt limit) with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
+    // E0c8 §1.1b (GT-19): wall clock is the primary limiter. The attempt
+    // limit only triggers when wall clock is also exhausted. Both limits
+    // are hit simultaneously here.
     const { dir, env, e0regression } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 30,
+        wallClockSeconds: 3,
         backoffSeconds: 0,
         terminationStates: [
           { drainId: "fake-drain-null-1", state: null },
           { drainId: "fake-drain-null-2", state: null },
+          { drainId: "fake-drain-null-3", state: null },
+          { drainId: "fake-drain-null-4", state: null },
+          { drainId: "fake-drain-null-5", state: null },
         ],
       },
     );
@@ -1162,11 +1167,42 @@ describe("E0c3b 判据 4: board composition and triage deadlock naming on limit 
       { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
       3,
     );
+    setupRuntimeDir(
+      join(dir, "engine-root"),
+      join(dir, "engine-root", "runs"),
+      "fake-drain-null-3",
+      null,
+      undefined,
+      undefined,
+      { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+      3,
+    );
+    setupRuntimeDir(
+      join(dir, "engine-root"),
+      join(dir, "engine-root", "runs"),
+      "fake-drain-null-4",
+      null,
+      undefined,
+      undefined,
+      { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+      3,
+    );
+    setupRuntimeDir(
+      join(dir, "engine-root"),
+      join(dir, "engine-root", "runs"),
+      "fake-drain-null-5",
+      null,
+      undefined,
+      undefined,
+      { proposed: 1, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+      3,
+    );
     const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
     env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
     env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
     try {
       const res = runE0Regression(e0regression, env);
+      expect(res.err).toMatch(/HIT WALL CLOCK LIMIT/i);
       expect(res.err).toMatch(/board:\s*proposed=1/);
       expect(res.err).toMatch(/TRIAGE THRESHOLD DEADLOCK/);
       expect(res.err).toMatch(/proposed=1\s*<\s*triageThreshold=3/);

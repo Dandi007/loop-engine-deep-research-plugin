@@ -144,6 +144,8 @@ export interface TriageReport {
   casCount: number;
   /** 实际发出的 CAS 结果（budget 跳过时为空）。 */
   casResults: { clueId: string; to: ClueV2["status"]; success: boolean; error?: CasDecision["error"] }[];
+  /** E0c6 §1.1 —— triage worker 退出但未产出结果时跳过的原因诊断。 */
+  skippedReason?: string;
 }
 
 /**
@@ -373,6 +375,37 @@ export class MissingExportRootError extends Error {
     );
     this.name = "MissingExportRootError";
   }
+}
+
+/** E0c6 §1.1 —— generate worker 已退出但未产出 dr-doc.result.v1 ⇒ 记录诊断、继续 tick，不得毙掉整条基线。 */
+export class GenerateWorkerExitedWithoutResultError extends Error {
+  constructor(runId: string, role: string, waitedMs: number) {
+    super(
+      `E0c6 §1.1: run ${runId} (${role}) exited without producing a dr-doc.result.v1 after ${waitedMs}ms — refusing to wait the full timeout`,
+    );
+    this.name = "GenerateWorkerExitedWithoutResultError";
+  }
+}
+
+/** E0c6 §1.2 —— triage worker 已退出但未产出 dr-triage.result.v1 ⇒ 立即停止等待并记录诊断。 */
+export class TriageWorkerExitedWithoutResultError extends Error {
+  constructor(runId: string, waitedMs: number) {
+    super(
+      `E0c6 §1.2: run ${runId} (dr-triage) exited without producing a dr-triage.result.v1 after ${waitedMs}ms — refusing to wait the full timeout`,
+    );
+    this.name = "TriageWorkerExitedWithoutResultError";
+  }
+}
+
+/**
+ * E0c6 §1.2 —— 检查一个 run 是否已退出（agent.run.exited 已发布到 board:agent-runs）。
+ * 在读结果轮询中调用，若 run 已退出但无 result ⇒ 立即停止等待。
+ */
+async function checkRunExited(runId: string): Promise<boolean> {
+  const messages = await readChannelMessages(RUNS_CHANNEL_ID);
+  const runs = buildRunsFromMessages(messages);
+  const run = runs[runId];
+  return run !== undefined && run.state === "exited";
 }
 
 /**
@@ -847,17 +880,33 @@ export async function runWrite(
               (decisions) => ({ decisions, runId: deps.triageSpawnRuntime!.runId }),
             );
           });
-        const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
-        const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
-        const applied = await applyTriageBatch(
-          deps,
-          { writes, maxWrites },
-          proposedIds,
-          triageDecisions,
-          triageRunId,
-        );
-        writes = applied.writes;
-        triageReports.push(applied.report);
+        try {
+          const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus);
+          const proposedIds = new Set(decision.proposedClues.map((c) => c.clueId));
+          const applied = await applyTriageBatch(
+            deps,
+            { writes, maxWrites },
+            proposedIds,
+            triageDecisions,
+            triageRunId,
+          );
+          writes = applied.writes;
+          triageReports.push(applied.report);
+        } catch (err) {
+          if (err instanceof TriageWorkerExitedWithoutResultError) {
+            triageReports.push({
+              runId: "",
+              budgetSkipped: false,
+              invalidActions: 0,
+              outOfScopeDropped: 0,
+              casCount: 0,
+              casResults: [],
+              skippedReason: err.message,
+            });
+          } else {
+            throw err;
+          }
+        }
         break;
       }
     }
@@ -1049,6 +1098,10 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E0c6 §1.1 —— 生成段 error 诊断（worker 退出但未产出 result 时记录，⛔ 不得毙掉 tick）。
+   */
+  generateError?: string;
 }
 
 /**
@@ -1320,11 +1373,17 @@ export function assembleGenerateDeps(
         return {};
       },
       readBody: async (runId: string) => {
+        const startTime = Date.now();
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-        const deadline = Date.now() + timeoutMs;
+        const deadline = startTime + timeoutMs;
         while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
+          const exited = await checkRunExited(runId);
+          if (exited) {
+            const waitedMs = Date.now() - startTime;
+            throw new GenerateWorkerExitedWithoutResultError(runId, "generate", waitedMs);
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1597,11 +1656,17 @@ export async function runChannelWrite(
               return {};
             },
             readResult: async (runId) => {
+              const startTime = Date.now();
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
+              const deadline = startTime + timeoutMs;
               while (Date.now() < deadline) {
                 const result = await readTriageResult(runId);
                 if (result !== null) return result;
+                const exited = await checkRunExited(runId);
+                if (exited) {
+                  const waitedMs = Date.now() - startTime;
+                  throw new TriageWorkerExitedWithoutResultError(runId, waitedMs);
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(
@@ -1670,6 +1735,7 @@ export async function runChannelWrite(
   );
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  let generateError: string | undefined;
   if (opts.origin) {
     if (decideGenerate(termination)) {
       const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
@@ -1677,10 +1743,18 @@ export async function runChannelWrite(
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
-        const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
-        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
-        mkdirSync(oneShotDir, { recursive: true });
-        writeFileSync(markerPath, "");
+        try {
+          const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
+          await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+          mkdirSync(oneShotDir, { recursive: true });
+          writeFileSync(markerPath, "");
+        } catch (err) {
+          if (err instanceof GenerateWorkerExitedWithoutResultError) {
+            generateError = err.message;
+          } else {
+            throw err;
+          }
+        }
       }
     }
   }
@@ -1697,6 +1771,7 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    generateError,
   };
 }
 

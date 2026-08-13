@@ -1129,13 +1129,13 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
 
 describe("E0c3b 判据 4: board composition and triage deadlock naming on limit hit", () => {
   it("HIT WALL CLOCK LIMIT (also hit attempt limit) with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
-    // E0c8 §1.1b (GT-19): wall clock is the primary limiter. The attempt
-    // limit only triggers when wall clock is also exhausted. Both limits
-    // are hit simultaneously here.
+    // E0c8 §1.1b (GT-19): wall clock is the primary limiter. GT-22:
+    // DRAIN_MAX_ATTEMPTS is a runaway safeguard that terminates when hit.
+    // This test uses a large maxAttempts so wall clock is hit first.
     const { dir, env, e0regression } = setupE0RegressionEnv(
       "always-null",
       {
-        maxAttempts: 2,
+        maxAttempts: 100,
         wallClockSeconds: 3,
         backoffSeconds: 0,
         terminationStates: [

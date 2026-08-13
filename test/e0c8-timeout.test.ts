@@ -80,28 +80,28 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 // ══════════════════════════════════════════════════════════════════════
 // 判据 2 (GT-18): workflow.yaml node_timeout 判别性
-//   node_timeout=900s 依据：
-//   - GT-13 实测最大单 tick 耗时 904.2s（E0c3b 真机长跑，原 node_timeout=30 的 bug 下）
+//   node_timeout=2000s 依据：
+//   - GT-13 实测最大单 tick 耗时 904.2s（E0c3b 真机长跑，run_id=e0-1786589921832979147-1672191）
 //   - GT-15 实测 30.5s / 39.9s（种子板，node_timeout=30 被引擎杀）
 //   - GT-18 worker 耗时 221.084s / 36.109s（agent.run.exited.v2 exit=0）
-//   - DEFAULT_AGENT_RESULT_TIMEOUT_MS=900_000ms（15min）是单个 worker 等待的上界
-//   node_timeout=900s ≥ 实测最大（904s ≈ 1.004× headroom after bug fix）
-//   且 = DEFAULT_AGENT_RESULT_TIMEOUT_MS/1000，保证合法等待可完成。
+//   node_timeout=2000s ≥ 2.0× 实测最大单 tick 耗时（904.2s × 2.0 = 1808.4s，取 2000s ≈ 2.21×）
 //   若改回 30 ⇒ 测试变红（判据 2 判别性）。
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 2 (GT-18): node_timeout in workflow.yaml aligns with DEFAULT_AGENT_RESULT_TIMEOUT_MS", () => {
-  it("workflow.yaml limits.node_timeout >= DEFAULT_AGENT_RESULT_TIMEOUT_MS / 1000", async () => {
-    const { DEFAULT_AGENT_RESULT_TIMEOUT_MS } = await import("../src/tick-run");
+const MEASURED_MAX_SINGLE_TICK_S = 904.2;
+const COMMENT_MULTIPLIER = 2.0;
+
+describe("判据 2 (GT-18): node_timeout in workflow.yaml ≥ multiplier × measured max single-tick time", () => {
+  it("workflow.yaml limits.node_timeout >= 2.0 × measured max single-tick time (904.2s)", () => {
     const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
     const content = readFileSync(wfPath, "utf8");
     const parsed = YAML.parse(content) as Record<string, unknown>;
     const limits = parsed.limits as Record<string, number>;
     expect(limits).toBeDefined();
     expect(limits.node_timeout).toBeDefined();
-    // node_timeout (seconds) must be >= DEFAULT_AGENT_RESULT_TIMEOUT_MS / 1000 (seconds)
-    // so that a single legitimate wait for worker result can complete before the engine kills the tick.
-    expect(limits.node_timeout).toBeGreaterThanOrEqual(DEFAULT_AGENT_RESULT_TIMEOUT_MS / 1000);
+    // node_timeout (seconds) must be >= COMMENT_MULTIPLIER × MEASURED_MAX_SINGLE_TICK_S
+    // as recorded in the workflow.yaml comment (spec §1.1 / GT-21 evidence).
+    expect(limits.node_timeout).toBeGreaterThanOrEqual(MEASURED_MAX_SINGLE_TICK_S * COMMENT_MULTIPLIER);
   });
 
   it("discriminant: node_timeout is not 30 (the old value that caused GT-15 timeouts)", () => {
@@ -112,13 +112,13 @@ describe("判据 2 (GT-18): node_timeout in workflow.yaml aligns with DEFAULT_AG
     expect(limits.node_timeout).not.toBe(30);
   });
 
-  it("discriminant: changing node_timeout back to 30 would make the >= test fail", () => {
+  it("discriminant: changing node_timeout back to 30 would make the multiplier test fail", () => {
     const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
     const content = readFileSync(wfPath, "utf8");
     const parsed = YAML.parse(content) as Record<string, unknown>;
     const limits = parsed.limits as Record<string, number>;
-    expect(limits.node_timeout).toBeGreaterThanOrEqual(900);
-    // If this were 30, the assertion would fail
+    expect(limits.node_timeout).toBeGreaterThanOrEqual(MEASURED_MAX_SINGLE_TICK_S * COMMENT_MULTIPLIER);
+    // If this were 30, the assertion would fail (30 < 904.2 * 2.0 = 1808.4)
     expect(limits.node_timeout).not.toBe(30);
   });
 });
@@ -152,6 +152,10 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
     // count is exhausted. The entry must continue (not exit due to attempt limit).
     // GT-19: wall clock is the primary limiter; fixed attempt count must not
     // cause failure before the wall clock budget is consumed.
+    // GT-22: DRAIN_MAX_ATTEMPTS is a runaway safeguard — it must terminate when
+    // hit, but the profile self-consistency ensures it never triggers before
+    // wall clock in normal operation. This test uses DRAIN_MAX_ATTEMPTS=100
+    // (well above the wall clock budget of 5s) so wall clock is hit first.
     const dir = mkdtempSync(join(tmpdir(), "e0c8-2a-exec-"));
     try {
       // Symlink critical workspace directories so the entry script can resolve deps
@@ -162,7 +166,7 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
         }
       }
 
-      // Create profile with wall clock = 5s, max attempts = 2, backoff = 0
+      // Create profile with wall clock = 5s, max attempts = 100, backoff = 0
       const profilesDir = join(dir, "profiles", "deploy");
       mkdirSync(profilesDir, { recursive: true });
       const binDir = join(dir, "bin");
@@ -185,7 +189,7 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
         "SEED_CLUE=test seed",
         "SEED_SOURCES=code-local",
         "DRAIN_BACKOFF_SECONDS=0",
-        "DRAIN_MAX_ATTEMPTS=2",
+        "DRAIN_MAX_ATTEMPTS=100",
         "DRAIN_WALL_CLOCK_SECONDS=5",
         `LOOP_ENGINE_RUNTIME_ROOT=${engineRoot}`,
         "",
@@ -266,12 +270,12 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
         const out = String(ee.stdout ?? "");
         const err = String(ee.stderr ?? "");
         // With wall-clock-primary, the entry continues past the attempt limit
-        // and eventually hits the wall clock limit. It should NOT exit with
-        // HIT ATTEMPT LIMIT (that would be the "attempts-first" reverted case).
-        // With wall-clock-primary, the entry continues past the attempt limit
-        // (2 attempts) and eventually hits the wall clock limit.
+        // (100 attempts) and eventually hits the wall clock limit (5s).
         // It should NOT exit with HIT ATTEMPT LIMIT (that would be the
         // "attempts-first" reverted case).
+        // GT-22: DRAIN_MAX_ATTEMPTS is a runaway safeguard that terminates when
+        // actually hit, but with 100 attempts and 5s wall clock, the wall clock
+        // is always hit first in normal operation.
         expect(err).not.toMatch(/HIT ATTEMPT LIMIT/i);
         expect(err).toMatch(/HIT WALL CLOCK LIMIT/i);
       }
@@ -609,97 +613,106 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
     const CHANNEL = "research:e0c8-gen-bounded";
+    // Use a unique oneShotDir so the marker file is isolated per run and
+    // cleaned up after the test (判据 1 requires running twice; without
+    // cleanup, the second run finds the marker and skips the generate path).
+    const oneShotDir = mkdtempSync(join(tmpdir(), "e0c8-gen-oneshot-"));
 
-    lastSpawnedRunId = "";
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("board:agent-runs")) {
-        const rid = lastSpawnedRunId;
-        if (rid) {
+    try {
+      lastSpawnedRunId = "";
+      vi.stubGlobal("fetch", async (input: RequestInfo) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("board:agent-runs")) {
+          const rid = lastSpawnedRunId;
+          if (rid) {
+            return messagesResponse([
+              {
+                message_id: "msg_exited",
+                channel_id: "board:agent-runs",
+                channel_seq: 1,
+                kind: "agent.run.exited.v1",
+                payload: { run_id: rid, exit_code: 0 },
+                entity_id: rid,
+                supersedes: null,
+                created_at: "2026-08-01T00:00:00Z",
+              },
+            ]);
+          }
+          return emptyMessagesResponse();
+        }
+        if (url.includes("/publish")) {
+          return jsonResponse({ message_id: "pub_001" });
+        }
+        if (url.includes("/v1/entities/")) {
+          return jsonResponse({
+            head: {
+              message_id: "head_001",
+              channel_id: CHANNEL,
+              channel_seq: 1,
+              kind: "research.clue.v2",
+              payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
+              entity_id: "e1",
+              supersedes: null,
+              created_at: "2026-08-01T00:00:00Z",
+            },
+          });
+        }
+        if (url.includes("/messages")) {
           return messagesResponse([
             {
-              message_id: "msg_exited",
-              channel_id: "board:agent-runs",
+              message_id: "msg_e1",
+              channel_id: CHANNEL,
               channel_seq: 1,
-              kind: "agent.run.exited.v1",
-              payload: { run_id: rid, exit_code: 0 },
-              entity_id: rid,
+              kind: "research.clue.v2",
+              payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
+              entity_id: "e1",
+              supersedes: null,
+              created_at: "2026-08-01T00:00:00Z",
+            },
+            {
+              message_id: "msg_e2",
+              channel_id: CHANNEL,
+              channel_seq: 2,
+              kind: "research.clue.v2",
+              payload: { status: "explored", text: "explored 2", depth: 1, sources: ["wiki"] },
+              entity_id: "e2",
+              supersedes: null,
+              created_at: "2026-08-01T00:00:00Z",
+            },
+            {
+              message_id: "msg_e3",
+              channel_id: CHANNEL,
+              channel_seq: 3,
+              kind: "research.clue.v2",
+              payload: { status: "explored", text: "explored 3", depth: 1, sources: ["wiki"] },
+              entity_id: "e3",
               supersedes: null,
               created_at: "2026-08-01T00:00:00Z",
             },
           ]);
         }
         return emptyMessagesResponse();
-      }
-      if (url.includes("/publish")) {
-        return jsonResponse({ message_id: "pub_001" });
-      }
-      if (url.includes("/v1/entities/")) {
-        return jsonResponse({
-          head: {
-            message_id: "head_001",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
-            entity_id: "e1",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        });
-      }
-      if (url.includes("/messages")) {
-        return messagesResponse([
-          {
-            message_id: "msg_e1",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "explored", text: "explored 1", depth: 1, sources: ["wiki"] },
-            entity_id: "e1",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-          {
-            message_id: "msg_e2",
-            channel_id: CHANNEL,
-            channel_seq: 2,
-            kind: "research.clue.v2",
-            payload: { status: "explored", text: "explored 2", depth: 1, sources: ["wiki"] },
-            entity_id: "e2",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-          {
-            message_id: "msg_e3",
-            channel_id: CHANNEL,
-            channel_seq: 3,
-            kind: "research.clue.v2",
-            payload: { status: "explored", text: "explored 3", depth: 1, sources: ["wiki"] },
-            entity_id: "e3",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        ]);
-      }
-      return emptyMessagesResponse();
-    });
+      });
 
-    const { runChannelWrite } = await import("../src/tick-run");
-    const startTime = Date.now();
-    const result = await runChannelWrite({
-      channelId: CHANNEL,
-      maxWrites: 10,
-      workerCmd: "/fake/agent-run",
-      origin: "test-origin",
-      docChannelId: "research:e0c8-gen-bounded.docs",
-      question: "test question?",
-      maxClues: 3,
-    });
+      const { runChannelWrite } = await import("../src/tick-run");
+      const startTime = Date.now();
+      const result = await runChannelWrite({
+        channelId: CHANNEL,
+        maxWrites: 10,
+        workerCmd: "/fake/agent-run",
+        origin: "test-origin",
+        docChannelId: "research:e0c8-gen-bounded.docs",
+        question: "test question?",
+        maxClues: 3,
+        oneShotDir,
+      });
 
-    expect(result).toBeDefined();
-    const elapsed = Date.now() - startTime;
-    expect(elapsed).toBeLessThan(500);
+      expect(result).toBeDefined();
+      const elapsed = Date.now() - startTime;
+      expect(elapsed).toBeLessThan(500);
+    } finally {
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
   });
 
   it("isRunExited detects agent.run.exited.v1 and agent.run.exited.v2", async () => {
@@ -1091,13 +1104,13 @@ it("real --run on a seed board (1 clue) returns timings and termination", async 
       expect(typeof result.timings.totalMs).toBe("number");
       expect(typeof result.timings.readMs).toBe("number");
 
-      // On a seed board, should complete quickly (well under node_timeout/2)
-      const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
-      const wfContent = readFileSync(wfPath, "utf8");
-      const wfParsed = YAML.parse(wfContent) as Record<string, unknown>;
-      const wfLimits = wfParsed.limits as Record<string, number>;
-      const nodeTimeoutMs = (wfLimits.node_timeout ?? 900) * 1000;
-      expect(elapsed).toBeLessThan(nodeTimeoutMs / 2);
+      // On a seed board, should complete quickly (well under 30s, the old
+      // node_timeout=30 that caused GT-15 engine kills).  If the tick were
+      // still slow enough to be killed by the old node_timeout=30, this test
+      // would fail.  The discriminant: reverting §1.1 (making the tick slow
+      // again) ⇒ this test goes red.
+      const OLD_NODE_TIMEOUT_MS = 30 * 1000;
+      expect(elapsed).toBeLessThan(OLD_NODE_TIMEOUT_MS / 2);
 
       // termination should be readable
       expect(result.termination).toBeDefined();

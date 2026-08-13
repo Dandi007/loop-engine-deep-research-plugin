@@ -545,52 +545,33 @@ describe("判据 4b: MAX_CLUES is profile-declared (regression scope narrowed)",
     expect(profText).toContain("MAX_CLUES=");
   });
 
-  it("--run with maxClues uses the profile value, not the default", async () => {
-    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
-    process.env.AGENT_RESULT_POLL_MS = "10";
+  it("DISCRIMINATING: production wiring — fleet.yaml.tpl injects max_clues", () => {
+    // Verifies that the production assembly chain carries MAX_CLUES to the tick.
+    // If someone removes max_clues from fleet.yaml.tpl, this test fails.
+    const fleetTpl = readFileSync(
+      join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"),
+      "utf8",
+    );
+    expect(fleetTpl).toContain("max_clues: ${MAX_CLUES}");
+  });
 
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("board:agent-runs")) {
-        return jsonResponse({ messages: [] });
-      }
-      if (url.includes("/publish")) {
-        return jsonResponse({ message_id: "pub_001" });
-      }
-      if (url.includes("/v1/entities/")) {
-        return jsonResponse({
-          head: {
-            message_id: "head_001",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "open", text: "clue", depth: 0, sources: ["code-local"] },
-            entity_id: "c1",
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        });
-      }
-      if (url.includes("/messages")) {
-        return jsonResponse({
-          messages: [
-            clueMsg("c1", { status: "open", depth: 0, sources: ["code-local"] }, 1),
-          ],
-        });
-      }
-      return jsonResponse({ messages: [] });
-    });
+  it("DISCRIMINATING: production wiring — tick.md appends --max-clues to tick_args", () => {
+    // Verifies that tick.md passes --max-clues to tick-entry.
+    // If someone removes the --max-clues wiring from tick.md, this test fails.
+    const tickMd = readFileSync(
+      join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md"),
+      "utf8",
+    );
+    expect(tickMd).toContain("max_clues");
+    expect(tickMd).toContain("--max-clues");
+  });
 
-    const result = await runChannelWrite({
-      channelId: CHANNEL,
-      question: "test question?",
-      workerCmd: "/fake/agent-run",
-      allowedRoot: ROOT,
-      maxWrites: 10,
-      maxClues: 24,
-    });
-
-    expect(result.termination).toBeDefined();
-    expect(result.termination.boardComposition).toBeDefined();
+  it("DISCRIMINATING: production wiring — workflow.yaml seed payload has max_clues", () => {
+    // Verifies that the workflow.yaml seed payload passes max_clues through.
+    // If someone removes max_clues from the seed payload, this test fails.
+    const wf = parse(readFileSync(WORKFLOW_YAML, "utf8"));
+    const tickSeed = (wf as any).seed?.[0];
+    expect(tickSeed).toBeDefined();
+    expect(tickSeed.payload?.max_clues).toBeDefined();
   });
 });

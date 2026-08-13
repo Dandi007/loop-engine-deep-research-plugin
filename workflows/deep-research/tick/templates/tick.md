@@ -27,6 +27,7 @@ research_question="{{research_question}}"
 research_origin="{{research_origin}}"
 doc_channel="{{doc_channel}}"
 triage_threshold="{{triage_threshold}}"
+max_clues="{{max_clues}}"
 trigger_store_dir="{{trigger_store_dir}}"
 loop_store_cli="{{loop_store_cli}}"
 loop_engine_runner="{{loop_engine_runner}}"
@@ -55,6 +56,8 @@ if [ -n "$tick_channel" ]; then
   if [ -n "$doc_channel" ]; then tick_args+=(--doc-channel "$doc_channel"); fi
   # E0c3b §1.1 —— triage 触发阈值：由 pipeline input 注入（缺省 3），与 MAX_WRITES 同款装配链。
   if [ -n "$triage_threshold" ]; then tick_args+=(--triage-threshold "${triage_threshold}"); fi
+  # E0c7 判据 4b —— maxClues 上限：由 pipeline input 注入（缺省 64），与 MAX_WRITES 同款装配链。
+  if [ -n "$max_clues" ]; then tick_args+=(--max-clues "$max_clues"); fi
   # G4b —— 从 trigger_body 解析上一轮的 coverage / zeroGrowthRounds 并传给 tick-entry。
   #   ⛔ body 一旦非空就必须是合法 JSON。首轮判定基于 **seed 标记**（{"seed":true}）：
   #      seed body ⇒ 不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。

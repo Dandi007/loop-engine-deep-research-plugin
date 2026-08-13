@@ -7,7 +7,7 @@
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
 # E0c9 §1.1 —— node_timeout 取 1800s，大于实测最大单 tick 耗时（904.2s，派发方 2026-08-13 真机取证）。
-#   1800 / 904.2 ≈ 2.0× 余量：覆盖合法 tick 工作（bus I/O + spawn + 等 worker 结果 + harvest + triage + generate），
+#   1800 / 904.2 ≈ 1.99× 余量：覆盖合法 tick 工作（bus I/O + spawn + 等 worker 结果 + harvest + triage + generate），
 #   同时保留「超过上界要响亮失败」的语义（非无上限）。引擎闸刀必须大于一次合法的等待预算：
 #   DEFAULT_AGENT_RESULT_TIMEOUT_MS = 900_000（15 分钟）是 agent 结果等待预算，若 node_timeout ≤ 它，
 #   合法等待仍会被腰斩。1800s = 30 分钟 > 15 分钟，保证引擎闸刀在合法等待预算之后。
@@ -35,6 +35,9 @@ seed:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 fleet input 注入 tick.md，
       # 再传给 tick-entry --run。与 MAX_WRITES 同款装配链（缺省 3）。
       triage_threshold: "{{triage_threshold}}"
+      # E0c9 §1.1b —— 板面上限（--max-clues）：由 fleet input 注入 tick.md，
+      # 再传给 tick-entry --run。回归 profile 降为 16 以收窄范围（缺省 64）。
+      max_clues: "{{max_clues}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

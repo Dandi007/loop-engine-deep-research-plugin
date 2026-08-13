@@ -3,19 +3,128 @@
  *
  * 覆盖 spec §2 判据 2–4b（判别性单测）。
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
-import { DEFAULT_AGENT_RESULT_TIMEOUT_MS } from "../src/tick-run";
-import { hasRunExited } from "../src/tick-inspect";
+import {
+  runChannelWrite,
+  assembleGenerateDeps,
+  DEFAULT_AGENT_RESULT_TIMEOUT_MS,
+  RunExitedWithoutDocError,
+} from "../src/tick-run";
+import { hasRunExited, type InspectMessage } from "../src/tick-inspect";
 import { DEFAULT_TICK_CONFIG } from "../src/tick";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_YAML = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
+const CHANNEL = "research:p-e0c9-timeout";
+
+// Mock child_process.spawn to prevent ENOENT for fake agent-run
+function createMockChild() {
+  const EventEmitter = require("node:events").EventEmitter;
+  const child = new EventEmitter();
+  child.pid = 12345;
+  child.unref = () => {};
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  setImmediate(() => child.emit("exit", 0));
+  return child;
+}
+
+// Store captured triage run_id for test assertions
+let __capturedTriageRunId = "";
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual("node:child_process") as typeof import("node:child_process");
+  return {
+    ...actual,
+    spawn: (cmd: string, args: string[], opts?: unknown) => {
+      const runIdIdx = args.indexOf("--run-id");
+      const roleIdx = args.indexOf("--role");
+      if (runIdIdx >= 0 && roleIdx >= 0 && args[roleIdx + 1] === "dr-triage") {
+        __capturedTriageRunId = args[runIdIdx + 1] ?? "";
+      }
+      return createMockChild();
+    },
+  };
+});
+
+function jsonResponse(data: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => data,
+    text: async () => JSON.stringify(data),
+  };
+}
+
+function emptyMessagesResponse() {
+  return jsonResponse({ messages: [] });
+}
+
+function messagesResponse(msgs: InspectMessage[]) {
+  return jsonResponse({ messages: msgs });
+}
+
+function clueMsg(
+  clueId: string,
+  over: Record<string, unknown> = {},
+  seq = 1,
+): InspectMessage {
+  return {
+    message_id: `msg_${clueId}`,
+    channel_id: CHANNEL,
+    channel_seq: seq,
+    kind: "research.clue.v2",
+    payload: {
+      status: "explored",
+      text: `clue ${clueId}`,
+      depth: 1,
+      sources: ["code-local"],
+      ...over,
+    },
+    entity_id: clueId,
+    supersedes: null,
+    created_at: "2026-08-01T00:00:00Z",
+  };
+}
+
+function triageResultMsg(runId: string, decisions: Array<{ clue_id: string; action: "keep" | "drop"; rationale: string }>, seq = 100): InspectMessage {
+  return {
+    message_id: `msg_triage_${runId}`,
+    channel_id: "board:agent-runs",
+    channel_seq: seq,
+    kind: "dr-triage.result.v1",
+    payload: { run_id: runId, decisions },
+    entity_id: runId,
+    supersedes: null,
+    created_at: "2026-08-01T00:00:01Z",
+  };
+}
+
+function termState(over: Partial<TerminationState> = {}): TerminationState {
+  return {
+    state: "converged",
+    coverage: 0,
+    zeroGrowthRounds: 3,
+    capHit: false,
+    boardComposition: { proposed: 0, open: 0, inFlight: 0, explored: 0, blocked: 0 },
+    ...over,
+  };
+}
+
+function boardState(over: Partial<BoardState> = {}): BoardState {
+  return { cards: [], runs: {}, triageInFlight: false, ...over };
+}
+
+function setEnv(k: string, v: string | undefined): void {
+  if (v === undefined) delete process.env[k];
+  else process.env[k] = v;
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // 判据 2: node_timeout >= 实测最大单 tick 耗时 x 倍数
@@ -27,10 +136,9 @@ describe("判据 2: node_timeout >= measured max single-tick duration x headroom
     const doc = parse(yaml) as { limits?: { node_timeout?: number } };
     const nodeTimeout = doc?.limits?.node_timeout;
     expect(nodeTimeout).toBeDefined();
-    const MEASURED_MAX_MS = 904.2;
-    expect(nodeTimeout).toBeGreaterThan(MEASURED_MAX_MS);
-    // 1800 / 904.2 ≈ 1.99x headroom
-    expect(nodeTimeout! / MEASURED_MAX_MS).toBeGreaterThanOrEqual(1.99);
+    const MEASURED_MAX_SECONDS = 904.2;
+    expect(nodeTimeout).toBeGreaterThan(MEASURED_MAX_SECONDS);
+    expect(nodeTimeout! / MEASURED_MAX_SECONDS).toBeGreaterThanOrEqual(1.99);
   });
 
   it("node_timeout is exactly 1800 (round value)", () => {
@@ -56,11 +164,20 @@ describe("判据 2: node_timeout >= measured max single-tick duration x headroom
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 2a (GT-19): 墙钟预算为主，不可让次数先撞线
+// 判据 2a (GT-19): 墙钟预算为主，墙钟先于次数检查
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 2a (GT-19): wall clock budget is primary, attempt count is safety net", () => {
-  it("profile DRAIN_MAX_ATTEMPTS > wall_clock / backoff by a safe margin", () => {
+describe("判据 2a (GT-19): wall clock budget is primary", () => {
+  it("wall clock is checked before attempt count in e0-regression.sh", () => {
+    const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
+    const wallClockIdx = script.indexOf("HIT WALL CLOCK LIMIT");
+    const attemptIdx = script.indexOf("HIT ATTEMPT LIMIT");
+    expect(wallClockIdx).toBeGreaterThan(0);
+    expect(attemptIdx).toBeGreaterThan(0);
+    expect(wallClockIdx).toBeLessThan(attemptIdx);
+  });
+
+  it("profile DRAIN_MAX_ATTEMPTS > wall_clock / (shortest drain + backoff) by safe margin", () => {
     const profilePath = join(ROOT, "profiles", "deploy", "e0-regression.env");
     const content = readFileSync(profilePath, "utf8");
     const wallClock = Number(content.match(/DRAIN_WALL_CLOCK_SECONDS=(\d+)/)?.[1]);
@@ -71,6 +188,7 @@ describe("判据 2a (GT-19): wall clock budget is primary, attempt count is safe
     expect(maxAttempts).toBeGreaterThan(0);
     const worstCaseThroughput = wallClock / backoff;
     expect(maxAttempts).toBeGreaterThan(worstCaseThroughput);
+    expect(maxAttempts).toBeGreaterThanOrEqual(worstCaseThroughput * 2);
   });
 
   it("discriminant: DRAIN_MAX_ATTEMPTS=12 would be <= worst-case throughput", () => {
@@ -89,47 +207,232 @@ describe("判据 2a (GT-19): wall clock budget is primary, attempt count is safe
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 3 (GT-14/§1.2): hasRunExited 函数存在且可判
+// 判据 2b (GT-15/GT-16): seed board tick completes well below half node_timeout
 // ══════════════════════════════════════════════════════════════════════
 
-describe("判据 3 (GT-14/§1.2): hasRunExited function exists and correctly detects exit status", () => {
-  it("hasRunExited returns true when agent.run.exited event exists for the run_id", () => {
-    const messages = [
-      {
-        message_id: "m1",
-        channel_id: "board:agent-runs",
-        channel_seq: 1,
-        kind: "agent.run.exited.v2",
-        payload: { run_id: "run-001", exit_code: 0 },
-        entity_id: "run-001",
-        supersedes: null,
-        created_at: "2026-08-01T00:00:00Z",
-      },
+describe("判据 2b (GT-15/GT-16): seed-board tick well below half node_timeout", () => {
+  beforeEach(() => {
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  it("seed board (1 explored clue) tick completes with timings, totalMs below half node_timeout", async () => {
+    setEnv("AGENT_RESULT_TIMEOUT_MS", "500");
+    setEnv("AGENT_RESULT_POLL_MS", "10");
+
+    const cards = [clueMsg("c1", { status: "explored" }, 1)];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse(cards);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const yaml = readFileSync(WORKFLOW_YAML, "utf8");
+    const doc = parse(yaml) as { limits?: { node_timeout?: number } };
+    const nodeTimeout = doc?.limits?.node_timeout ?? 1800;
+    const halfTimeout = nodeTimeout * 1000 * 0.5;
+
+    const result = await runChannelWrite({ channelId: CHANNEL });
+
+    expect(result.timings).toBeDefined();
+    expect(result.timings.totalMs).toBeGreaterThanOrEqual(0);
+    expect(result.timings.totalMs).toBeLessThan(halfTimeout);
+    expect(result.timings.readPhaseMs).toBeGreaterThanOrEqual(0);
+    expect(result.timings.writePhaseMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("timings field is present in --run JSON output", async () => {
+    setEnv("AGENT_RESULT_TIMEOUT_MS", "500");
+    setEnv("AGENT_RESULT_POLL_MS", "10");
+
+    const cards = [clueMsg("c1", { status: "explored" }, 1)];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse(cards);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({ channelId: CHANNEL });
+    const json = JSON.stringify(result);
+    expect(json).toContain('"timings"');
+    expect(json).toContain('"totalMs"');
+    expect(json).toContain('"readPhaseMs"');
+    expect(json).toContain('"writePhaseMs"');
+    expect(json).toContain('"generatePhaseMs"');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 判据 2z (GT-17): triage run exited without result ⇒ tick exits 0 with diagnostic
+// ══════════════════════════════════════════════════════════════════════
+
+describe("判据 2z (GT-17): triage run exited without result ⇒ tick exits 0 with diagnostic", () => {
+  beforeEach(() => {
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  it("triage run exited without result ⇒ tick returns [], tick continues normally", async () => {
+    setEnv("AGENT_RESULT_TIMEOUT_MS", "500");
+    setEnv("AGENT_RESULT_POLL_MS", "10");
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
     ];
-    expect(hasRunExited("run-001", messages)).toBe(true);
+
+    let capturedTriageRunId = "";
+    let agentRunsReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        if (__capturedTriageRunId && agentRunsReads >= 2) {
+          return messagesResponse([
+            {
+              message_id: "msg_exited",
+              channel_id: "board:agent-runs",
+              channel_seq: 100,
+              kind: "agent.run.exited.v2",
+              payload: { run_id: __capturedTriageRunId, exit_code: 0 },
+              entity_id: __capturedTriageRunId,
+              supersedes: null,
+              created_at: "2026-08-01T00:00:01Z",
+            },
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const stderrChunks: string[] = [];
+    const origStderr = process.stderr.write;
+    process.stderr.write = ((chunk: string) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+
+    try {
+      const result = await runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 10,
+      });
+
+      expect(result.triageReports[0].casCount).toBe(0);
+      expect(result.triageReports[0].budgetSkipped).toBe(false);
+      const stderr = stderrChunks.join("");
+      expect(stderr).toContain("exited without producing a dr-triage.result.v1");
+      expect(stderr).toContain("recording as local failure, continuing");
+      expect(stderr).toMatch(/after \d+ms/);
+    } finally {
+      process.stderr.write = origStderr;
+    }
   });
 
-  it("hasRunExited returns false when no agent.run.exited event exists", () => {
-    const messages = [
-      {
-        message_id: "m1",
-        channel_id: "board:agent-runs",
-        channel_seq: 1,
-        kind: "agent.run.started.v2",
-        payload: { run_id: "run-001" },
-        entity_id: "run-001",
-        supersedes: null,
-        created_at: "2026-08-01T00:00:00Z",
-      },
-    ];
-    expect(hasRunExited("run-001", messages)).toBe(false);
+  it("reverse case: bus unreachable ⇒ tick still must exit non-zero (throw)", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("fetch failed: connect ECONNREFUSED");
+    });
+
+    await expect(
+      runChannelWrite({ channelId: CHANNEL }),
+    ).rejects.toThrow();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// 判据 3 (GT-14/§1.2): exited-without-result detection immediately stops waiting
+// ══════════════════════════════════════════════════════════════════════
+
+describe("判据 3 (GT-14/§1.2): exited-without-result detection immediately stops waiting", () => {
+  beforeEach(() => {
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
   });
 
-  it("hasRunExited returns false for empty messages", () => {
-    expect(hasRunExited("run-001", [])).toBe(false);
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
   });
 
-  it("discriminant: if hasRunExited were removed, this test would fail", () => {
+  it("generate readBody stops immediately when run exited without result (throws RunExitedWithoutDocError)", async () => {
+    setEnv("AGENT_RESULT_TIMEOUT_MS", "900000");
+    setEnv("AGENT_RESULT_POLL_MS", "3000");
+
+    const generateRunId = "e0c9-gen-exited-001";
+    let agentRunsReads = 0;
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        return messagesResponse([
+          {
+            message_id: "msg_exited",
+            channel_id: "board:agent-runs",
+            channel_seq: 1,
+            kind: "agent.run.exited.v2",
+            payload: { run_id: generateRunId, exit_code: 0 },
+            entity_id: generateRunId,
+            supersedes: null,
+            created_at: "2026-08-01T00:00:01Z",
+          },
+        ]);
+      }
+      return emptyMessagesResponse();
+    });
+
+    const deps = assembleGenerateDeps(
+      { channelId: CHANNEL, workerCmd: "/fake/agent-run" },
+      termState(),
+      boardState(),
+    );
+
+    await expect(
+      deps.spawnRuntime!.readBody(generateRunId),
+    ).rejects.toThrow(RunExitedWithoutDocError);
+
+    expect(agentRunsReads).toBeLessThanOrEqual(6);
+  });
+
+  it("discriminant: hasRunExited deleted from call sites would leave tests green", () => {
     const code = readFileSync(join(ROOT, "src", "tick-inspect.ts"), "utf8");
     expect(code).toContain("export function hasRunExited");
   });
@@ -181,7 +484,7 @@ describe("判据 4 (§1.3): check-drain-failures detects TIMEOUT failures", () =
     return { dir, engineRoot, runDir };
   }
 
-  it("detects [外部调用失敗 status=TIMEOUT] in journal", () => {
+  it("detects [外部调用失败 status=TIMEOUT] in journal", () => {
     const drainId = "test-drain-c4-a";
     const { dir, engineRoot, runDir } = setupDrainEnv(drainId, "[外部调用失败 status=TIMEOUT]\n", "exec");
     const drainSummary = JSON.stringify({ reason: "drained", rounds: 1, ticksByLabel: { tick: 1 }, runs_root: join(engineRoot, "runs", `run-${drainId}`), drain_id: drainId });
@@ -227,7 +530,7 @@ describe("判据 4 (§1.3): check-drain-failures detects TIMEOUT failures", () =
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// 判据 4b (regression): TICK FAILURE is visible and names run_dir
+// 判据 4b (regression): TICK FAILURE is visible and names run_dir, MAX_CLUES by profile
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 4b (regression): TICK FAILURE visible, names run_dir, MAX_CLUES by profile", () => {
@@ -243,9 +546,24 @@ describe("判据 4b (regression): TICK FAILURE visible, names run_dir, MAX_CLUES
     expect(script).toContain("TICK FAILURE");
   });
 
+  it("e0-regression profile declares MAX_CLUES=16", () => {
+    const profile = readFileSync(join(ROOT, "profiles", "deploy", "e0-regression.env"), "utf8");
+    expect(profile).toContain("MAX_CLUES=16");
+  });
+
   it("e0-regression profile has MAX_WRITES=96", () => {
     const profile = readFileSync(join(ROOT, "profiles", "deploy", "e0-regression.env"), "utf8");
     expect(profile).toContain("MAX_WRITES=96");
+  });
+
+  it("fleet.yaml.tpl wires max_clues", () => {
+    const tpl = readFileSync(join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"), "utf8");
+    expect(tpl).toContain("max_clues");
+  });
+
+  it("deep-research-loop.sh exports MAX_CLUES", () => {
+    const script = readFileSync(join(ROOT, "bin", "deep-research-loop.sh"), "utf8");
+    expect(script).toContain("MAX_CLUES");
   });
 });
 
@@ -274,7 +592,6 @@ describe("判据 5 (regression): previous behavior preserved", () => {
     const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
     expect(script).toContain("DRAIN_MAX_ATTEMPTS");
     expect(script).toContain("HIT ATTEMPT LIMIT");
-    // The safety net causes LOOP_EXIT=4 then break
     expect(script).toMatch(/HIT ATTEMPT LIMIT[\s\S]*LOOP_EXIT=4[\s\S]*break/);
   });
 });

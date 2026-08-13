@@ -379,21 +379,8 @@ _drain_fail_echo() {
 }
 
 while true; do
-  # 次数上限检查（先于增量，使 drain_attempts 反映实际执行次数而非 off-by-one）
-  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
-      fi
-    fi
-    LOOP_EXIT=4
-    break
-  fi
-
-  # 墙钟上限检查（先于自增，使 drain_attempts 反映实际执行次数而非 off-by-one）
+  # E0c9 §1.1b —— 墙钟预算为主：先查墙钟，后查次数（次数是失控兜底）。
+  # 墙钟未耗尽即继续；次数只在墙钟耗尽后才作为兜底触发。
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
@@ -405,6 +392,20 @@ while true; do
         if [ -n "$_last_term" ]; then
           _print_board_composition "$_last_term"
         fi
+      fi
+    fi
+    LOOP_EXIT=4
+    break
+  fi
+
+  # 次数上限检查（失控兜底，正常情形下不会先于墙钟触发）
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
+    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+    if [ -f "$_last_stdout" ]; then
+      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+      if [ -n "$_last_term" ]; then
+        _print_board_composition "$_last_term"
       fi
     fi
     LOOP_EXIT=4

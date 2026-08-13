@@ -250,6 +250,19 @@ export class InvalidTriageActionError extends Error {
   }
 }
 
+/**
+ * E0c9 §1.1c —— generate run 已退出但没有产出 dr-doc.result.v1。
+ * 被 runChannelWrite 捕获后记录诊断并继续，不使 tick 非零退出。
+ */
+export class RunExitedWithoutDocError extends Error {
+  constructor(runId: string, waitedMs: number) {
+    super(
+      `G4c: run ${runId} (generate) exited without producing a dr-doc.result.v1 after ${waitedMs}ms — recording as local failure, continuing`,
+    );
+    this.name = "RunExitedWithoutDocError";
+  }
+}
+
 /** G2b §2.3(b) —— clue_id 越界（不在本轮 proposed 集合）被丢弃并响亮记录（查得到 ≠ 有权改）。 */
 export class OutOfScopeTriageClueError extends Error {
   constructor(clueId: string) {
@@ -1050,6 +1063,20 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E0c9 §1.1 —— 全 tick 计时（毫秒），覆盖读板、决策、写、spawn、triage、generate 全部阶段。
+   * 交付方 2026-08-13 真机取证实测最大单 tick 耗时 904.2s。
+   * `totalMs` = 整个 tick 从 runChannelWrite 开始到返回的完整耗时。
+   * `readPhaseMs` = 读板面 + 读 runs channel 耗时。
+   * `writePhaseMs` = 执行 write 决策（CAS/spawn/harvest/triage）耗时。
+   * `generatePhaseMs` = runGenerate 耗时（未触发生成段时为 0）。
+   */
+  timings: {
+    totalMs: number;
+    readPhaseMs: number;
+    writePhaseMs: number;
+    generatePhaseMs: number;
+  };
 }
 
 /**
@@ -1322,17 +1349,18 @@ export function assembleGenerateDeps(
       },
       readBody: async (runId: string) => {
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-        const deadline = Date.now() + timeoutMs;
+        const startTs = Date.now();
+        const deadline = startTs + timeoutMs;
         while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
-          // E0c9 §1.2: check if the run has exited without producing a result
           const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
           if (hasRunExited(runId, runsMsgs)) {
+            const waitedMs = Date.now() - startTs;
             process.stderr.write(
-              `[tick] run ${runId} (generate) exited without producing a dr-doc.result.v1 — recording as local failure, continuing\n`,
+              `[tick] run ${runId} (generate) exited without producing a dr-doc.result.v1 after ${waitedMs}ms — recording as local failure, continuing\n`,
             );
-            return "";
+            throw new RunExitedWithoutDocError(runId, waitedMs);
           }
           await new Promise((r) => setTimeout(r, pollMs));
         }
@@ -1500,6 +1528,7 @@ export function assembleGenerateDeps(
 export async function runChannelWrite(
   opts: RunWriteOptions,
 ): Promise<RunWriteOutcome> {
+  const t0 = Date.now();
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
@@ -1530,6 +1559,7 @@ export async function runChannelWrite(
       coveredClueIds = [...merged];
     }
   }
+  const t1 = Date.now();
   const state = assembled.state;
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
@@ -1607,16 +1637,18 @@ export async function runChannelWrite(
             },
             readResult: async (runId) => {
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
+              const startTs = Date.now();
+              const deadline = startTs + timeoutMs;
               while (Date.now() < deadline) {
                 const result = await readTriageResult(runId);
                 if (result !== null) return result;
-                // E0c9 §1.2: check if the run has exited without producing a result
                 const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
                 if (hasRunExited(runId, runsMsgs)) {
-                  throw new Error(
-                    `G5: triage run ${runId} exited without producing a dr-triage.result.v1 — refusing to dead-wait`,
+                  const waitedMs = Date.now() - startTs;
+                  process.stderr.write(
+                    `[tick] run ${runId} (triage) exited without producing a dr-triage.result.v1 after ${waitedMs}ms — recording as local failure, continuing\n`,
                   );
+                  return [];
                 }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
@@ -1635,6 +1667,7 @@ export async function runChannelWrite(
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  const t2 = Date.now();
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1686,21 +1719,37 @@ export async function runChannelWrite(
   );
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
+  let generatePhaseMs = 0;
   if (opts.origin) {
     if (decideGenerate(termination)) {
+      const generateStart = Date.now();
       const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
       const markerKey = `${opts.origin}:${opts.channelId}`;
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
         const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
-        await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
-        mkdirSync(oneShotDir, { recursive: true });
-        writeFileSync(markerPath, "");
+        let generateSucceeded = false;
+        try {
+          await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+          generateSucceeded = true;
+        } catch (err) {
+          if (err instanceof RunExitedWithoutDocError) {
+            process.stderr.write(`[tick] ${(err as Error).message}\n`);
+          } else {
+            throw err;
+          }
+        }
+        if (generateSucceeded) {
+          mkdirSync(oneShotDir, { recursive: true });
+          writeFileSync(markerPath, "");
+        }
       }
+      generatePhaseMs = Date.now() - generateStart;
     }
   }
 
+  const totalMs = Date.now() - t0;
   return {
     channelId: opts.channelId,
     messageCount: messages.length,
@@ -1713,6 +1762,12 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    timings: {
+      totalMs,
+      readPhaseMs: t1 - t0,
+      writePhaseMs: t2 - t1,
+      generatePhaseMs,
+    },
   };
 }
 
@@ -1805,6 +1860,8 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /** E0c9 §1.1b —— 板面上限（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
+  maxClues?: number;
 }
 
 /**
@@ -1828,6 +1885,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1911,6 +1969,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c9: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1926,6 +1993,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

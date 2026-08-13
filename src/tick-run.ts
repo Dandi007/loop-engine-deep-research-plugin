@@ -55,6 +55,7 @@ import {
   readExistingTranscript,
   fetchMaterialHttp,
   createMutex,
+  parseContentClueText,
   type IngestDeps,
 } from "./ingest";
 import { fileParse } from "./mineru";
@@ -380,6 +381,112 @@ export class MissingAllowedRootError extends Error {
     );
     this.name = "MissingAllowedRootError";
   }
+}
+
+/**
+ * E1b D5——派发一条 `sources:["content"]` 的 clue 时，按 clue 携带的 digest 从
+ * `research:content` 读不到 transcript（GT-2：transcript 从未被落到磁盘；D1 spool 取材失败）。
+ *
+ * 与 `MissingAllowedRootError` 的响亮纪律同构（spec §1 D5）：⛔ 不得静默跳过、⛔ 不得派一个
+ * 必然产出零证据的 worker。该 clue 出生即/转为 `blocked`（rationale 点名 digest 与失败原因）、
+ * 零 spawn。由 `runWrite` 的 dispatch catch 识别本错误后 CAS 该卡 → blocked（不 CAS 回 open）。
+ */
+export class ContentTranscriptMissingError extends Error {
+  /** clue text 里携带的 digest（解析自 `web://<uri>@<digest>`，D3）。 */
+  readonly digest: string;
+  constructor(digest: string) {
+    super(
+      `E1b D5: content clue carries digest "${digest}" but no doc(transcript) found on research:content — cannot spool transcript for dr-worker-content. Blocking this clue (zero spawn) instead of dispatching a zero-evidence worker.`,
+    );
+    this.name = "ContentTranscriptMissingError";
+    this.digest = digest;
+  }
+}
+
+/**
+ * E1b D1/D2——content worker 的 spool 根目录缺省（只在 opts.contentSpoolRoot 未配置时兜底）。
+ *
+ * ⛔ D7：spool 目录归属本 run，生产须由 profile 声明（`CONTENT_SPOOL_ROOT`），⛔ 不得写死
+ *    绝对路径、⛔ 不得落 vault 根、⛔ 不得与 `.dd-evidence/**` / `.dev-dispatch/**` 冲突。
+ *    本缺省仅用于「未配置时的可观测兜底」，生产装配（runChannelWrite）与测试均可显式注入。
+ */
+export const DEFAULT_CONTENT_SPOOL_ROOT = join(tmpdir(), "deep-research-content-spool");
+
+/**
+ * E1b D1——由 digest 派生 spool 文件名（确定性、跨 run 幂等：同 digest ⇒ 同文件名）。
+ * 文件名只含 `[0-9a-f]` + 后缀，是任意文件系统安全的子集。
+ */
+export function spoolFileName(digest: string): string {
+  return `${digest}.md`;
+}
+
+/**
+ * E1b D1——spool 步骤的产物：transcript 落成本地文件后的路径（= content worker 的 allowed_root 指向的根下的文件）。
+ * `spoolRoot` 即 content worker 的 `allowed_root`（D2）；`filePath` 是 transcript body 落点。
+ */
+export interface ContentSpoolResult {
+  /** spool 根目录（= content worker 的 allowed_root，D2）。 */
+  spoolRoot: string;
+  /** transcript body 落成的本地文件绝对路径（D1）。 */
+  filePath: string;
+  /** 该 transcript 的 digest（来自 clue text，D3）。 */
+  digest: string;
+}
+
+/**
+ * E1b D1/D5——spool 步骤纯逻辑（无 IO 读取决策）：由 clue text 解析 digest。
+ *
+ * 派发一条 `sources:["content"]` 的 clue 前，先从 clue text（`web://<uri>@<digest>`，D3）
+ * 解析出 digest。解析失败（非 content-clue 形态）⇒ 视为 transcript 不可定位 ⇒ D5 block。
+ *
+ * 纯函数（无 IO）：只做文本解析，便于直接断言。读取 transcript body 的 IO 在 `spoolContentTranscript`。
+ */
+export function parseDigestFromContentClue(clueText: string): string | null {
+  const parsed = parseContentClueText(clueText);
+  return parsed ? parsed.digest : null;
+}
+
+/**
+ * E1b D1/D2/D5——spool 步骤：按 clue 携带的 digest 从 `research:content` 读 transcript body，
+ * 落成 `<spoolRoot>/<digest>.md` 本地文件；返回 spool 结果（spool 根 = content worker 的 allowed_root）。
+ *
+ * 派发一条 `sources:["content"]` 的 clue **前**执行（GT-2：全仓原先零处把 transcript 落地）：
+ *   1. 从 clue text 解析 digest（`web://<uri>@<digest>`，D3）；解析失败 ⇒ D5（抛 ContentTranscriptMissingError）。
+ *   2. 按 digest 从 content channel 读 doc(transcript)（D1 取材）。
+ *   3. 取不到 ⇒ D5（抛 ContentTranscriptMissingError，零 spawn，由 dispatch catch CAS → blocked）。
+ *   4. 取到 ⇒ 把 body 落成 spool 文件（D1 落地）；返回 spool 根（= content worker 的 allowed_root，D2）。
+ *
+ * ⛔ D7：spoolRoot 归属本 run，须由 profile 声明（⛔ 不得落 vault 根 / `.dev-dispatch/**`）。
+ *    本函数只在该目录下创建 `<digest>.md`，不向上越界。
+ * ⛔ 幂等：同 digest ⇒ 同文件路径（spoolFileName 确定性），重复派发覆盖写同一文件（不堆积）。
+ */
+export async function spoolContentTranscript(opts: {
+  clueText: string;
+  contentChannelId: string;
+  spoolRoot: string;
+}): Promise<ContentSpoolResult> {
+  const digest = parseDigestFromContentClue(opts.clueText);
+  if (!digest) {
+    // clue text 非content-clue 形态 ⇒ 无法定位 transcript ⇒ D5 block（rationale 点名失败原因）。
+    throw new ContentTranscriptMissingError("");
+  }
+  const doc = await readExistingTranscript(
+    (afterSeq) =>
+      getMessages(
+        opts.contentChannelId,
+        afterSeq !== null ? { afterSeq } : {},
+      ),
+    digest,
+  );
+  if (!doc) {
+    // transcript 取不到 ⇒ D5：零 spawn，由 dispatch catch CAS 该卡 → blocked（rationale 点名 digest）。
+    throw new ContentTranscriptMissingError(digest);
+  }
+  const spoolRoot = opts.spoolRoot;
+  mkdirSync(spoolRoot, { recursive: true });
+  const filePath = join(spoolRoot, spoolFileName(digest));
+  writeFileSync(filePath, doc.body, "utf8");
+  return { spoolRoot, filePath, digest };
 }
 
 /**
@@ -879,6 +986,36 @@ export async function runWrite(
             ) {
               throw err;
             }
+            // E1b D5——content clue 的 transcript 取不到 ⇒ 该 clue 转为 blocked（rationale 点名
+            //    digest 与失败原因）、⛔ 零 spawn（与既有 MissingAllowedRootError 的响亮纪律同构，
+            //    但这里是「单卡 blocked」而非「整轮响亮抛错」：transcript 缺失是该卡自己的问题，
+            //    不应阻断同 tick 其余卡）。CAS in_flight → blocked；⛔ 不 CAS 回 open（那会重派一个
+            //    必然零证据的 worker）。spawned:false 记录零 spawn。
+            if (err instanceof ContentTranscriptMissingError) {
+              const rationale =
+                err.digest === ""
+                  ? "content clue text is not in the web://<uri>@<digest> form; cannot locate transcript (spec E1b D5)"
+                  : `content clue carries digest "${err.digest}" but no doc(transcript) found on research:content; cannot spool transcript for dr-worker-content (spec E1b D5)`;
+              const block = await perform({
+                clueId: decision.clueId,
+                to: "blocked",
+                from: "in_flight",
+                rationale,
+              });
+              casResults.push({
+                clueId: decision.clueId,
+                to: "blocked",
+                success: block.success,
+                error: block.error,
+              });
+              spawns.push({
+                clueId: decision.clueId,
+                role: decision.role,
+                runId,
+                spawned: false,
+              });
+              break;
+            }
             // ⛔ spawn 同步失败 ⇒ 当场 CAS 回 open（S2 补偿规则，真实路径兑现 N5）。
             const rollback = await perform({
               clueId: decision.clueId,
@@ -1120,6 +1257,18 @@ export interface RunWriteOptions {
    * ingest 把 doc(transcript) 发到这条 channel，并以权威 digest 做全局去重（D2）。
    */
   contentChannelId?: string;
+  /**
+   * E1b D1/D2/D7——content worker 的 spool 根目录（= content worker 的 allowed_root）。
+   *
+   * 派发一条 `sources:["content"]` 的 clue 前，按 clue 携带的 digest 从 `research:content`
+   * 读到 transcript body，落成 `<contentSpoolRoot>/<digest>.md` 本地文件（D1）；content worker
+   * 的 `allowed_root` 就是这个 spool 根（D2：⛔ 不是 `--allowed-root` 那个代码仓根）。
+   *
+   * 生产由 profile 声明（`CONTENT_SPOOL_ROOT`，D7：⛔ 不得落 vault 根 / `.dev-dispatch/**`），
+   * 经 tick-entry `--content-spool-root` 传入；缺省 `DEFAULT_CONTENT_SPOOL_ROOT`（tmpdir 下，
+   * 仅供未配置时的可观测兜底）。
+   */
+  contentSpoolRoot?: string;
   /**
    * G4c —— 一次性标记文件目录（跨进程持久）。
    * 缺省 `join(tmpdir(), "deep-research-generated")`。
@@ -1718,28 +1867,73 @@ export async function runChannelWrite(
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
       opts.spawnWorker ??
-      ((clueId, role, runId, input) => {
-        // A8f/E2b——需要 `allowed_root` 的 role（code-local / content）未配置 ⇒ 当场响亮失败
-        //    （spec §1.2 / E2b §1.1 W3：content worker 要读 spool 文件，spawn 参数带 allowed_root），零 spawn。
-        const allowedRoot = opts.allowedRoot;
-        if ((ROLES_REQUIRING_ALLOWED_ROOT as readonly string[]).includes(role) && !allowedRoot) {
-          throw new MissingAllowedRootError(role);
+      (async (clueId, role, runId, input) => {
+        // E1b D1/D2/D5——content role：派发前先把 transcript 落成本地文件（spool），content worker
+        //    的 allowed_root = spool 根（D2：⛔ 不是 --allowed-root 那个代码仓根）；transcript 取不到 ⇒ 抛
+        //    ContentTranscriptMissingError，由 runWrite 的 dispatch catch CAS 该卡 → blocked、零 spawn（D5）。
+        //    ⛔ content 的 revision 不得再取代码仓的 HEAD（GT-1：那与 transcript 无关）；transcript 的
+        //      内容指纹已由 clue text 携带（`web://<uri>@<digest>`，D3），spool 文件即权威可复读来源。
+        if (role === CONTENT_ROLE) {
+          const spool = await spoolContentTranscript({
+            clueText: input.clue_text,
+            contentChannelId: opts.contentChannelId ?? CONTENT_CHANNEL_ID,
+            spoolRoot: opts.contentSpoolRoot ?? DEFAULT_CONTENT_SPOOL_ROOT,
+          });
+          // D2：content worker 的 allowed_root = spool 根（⛔ 不是 opts.allowedRoot）。
+          //   revision 省略（⛔ 不取代码仓 HEAD：GT-1）；content worker 读 spool 文件即可定位 transcript。
+          const augmented = buildWorkerInput(
+            input.clue_id,
+            input.clue_text,
+            input.depth,
+            input.sources,
+            spool.spoolRoot,
+          );
+          return spawnAgentRunWorker({
+            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+            role,
+            runId,
+            input: augmented,
+            allowedRoot: spool.spoolRoot,
+          }).then(() => undefined);
         }
-        // A8f——生产调用点真实传入 allowedRoot，并取引擎权威 revision（spec §1.3 / F3/F4）。
+        // A8f——code-local 需要 allowed_root（读 repo 根下源文件）；未配置 ⇒ 响亮失败零 spawn
+        //    （spec §1.2 / F5）。⛔ code-local 的 allowed_root / revision 行为逐字不变（仍是代码仓根
+        //    + git rev-parse HEAD，D2 回归）。其余 role（wiki / feishu / code-remote / web-search）
+        //    不需要 allowed_root，照常 spawn（F7）。
+        if (role === CODE_LOCAL_ROLE) {
+          const allowedRoot = opts.allowedRoot;
+          if (!allowedRoot) {
+            throw new MissingAllowedRootError(role);
+          }
+          const augmented = buildWorkerInput(
+            input.clue_id,
+            input.clue_text,
+            input.depth,
+            input.sources,
+            allowedRoot,
+            resolveRevision(allowedRoot),
+          );
+          return spawnAgentRunWorker({
+            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+            role,
+            runId,
+            input: augmented,
+            allowedRoot,
+          }).then(() => undefined);
+        }
+        // 非 code-local / 非 content 的 role（wiki / feishu / code-remote / web-search）：
+        // 不需要 allowed_root，照常 spawn（F7）。clue 文本/depth/sources 仍以 worker 输入载荷传下去。
         const augmented = buildWorkerInput(
           input.clue_id,
           input.clue_text,
           input.depth,
           input.sources,
-          allowedRoot,
-          allowedRoot ? resolveRevision(allowedRoot) : undefined,
         );
         return spawnAgentRunWorker({
           agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
           role,
           runId,
           input: augmented,
-          allowedRoot,
         }).then(() => undefined);
       }),
     // A8e——收割写依赖：证据 channel 显式传入（无默认值）；readWorkerResult 读 board:agent-runs。
@@ -2068,6 +2262,16 @@ export interface RunCliOptions {
    * 影响 harvest 封顶与 decideTermination 的 capHit 判定（spec §2 判据 5）。
    */
   maxClues?: number;
+  /**
+   * E1b D1/D7——content worker 的 spool 根目录（--content-spool-root）。
+   * 派发 content clue 前把 transcript body 落成 `<spoolRoot>/<digest>.md`（D1）；
+   * content worker 的 allowed_root = spool 根（D2）。生产由 profile `CONTENT_SPOOL_ROOT` 经
+   * tick.md `{{content_spool_root}}` 注入；缺省 DEFAULT_CONTENT_SPOOL_ROOT（tmpdir 下兜底）。
+   * ⛔ D7：归属本 run，不得落 vault 根 / `.dev-dispatch/**`。
+   */
+  contentSpoolRoot?: string;
+  /** E1b D1——content channel（--content-channel）；缺省 CONTENT_CHANNEL_ID（research:content）。 */
+  contentChannelId?: string;
 }
 
 /**
@@ -2092,6 +2296,8 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
   let maxClues: number | undefined;
+  let contentSpoolRoot: string | undefined;
+  let contentChannelId: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -2184,6 +2390,22 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       maxClues = value;
       i += 1;
+    } else if (args[i] === "--content-spool-root") {
+      contentSpoolRoot = args[i + 1];
+      if (!contentSpoolRoot) {
+        throw new Error(
+          "E1b: invalid --content-spool-root (must specify a directory path).",
+        );
+      }
+      i += 1;
+    } else if (args[i] === "--content-channel") {
+      contentChannelId = args[i + 1];
+      if (!contentChannelId) {
+        throw new Error(
+          "E1b: invalid --content-channel (must specify a channel id).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -2200,6 +2422,8 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     oneShotDir,
     triageThreshold,
     maxClues,
+    contentSpoolRoot,
+    contentChannelId,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

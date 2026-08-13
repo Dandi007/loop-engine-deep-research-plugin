@@ -260,3 +260,42 @@ describe("E7: docs/deploy.md documents 4 deploy steps with verifiable checks", (
     expect(md).toMatch(/全绿/);
   });
 });
+
+// ── E1b D1/D2/D7：CONTENT_SPOOL_ROOT 随装配系统一路注入（profile 声明、不得落 vault 根）──
+
+describe("E1b D7: CONTENT_SPOOL_ROOT declared in profile + plumbed through assembly", () => {
+  it("production profile (agent-harness) declares CONTENT_SPOOL_ROOT outside vault root / .dev-dispatch", () => {
+    const prof = readProfile("agent-harness");
+    expect(prof.CONTENT_SPOOL_ROOT).toBeTruthy();
+    // ⛔ D7：不得落 vault 根、不得与 .dev-dispatch / .dd-evidence 冲突。
+    expect(prof.CONTENT_SPOOL_ROOT).not.toMatch(/\/vault\/?$/);
+    expect(prof.CONTENT_SPOOL_ROOT).not.toContain(".dev-dispatch");
+    expect(prof.CONTENT_SPOOL_ROOT).not.toContain(".dd-evidence");
+  });
+
+  it("CONTENT_SPOOL_ROOT differs from ALLOWED_ROOT (D2: content allowed_root = spool root, NOT code repo root)", () => {
+    const prof = readProfile("agent-harness");
+    expect(prof.CONTENT_SPOOL_ROOT).not.toBe(prof.ALLOWED_ROOT);
+  });
+
+  it("bin exports CONTENT_SPOOL_ROOT, fleet/workflow/tick.md plumb --content-spool-root", () => {
+    const bin = readFileSync(BIN, "utf8");
+    expect(bin).toMatch(/export\s+CONTENT_SPOOL_ROOT=/);
+    const fleet = readFileSync(join(ROOT, "workflows", "deep-research", "fleet.yaml.tpl"), "utf8");
+    expect(fleet).toMatch(/content_spool_root:\s+\$\{CONTENT_SPOOL_ROOT\}/);
+    const wf = readFileSync(join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml"), "utf8");
+    expect(wf).toMatch(/content_spool_root:\s*"\{\{content_spool_root\?\}\}"/);
+    const tickMd = readFileSync(join(ROOT, "workflows", "deep-research", "tick", "templates", "tick.md"), "utf8");
+    expect(tickMd).toMatch(/--content-spool-root/);
+  });
+
+  it("dry-run from agent-harness profile renders content_spool_root === profile value", () => {
+    const childEnv = cleanChildEnv();
+    childEnv.DEPLOY_PROFILE = "agent-harness";
+    const res = render(childEnv);
+    expect(res.code).toBe(0);
+    const input = tickInput(res.out);
+    const prof = readProfile("agent-harness");
+    expect(input.content_spool_root).toBe(prof.CONTENT_SPOOL_ROOT);
+  });
+});

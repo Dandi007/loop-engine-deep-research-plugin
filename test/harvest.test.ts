@@ -91,6 +91,57 @@ describe("H4: range absent ⇒ anchor has no # (separate case)", () => {
   });
 });
 
+// ── E1b D4 / GT-4：content 证据锚点修掉双 scheme（收割侧兜住）──────────
+//    persona 输出形态由 worker 决定，本包管不着；必须在收割侧把
+//    `source:content, locator:web://<uri>` 拼成 `web://<uri>@<digest>#<range>`（spec §5.1）。
+
+describe("E1b D4 / GT-4: content evidence anchor = web://<uri>@<digest>#<range> (no double scheme)", () => {
+  // GT-4 逐字 worker evidence（spec §0 GT-4 真机取证照抄）。
+  const gt4Item = {
+    quote: "H1 工程基建组围绕…",
+    claim: "H1 工程基建组以…为北极星方向。",
+    source: "content",
+    locator: "web://http://127.0.0.1:50287/e1-material.png",
+    revision: "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b",
+    range: "L9",
+  };
+
+  it("⭐⭐ D4 discriminating: GT-4 verbatim content evidence ⇒ anchor literally web://<uri>@<digest>#<range>", () => {
+    const anchor = anchorForEvidence(gt4Item);
+    // 判据 4：逐字等于 spec §0 GT-4 期望形态。
+    expect(anchor).toBe(
+      "web://http://127.0.0.1:50287/e1-material.png@63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b#L9",
+    );
+    // ⛔ 断言里不得出现 content://（方向钉反即拒）。
+    expect(anchor).not.toContain("content://");
+    expect(anchor).not.toMatch(/^content:\/\//);
+  });
+
+  it("⭐⭐ D4 discriminating (composeAnchor): content + web:// locator ⇒ no content:// prefix", () => {
+    const a = composeAnchor("content", "web://http://x/y.png", "deadbeef", "L1");
+    expect(a).toBe("web://http://x/y.png@deadbeef#L1");
+    expect(a).not.toContain("content://");
+  });
+
+  it("D4 regression: source:code evidence anchor unchanged (code:// path)", () => {
+    // ⛔ code:// 路径的拼装逐字不变（locator 不带 scheme，仍走 <source>://<locator>@…）。
+    const a = composeAnchor("code", "repo/path/File.ts", "abc123", "L10-L20");
+    expect(a).toBe("code://repo/path/File.ts@abc123#L10-L20");
+  });
+
+  it("D4 regression: anchorForEvidence on code evidence unchanged", () => {
+    const a = anchorForEvidence({
+      quote: "q",
+      claim: "c",
+      source: "code",
+      locator: "src/x.ts",
+      revision: "abc123",
+      range: "L5",
+    });
+    expect(a).toBe("code://src/x.ts@abc123#L5");
+  });
+});
+
 // ── evidence 映射（H2 / H5）────────────────────────────────────────
 
 describe("H2: evidence payload has four non-empty required fields", () => {
@@ -839,7 +890,99 @@ describe("harvestCard budget boundary", () => {
   });
 });
 
-// ── A10a 硬验收 B1–B8（夹具从冻结 schema 读出 + 真实形状 + 形状守卫 + no_result）──────
+// ── E1b D6 / GT-5：写预算对新 transcript 预留 2 次（doc + clue）──────────
+//    一份新 transcript 实际耗 2 次 bus 写（publishDoc + content-clue 落板）；
+//    原 needed 只预留 1 ⇒ --max-writes 可被超出「每份新转写 1 次」。
+
+describe("E1b D6 / GT-5: budget reserves 2 writes per new transcript (doc + clue)", () => {
+  // 一张只有 1 条 material（新 transcript，ingest 返回非 null clue）的卡。
+  // needed（worst case，每条 material = doc + clue）= 0 ev + 0 regular clue + 1 content clue + 1 content doc + 1 CAS = 3。
+  function newTranscriptDeps(): HarvestDeps {
+    return harvestDeps({
+      maxClues: 64,
+      boardClueCount: { value: 0 },
+      readWorkerResult: vi.fn(async () => ({
+        run_id: "run-d6",
+        evidences: [],
+        proposed_clues: [],
+        materials: [{ uri: "http://x/new-transcript.pdf" }],
+      })),
+      ingestMaterial: vi.fn(async () => ({
+        text: "web://http://x/new-transcript.pdf@deadbeef",
+        status: "proposed" as const,
+        depth: 0,
+        sources: ["content"],
+        parent: "card_d6",
+      })),
+    });
+  }
+
+  it("⭐ D6 discriminating: budget remaining 2 (< needed 3) ⇒ whole card skipped, zero writes (no overflow)", async () => {
+    const total = 64;
+    let used = 62; // remaining = 2
+    const budget: HarvestBudget = {
+      total: () => total,
+      remaining: () => total - used,
+      consume: (n) => { used += n; },
+    };
+    const hd = newTranscriptDeps();
+    const report = await harvestCard(hd, { clueId: "card_d6", depth: 0, sources: ["content"] }, "run-d6", budget);
+    // 整卡跳过（needed=3 > remaining=2）：零发布、零 CAS。
+    expect(report.skipped).toBe(true);
+    expect(report.skippedReason).toBe("budget");
+    expect(report.contentCluesPublished).toBe(0);
+    expect(report.casExplored).toBe(false);
+    // 零 consume（没有把预算写超）。
+    expect(used).toBe(62);
+  });
+
+  it("⭐ D6 discriminating: budget remaining 3 (== needed 3) ⇒ proceeds, consumes 2 (doc + clue), no overflow", async () => {
+    const total = 64;
+    let used = 61; // remaining = 3
+    const budget: HarvestBudget = {
+      total: () => total,
+      remaining: () => total - used,
+      consume: (n) => { used += n; },
+    };
+    const hd = newTranscriptDeps();
+    const report = await harvestCard(hd, { clueId: "card_d6", depth: 0, sources: ["content"] }, "run-d6", budget);
+    // needed=3 ≤ remaining=3 ⇒ 放行；发布 1 条 content-clue（新 transcript），consume 2（doc + clue）。
+    expect(report.skipped).toBe(false);
+    expect(report.contentCluesPublished).toBe(1);
+    expect(report.casExplored).toBe(true);
+    // D6：consume 2（doc + clue），⛔ 不是 1（旧漏算 doc 写）。CAS 由上层执行（账户外）。
+    expect(used).toBe(63); // 61 + 2
+  });
+
+  it("D6 reuse path: ingestMaterial returns null (D2 reuse) ⇒ consume 0 (no doc, no clue)", async () => {
+    const total = 64;
+    let used = 61; // remaining = 3
+    const budget: HarvestBudget = {
+      total: () => total,
+      remaining: () => total - used,
+      consume: (n) => { used += n; },
+    };
+    const hd = harvestDeps({
+      maxClues: 64,
+      boardClueCount: { value: 0 },
+      readWorkerResult: vi.fn(async () => ({
+        run_id: "run-d6-reuse",
+        evidences: [],
+        proposed_clues: [],
+        materials: [{ uri: "http://x/existing.pdf" }],
+      })),
+      // D2 复用 ⇒ 返回 null（不 propose、不发 doc）。
+      ingestMaterial: vi.fn(async () => null),
+    });
+    const report = await harvestCard(hd, { clueId: "card_d6r", depth: 0, sources: ["content"] }, "run-d6-reuse", budget);
+    expect(report.skipped).toBe(false);
+    expect(report.contentCluesPublished).toBe(0);
+    // 复用路径：实际 0 写（不新发 doc），consume 0。⛔ 不得一律 +1。
+    expect(used).toBe(61);
+  });
+});
+
+
 
 const EV_ITEM = (i: number): { quote: string; claim: string; source: string; locator: string; revision: string } => ({
   quote: `q${i}`,

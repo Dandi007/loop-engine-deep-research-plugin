@@ -16,6 +16,8 @@ import {
   createMutex,
   buildContentClue,
   contentClueText,
+  parseContentClueText,
+  CONTENT_CLUE_SCHEME,
   fetchMaterialHttp,
   filenameFromUri,
   MAX_MATERIAL_BYTES,
@@ -387,6 +389,56 @@ describe("E1 D4 propose content-clue on successful transcription", () => {
     const t = contentClueText("dig123", "http://u/x.pdf");
     expect(t).toContain("dig123");
     expect(t).toContain("http://u/x.pdf");
+  });
+});
+
+// ── E1b D3 / GT-3：content-clue text 统一成 persona 期望的 web://<uri>@<digest> ──
+
+describe("E1b D3 / GT-3: content-clue text in persona-expected web://<uri>@<digest> form", () => {
+  it("⭐ D3 discriminating: contentClueText produces web://<uri>@<digest>", () => {
+    const t = contentClueText("abc123", "http://127.0.0.1:50287/e1-material.png");
+    // 判据 5：propose 出来的 content-clue 的 text 含 web://<uri>@<digest>。
+    expect(t).toBe("web://http://127.0.0.1:50287/e1-material.png@abc123");
+    expect(t.startsWith(CONTENT_CLUE_SCHEME)).toBe(true);
+    // ⛔ 不再是 E1 旧的 transcript digest=… origin=… 形态（改回 ⇒ 变红）。
+    expect(t).not.toMatch(/^transcript digest=/);
+    expect(t).not.toContain("origin=");
+  });
+
+  it("⭐ D3 discriminating: buildContentClue text carries web://<uri>@<digest>", () => {
+    const clue = buildContentClue({
+      parentClueId: "p",
+      parentDepth: 2,
+      digest: "deadbeef",
+      originUri: "http://x/y.pdf",
+      status: "proposed",
+    });
+    expect(clue.text).toBe("web://http://x/y.pdf@deadbeef");
+    expect(clue.text.startsWith(CONTENT_CLUE_SCHEME)).toBe(true);
+  });
+
+  it("⭐ D3 parseContentClueText round-trips with contentClueText (D1 spool 依赖它取 digest)", () => {
+    const digest = "63ac13abaabf5726e675";
+    const uri = "http://127.0.0.1:50287/e1-material.png";
+    const text = contentClueText(digest, uri);
+    const parsed = parseContentClueText(text);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.digest).toBe(digest);
+    expect(parsed!.originUri).toBe(uri);
+  });
+
+  it("D3 parseContentClueText: URI containing '@' (userinfo) ⇒ digest is last segment", () => {
+    const text = "web://http://user:pw@host/x.pdf@deadbeef";
+    const parsed = parseContentClueText(text);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.digest).toBe("deadbeef");
+    expect(parsed!.originUri).toBe("http://user:pw@host/x.pdf");
+  });
+
+  it("D3 parseContentClueText: non-content-clue text ⇒ null", () => {
+    expect(parseContentClueText("investigate content")).toBeNull();
+    expect(parseContentClueText("transcript digest=x origin=y")).toBeNull();
+    expect(parseContentClueText("")).toBeNull();
   });
 });
 

@@ -7,6 +7,11 @@ pipelines:
       tick_channel: ${TICK_CHANNEL}
       evidence_channel: ${EVIDENCE_CHANNEL}
       allowed_root: ${ALLOWED_ROOT}
+      # E1b D1/D2/D7 —— content worker 的 spool 根目录（--content-spool-root）：由 bin 导出
+      # CONTENT_SPOOL_ROOT（缺省留空 ⇒ tick.md 不传 ⇒ tick-entry --run 用 DEFAULT_CONTENT_SPOOL_ROOT）。
+      # 派发 content 线索前把 transcript body 落成 <spoolRoot>/<digest>.md（D1）；content worker 的
+      # allowed_root = spool 根（D2）。⛔ D7：归属本 run，不得落 vault 根 / .dev-dispatch/**。
+      content_spool_root: ${CONTENT_SPOOL_ROOT}
       # A10c —— 写入预算（--max-writes）一路注入到 tick.md：由 bin 导出 MAX_WRITES（缺省 64），
       # 显式覆盖语义保留。缺省必须足以收割一张真实卡（spec §1.1）。
       max_writes: ${MAX_WRITES}

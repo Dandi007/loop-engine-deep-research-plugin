@@ -34,6 +34,10 @@ seed:
       tick_channel: "{{tick_channel}}"
       evidence_channel: "{{evidence_channel?}}"
       allowed_root: "{{allowed_root?}}"
+      # E1b D1/D2/D7 —— content worker 的 spool 根目录（--content-spool-root）：由 fleet input 注入 tick.md，
+      # 再传给 tick-entry --run。可选（`?` 后缀，与 allowed_root 同款）：缺省（null/空）⇒ tick.md 不传
+      # --content-spool-root ⇒ tick-entry --run 用 DEFAULT_CONTENT_SPOOL_ROOT（tmpdir 下兜底）。
+      content_spool_root: "{{content_spool_root?}}"
       # A10c —— 写入预算（--max-writes）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
       max_writes: "{{max_writes}}"
       # E0c10 D5 —— 板面 clue 上限（--max-clues）：由 fleet input 注入 tick.md，再传给 tick-entry --run。

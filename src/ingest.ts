@@ -215,9 +215,51 @@ export function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
 export const MATERIAL_BLOCKED_RATIONALE_PREFIX =
   "content-clue born blocked: material ingest failed";
 
-/** E1 D4——content-clue 的 text 模板：携带 transcript 的 digest 与 origin URI。 */
+/**
+ * E1b D3 / GT-3——content-clue 的 text 模板：携带 persona 期望的 `web://<uri>@<digest>`。
+ *
+ * `agent-runtime` 的 `profiles/roles/personas/dr-worker-content.md` 逐字：
+ *   - anchor URI format: web://<uri>@<digest>#<range>
+ *   - The `uri` and `digest` are carried by the clue text (`web://<uri>@<digest>`).
+ *     Reuse them as-is; never invent, guess, or reconstruct an anchor yourself.
+ *
+ * ⛔ E1 原先的 `transcript digest=… origin=…` 与 persona 期望对不上（GT-3）；
+ *    E1b 统一成本函数产出 persona 期望的形态，propose 出来的 content-clue 的 text
+ *    与派发时喂给 worker 的 clue_text 都走它（D3：两处都要改到位）。
+ */
 export function contentClueText(digest: string, originUri: string): string {
-  return `transcript digest=${digest} origin=${originUri}`;
+  return `web://${originUri}@${digest}`;
+}
+
+/**
+ * E1b D3 / GT-3——content-clue text 里携带的 anchor 头部（persona 期望的 scheme）。
+ * 用于派发侧识别 content-clue 并从中解析 digest / origin URI（D1 spool 依赖它）。
+ */
+export const CONTENT_CLUE_SCHEME = "web://";
+
+/**
+ * E1b D1/D3——从 content-clue text 解析出 `{ digest, originUri }`。
+ *
+ * content-clue text 形如 `web://<originUri>@<digest>`（由 `contentClueText` 产出，D3）。
+ * 派发一条 `sources:["content"]` 的 clue 前，按 clue 携带的 digest 从 `research:content`
+ * 读到 transcript 并落成本地文件（D1）；digest 就是从这里取的。
+ *
+ * 解析规则（与 `contentClueText` 严格对偶）：
+ *   - 必须以 `web://` 开头（CONTENT_CLUE_SCHEME）；
+ *   - 去掉 scheme 后，最后一个 `@` 之前 = originUri，之后 = digest；
+ *   - originUri 可含 `@`（如 `http://user:pw@host/x.pdf`），digest 是最后一段。
+ *
+ * @returns 解析失败（非 content-clue 形态）⇒ null；成功 ⇒ `{ digest, originUri }`。
+ */
+export function parseContentClueText(text: string): { digest: string; originUri: string } | null {
+  if (!text.startsWith(CONTENT_CLUE_SCHEME)) return null;
+  const rest = text.slice(CONTENT_CLUE_SCHEME.length);
+  const atIdx = rest.lastIndexOf("@");
+  if (atIdx <= 0) return null;
+  const originUri = rest.slice(0, atIdx);
+  const digest = rest.slice(atIdx + 1);
+  if (!originUri || !digest) return null;
+  return { originUri, digest };
 }
 
 /**

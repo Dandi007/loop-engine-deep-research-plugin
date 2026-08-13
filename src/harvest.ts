@@ -115,6 +115,14 @@ export const OVER_MAX_DEPTH_RATIONALE =
 /**
  * 组合 evidence 的 anchor（spec §5.2 / §1.3）：
  * `<source>://<locator>@<revision>#<range>`；range 缺省时**省略 `#` 段**（§1.3 / H4）。
+ *
+ * E1b D4 / GT-4——content 证据的 locator 已携带 persona 期望的 scheme（`web://<uri>`），
+ * 直接 `<source>://` 拼接会得到畸形的双 scheme 值（`content://web://http://…@<dig>#L9`），
+ * E3 的 `web://` 核验器永远匹配不上（GT-4）。content worker 的输出形态由 persona 决定，
+ * 本包管不着 worker，必须在**收割侧兜住**：当 locator 已自带 scheme（`web://`）时，
+ * 不再前置 `<source>://`，直接用 locator 作为 anchor 头部（`<locator>@<revision>#<range>`）。
+ *
+ * ⛔ `code://` 路径的拼装逐字不变（locator 不带 scheme，仍走 `<source>://<locator>@…`）。
  */
 export function composeAnchor(
   source: string,
@@ -122,6 +130,12 @@ export function composeAnchor(
   revision: string,
   range?: string,
 ): string {
+  // E1b D4 / GT-4：locator 自带 scheme（persona 的 `web://<uri>` 形态）⇒ 不前置 `<source>://`，
+  //   直接拼成 `<locator>@<revision>#<range>`（= `web://<uri>@<digest>#<range>`，spec §5.1 期望形态）。
+  if (locator.startsWith("web://")) {
+    const base = `${locator}@${revision}`;
+    return range ? `${base}#${range}` : base;
+  }
   const base = `${source}://${locator}@${revision}`;
   return range ? `${base}#${range}` : base;
 }
@@ -424,9 +438,18 @@ export async function harvestCard(
   // E1 D3/D9——content-clue 也是 clue，与普通 clue 共享同一 boardClueCount/headroom。
   //   最坏情况下本卡新增的 clue 写数（普通 + content）上界 = min(总待发, headroom)，
   //   而非「普通 clue 取满 headroom 之外再单独算 content」——两者竞争同一计数器。
-  const pendingClueTotal = clueItems.length + (ingestEnabled ? matItems.length : 0);
-  const clueBudgetMax = Math.min(pendingClueTotal, headroom);
-  const needed = evItems.length + clueBudgetMax + 1;
+  // E1b D6 / GT-5——一份**新** transcript 实际耗 **2 次 bus 写**（publishDoc 到 research:content
+  //   ＋ content-clue 落板），原 `needed` 只预留 1 ⇒ --max-writes 可被超出「每份新转写 1 次」。
+  //   这里按 worst case（每条被 ingest 的 material 都是新 transcript）给每条预留 2 次写
+  //   （doc + clue）；复用路径在发布循环里实际只 consume 0（返回 null），不会写超。
+  //   ⛔ 不得一律 +1：复用路径（不新发 doc）仍只算它实际要写的次数（0），由循环按返回值精确 consume。
+  const regularClueWrites = Math.min(clueItems.length, headroom);
+  const contentClueWrites = ingestEnabled
+    ? Math.min(matItems.length, Math.max(0, headroom - regularClueWrites))
+    : 0;
+  // D6：每条被 ingest 的 material（worst case 新 transcript）= 1 doc 写 + 1 clue 写。
+  const contentDocWrites = contentClueWrites;
+  const needed = evItems.length + regularClueWrites + contentClueWrites + contentDocWrites + 1;
 
   if (budget.remaining() < needed) {
     // ⛔ A10c §1.2——预算不足 ⇒ 整卡跳过：不发、不 CAS，留 in_flight，响亮报告（§1.7 / H13）。
@@ -532,7 +555,10 @@ export async function harvestCard(
         if (clue.status === "blocked") contentCluesBlocked += 1;
         // D9：content-clue 落板 ⇒ 计入 boardClueCount（与既有 clue 封顶同构）。
         boardClueCount.value += 1;
-        budget.consume(1);
+        // E1b D6 / GT-5——一份**新** transcript 实际耗 2 次 bus 写（publishDoc 到 research:content
+        //   ＋ content-clue 落板，都在 ingestMaterial 内部完成）。返回非 null ⇒ 是新 transcript
+        //   （复用路径返回 null，D5 幂等）⇒ consume 2（doc + clue）。⛔ 原 consume(1) 漏算 doc 写。
+        budget.consume(2);
       }
     }
   }

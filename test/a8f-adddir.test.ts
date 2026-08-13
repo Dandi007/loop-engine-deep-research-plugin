@@ -27,6 +27,9 @@ import {
   buildAgentRunArgv,
   resolveRevision,
   MissingAllowedRootError,
+  ContentTranscriptMissingError,
+  spoolFileName,
+  parseDigestFromContentClue,
   CODE_LOCAL_ROLE,
   CONTENT_ROLE,
 } from "../src/tick-run";
@@ -73,6 +76,7 @@ done\nprintf '%s\\n' "---" >> "${marker}"\nexit 0\n`,
 }
 
 function readAgentRunBlocks(marker: string): AgentRunBlock[] {
+  if (!existsSync(marker)) return []; // E1b D5：零 spawn ⇒ marker 未创建 ⇒ 无 block。
   const blocks: AgentRunBlock[] = [];
   let current: AgentRunBlock | null = null;
   for (const line of readFileSync(marker, "utf8").split("\n")) {
@@ -112,9 +116,10 @@ function openClueMsg(clueId: string, text: string, sources: string[]) {
   };
 }
 
-function stubBus(clues: unknown[]) {
+function stubBus(clues: unknown[], contentMessages: unknown[] = []) {
   let clueCalls = 0;
   let runsCalls = 0;
+  let contentCalls = 0;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: unknown) => {
@@ -130,6 +135,11 @@ function stubBus(clues: unknown[]) {
         runsCalls += 1;
         return jsonResponse({ messages: [] });
       }
+      // E1b D1——content channel (research:content)：spool 步骤从这里读 transcript body。
+      if (u.includes("/v1/channels/research:content/messages")) {
+        contentCalls += 1;
+        return jsonResponse({ messages: contentCalls === 1 ? contentMessages : [] });
+      }
       return jsonResponse({ messages: [] });
     }),
   );
@@ -144,11 +154,18 @@ interface DispatchResult {
 /**
  * 走生产缺省 spawn 路径（runChannelWrite 不注入 spawnWorker），跑一次 dispatch。
  * `allowedRoot` 传 undefined 表示**不配置**（F5 用）；`gitDir` 表示把 allowedRoot 做成真实 git 仓库（F4 用）。
+ * `contentMessages`：research:content 上的 doc(transcript) 消息列表（E1b D1 spool 测试用）。
+ * `contentSpoolRoot`：content worker 的 spool 根目录（E1b D1/D2 测试用）。
+ * `clueText`：覆盖 clue 文本（E1b D3：content clue text 形如 web://<uri>@<digest>）。
  */
 async function runDispatch(opts: {
   sources: string[];
   allowedRoot?: string;
   gitDir?: boolean;
+  contentMessages?: unknown[];
+  contentSpoolRoot?: string;
+  clueText?: string;
+  clueId?: string;
 }): Promise<DispatchResult> {
   const marker = join(tmpdir(), `a8f-marker-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
   const stub = makeAgentRunStub(marker);
@@ -165,12 +182,20 @@ async function runDispatch(opts: {
   }
   // 其余情况：allowedRoot 保持调用方给定的值（undefined = 不配置，F7 用）。
 
-  const clue = openClueMsg("clue_x", "investigate A8f", opts.sources);
-  stubBus([clue]);
+  const clueId = opts.clueId ?? "clue_x";
+  const clue = openClueMsg(clueId, opts.clueText ?? "investigate A8f", opts.sources);
+  stubBus([clue], opts.contentMessages ?? []);
 
   try {
-    const outcome = await runChannelWrite({ channelId: WIRE_CHANNEL, allowedRoot });
-    readUntilMarker(marker);
+    const outcome = await runChannelWrite({
+      channelId: WIRE_CHANNEL,
+      allowedRoot,
+      ...(opts.contentSpoolRoot ? { contentSpoolRoot: opts.contentSpoolRoot } : {}),
+    });
+    // E1b D5：transcript 取不到 ⇒ 零 spawn（marker 不会创建）；只在实际 spawn 时等 marker。
+    if (existsSync(marker)) {
+      readUntilMarker(marker);
+    }
     return { outcome, blocks: readAgentRunBlocks(marker), gitDir: allowedRoot ?? "" };
   } finally {
     rmSync(marker, { force: true });
@@ -347,53 +372,120 @@ describe("F7: non-code-local roles are not blocked by missing allowed_root", () 
   }
 });
 
-// ── E2b §1.1 W3：content worker 需要 allowed_root（读 spool 文件）──
-//    与 F5/F6 同构：无 root ⇒ 响亮失败零 spawn；有 root ⇒ spawn 参数带 allowed_root。
+// ── E1b D1/D2/D5：content worker 的 allowed_root = spool 根（⛔ 不是 --allowed-root）──
+//    GT-1：content worker 拿到的 allowed_root 是代码仓根，而 transcript 根本不在那儿。
+//    D1：派发前先把 transcript body 落成 spool 本地文件；D2：allowed_root = spool 根；
+//    D5：transcript 取不到 ⇒ 该 clue blocked、零 spawn。
 
-describe("E2b W3: content role requires allowed_root (loud failure + zero spawn when missing)", () => {
-  it("content dispatch without allowed_root ⇒ MissingAllowedRootError naming allowed-root, zero spawn", async () => {
-    const marker = join(tmpdir(), `e2b-w3-miss-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
-    const stub = makeAgentRunStub(marker);
-    const prevBin = process.env.AGENT_RUN_BIN;
-    process.env.AGENT_RUN_BIN = stub;
-    const clue = openClueMsg("clue_c", "investigate content", ["content"]);
-    stubBus([clue]);
+/** 造一条 research:content 上的 doc(transcript) 消息（D1 spool 取材源）。 */
+function contentDocMessage(digest: string, body: string, origin = "http://127.0.0.1:50287/e1-material.png") {
+  return {
+    message_id: `msg_doc_${digest.slice(0, 8)}`,
+    channel_id: "research:content",
+    channel_seq: 1,
+    kind: "research.doc.v2",
+    payload: { doc_kind: "transcript", digest, body, origin },
+    entity_id: `doc_${digest.slice(0, 8)}`,
+    supersedes: null,
+    created_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+describe("E1b D1/D2: content dispatch spools transcript + allowed_root = spool root (NOT --allowed-root)", () => {
+  it("⭐⭐ D1/D2 discriminating: content clue ⇒ transcript body spooled to file under spool root, worker allowed_root === spool root (NOT --allowed-root)", async () => {
+    const digest = "63ac13abaabf5726e675d8fbb5ccda36a960767ba5b860448e701ada88f5e43b";
+    const body = "# transcript body\nLine1\nLine2\n";
+    const spoolRoot = mkdtempSync(join(tmpdir(), "e1b-spool-"));
+    // --allowed-root 指向代码仓根（GT-1 的错配值）；content worker 的 allowed_root 必须是 spool 根、而非它。
+    const codeRepoRoot = mkdtempSync(join(tmpdir(), "e1b-coderepo-"));
     try {
-      let err: unknown;
-      try {
-        await runChannelWrite({ channelId: WIRE_CHANNEL });
-      } catch (e) {
-        err = e;
-      }
-      expect(err).toBeInstanceOf(MissingAllowedRootError);
-      expect((err as Error).message).toMatch(/allowed-root/);
-      // 零 spawn：marker 未创建。
-      expect(existsSync(marker)).toBe(false);
+      const { blocks, outcome } = await runDispatch({
+        sources: ["content"],
+        clueId: "clue_content",
+        clueText: `web://http://127.0.0.1:50287/e1-material.png@${digest}`,
+        contentMessages: [contentDocMessage(digest, body)],
+        contentSpoolRoot: spoolRoot,
+        allowedRoot: codeRepoRoot,
+      });
+      // (a) spool 根下真的出现了内容逐字等于 transcript body 的文件（判据 2a）。
+      const spooledPath = join(spoolRoot, spoolFileName(digest));
+      expect(existsSync(spooledPath)).toBe(true);
+      expect(readFileSync(spooledPath, "utf8")).toBe(body);
+      // (b) spawn 参数与 worker input 里的 allowed_root === spool 根、⛔ !== --allowed-root（判据 2b）。
+      expect(blocks).toHaveLength(1);
+      expect(outcome?.spawns[0].role).toBe(CONTENT_ROLE);
+      expect(outcome?.spawns[0].spawned).toBe(true);
+      const addDirIdx = blocks[0].args.indexOf("--add-dir");
+      expect(addDirIdx).toBeGreaterThanOrEqual(0);
+      expect(blocks[0].args[addDirIdx + 1]).toBe(spoolRoot);
+      expect(blocks[0].args[addDirIdx + 1]).not.toBe(codeRepoRoot);
+      const parsed = JSON.parse(blocks[0].inputContent ?? "{}") as WorkerInputPayload;
+      expect(parsed.allowed_root).toBe(spoolRoot);
+      expect(parsed.allowed_root).not.toBe(codeRepoRoot);
     } finally {
-      rmSync(marker, { force: true });
-      rmSync(dirname(stub), { recursive: true, force: true });
-      if (prevBin === undefined) delete process.env.AGENT_RUN_BIN;
-      else process.env.AGENT_RUN_BIN = prevBin;
+      rmSync(spoolRoot, { recursive: true, force: true });
+      rmSync(codeRepoRoot, { recursive: true, force: true });
     }
   });
 
-  it("DISCRIMINATING: content dispatch WITH allowed_root ⇒ spawns once as dr-worker-content with allowed_root in argv/input", async () => {
-    const d = mkdtempSync(join(tmpdir(), "e2b-w3-content-"));
+  it("⭐ D2 content revision: content worker payload omits revision (NOT code repo HEAD, GT-1)", async () => {
+    const digest = "abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890";
+    const spoolRoot = mkdtempSync(join(tmpdir(), "e1b-spool-rev-"));
+    // 把 --allowed-root 做成真实 git 仓 ⇒ 若 content 误取了 HEAD，revision 会是非空 sha。
+    const gitRepo = makeGitDir();
     try {
-      const { blocks, outcome } = await runDispatch({ sources: ["content"], allowedRoot: d });
+      const { blocks } = await runDispatch({
+        sources: ["content"],
+        clueText: `web://http://x/x.pdf@${digest}`,
+        contentMessages: [contentDocMessage(digest, "body")],
+        contentSpoolRoot: spoolRoot,
+        allowedRoot: gitRepo,
+        gitDir: false,
+      });
       expect(blocks).toHaveLength(1);
-      expect(outcome?.spawns).toHaveLength(1);
-      expect(outcome?.spawns[0].spawned).toBe(true);
-      expect(outcome?.spawns[0].role).toBe(CONTENT_ROLE);
-      // ⛔ 判别性（spec §1.1 W3）：spawn 参数里带 allowed_root（argv --add-dir + input.allowed_root）。
-      expect(blocks[0].args).toContain("--add-dir");
-      const addDirIdx = blocks[0].args.indexOf("--add-dir");
-      expect(blocks[0].args[addDirIdx + 1]).toBe(d);
       const parsed = JSON.parse(blocks[0].inputContent ?? "{}") as Record<string, unknown>;
-      expect(parsed.allowed_root).toBe(d);
+      // content 的 revision 不得再取代码仓 HEAD（GT-1：那与 transcript 无关）。
+      expect(parsed).not.toHaveProperty("revision");
     } finally {
-      rmSync(d, { recursive: true, force: true });
+      rmSync(spoolRoot, { recursive: true, force: true });
+      rmSync(gitRepo, { recursive: true, force: true });
     }
+  });
+});
+
+describe("E1b D5: content clue transcript not found ⇒ blocked, zero spawn", () => {
+  it("⭐ D5 discriminating: digest not on research:content ⇒ clue blocked (zero spawn, spawn record false)", async () => {
+    const digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const spoolRoot = mkdtempSync(join(tmpdir(), "e1b-spool-miss-"));
+    try {
+      const { blocks, outcome } = await runDispatch({
+        sources: ["content"],
+        clueId: "clue_missing",
+        clueText: `web://http://127.0.0.1:50287/missing.png@${digest}`,
+        // research:content 上没有该 digest 的 transcript。
+        contentMessages: [],
+        contentSpoolRoot: spoolRoot,
+      });
+      expect(outcome).toBeTruthy();
+      // 零 spawn（判据 6）：agent-run stub 未被调用（无 block）、spawn 记录 spawned:false。
+      expect(blocks).toHaveLength(0);
+      const spawnRec = outcome!.spawns.find((s) => s.clueId === "clue_missing");
+      expect(spawnRec).toBeTruthy();
+      expect(spawnRec!.spawned).toBe(false);
+      expect(spawnRec!.role).toBe(CONTENT_ROLE);
+      // D5 不静默跳过：该卡经两次 CAS（open→in_flight→blocked），writes ≥ 2（非零、非 skipped）。
+      expect(outcome!.writes).toBeGreaterThanOrEqual(2);
+      expect(outcome!.skipped).toBe(0);
+    } finally {
+      rmSync(spoolRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("D5 unit: ContentTranscriptMissingError carries the digest", () => {
+    const e = new ContentTranscriptMissingError("deadbeef");
+    expect(e.digest).toBe("deadbeef");
+    expect(e.message).toMatch(/deadbeef/);
+    expect(e.message).toMatch(/research:content/);
   });
 });
 
@@ -479,5 +571,25 @@ describe("F10: argv excludes --add-dir when no allowed_root", () => {
       clueText: "t",
     });
     expect(argv).not.toContain("--add-dir");
+  });
+});
+
+// ── E1b D1/D3 纯函数：parseDigestFromContentClue / spoolFileName ────────
+
+describe("E1b D1/D3 pure: parseDigestFromContentClue + spoolFileName (deterministic)", () => {
+  it("parseDigestFromContentClue extracts digest from web://<uri>@<digest>", () => {
+    const d = parseDigestFromContentClue("web://http://x/y.pdf@deadbeef");
+    expect(d).toBe("deadbeef");
+  });
+
+  it("parseDigestFromContentClue returns null for non-content-clue text", () => {
+    expect(parseDigestFromContentClue("investigate content")).toBeNull();
+    expect(parseDigestFromContentClue("transcript digest=x origin=y")).toBeNull();
+  });
+
+  it("spoolFileName is deterministic: same digest ⇒ same filename, .md suffix", () => {
+    const digest = "abc123";
+    expect(spoolFileName(digest)).toBe(`${digest}.md`);
+    expect(spoolFileName(digest)).toBe(spoolFileName(digest));
   });
 });

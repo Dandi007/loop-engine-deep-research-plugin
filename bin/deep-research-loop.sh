@@ -105,6 +105,13 @@ export EVIDENCE_CHANNEL="${EVIDENCE_CHANNEL:-}"
 # 未配置时留空，`--run` 一旦遇到 code-local dispatch 会响亮失败（§1.2 / F5），绝不静默零证据。
 # 其余 role（wiki / feishu / code-remote）不需要它，不会因缺失被阻断。
 export ALLOWED_ROOT="${ALLOWED_ROOT:-}"
+# E1b D1/D2/D7 —— content worker 的 spool 根目录：从 bin 一路导出 → fleet → workflow → tick.md
+# → `tick-entry --run --content-spool-root`。派发 content clue 前把 transcript body 落成
+# <spoolRoot>/<digest>.md（D1）；content worker 的 allowed_root = spool 根（D2）。
+# ⛔ D7：spool 目录归属本 run，⛔ 不得落 vault 根、⛔ 不得与 .dd-evidence/** / .dev-dispatch/** 冲突。
+#    缺省留空：tick.md 不传 --content-spool-root ⇒ tick-entry --run 用 DEFAULT_CONTENT_SPOOL_ROOT
+#    （tmpdir 下兜底，仅供未配置时的可观测兜底；生产由 profile CONTENT_SPOOL_ROOT 显式声明）。
+export CONTENT_SPOOL_ROOT="${CONTENT_SPOOL_ROOT:-}"
 # A10c——写入预算上限：从 bin 一路导出 → fleet → workflow → tick.md → `tick-entry --run --max-writes`。
 # ⛔ 缺省值必须**足以收割一张真实卡**（真实 worker 产出实测 6~10 条 evidence，加最终 CAS）；
 #    旧默认 5 让任何产出 ≥5 条 evidence 的卡永远收割不了 ⇒ 恒 max_rounds 死锁（本包根因）。

@@ -22,6 +22,9 @@ tick_entry="{{tick_entry}}"
 tick_channel="{{tick_channel}}"
 evidence_channel="{{evidence_channel}}"
 allowed_root="{{allowed_root}}"
+# E1b D1/D2/D7 —— content worker 的 spool 根目录：由 fleet input 注入。缺省（空串）⇒ 不传 ⇒
+# tick-entry --run 用 DEFAULT_CONTENT_SPOOL_ROOT（tmpdir 下兜底）。
+content_spool_root="{{content_spool_root}}"
 max_writes="{{max_writes}}"
 # E0c10 D5 —— 板面 clue 上限（--max-clues）：由 fleet input 注入。缺省（空串）⇒ 不传 ⇒ tick-entry 用 64。
 max_clues="{{max_clues}}"
@@ -50,6 +53,8 @@ if [ -n "$tick_channel" ]; then
   tick_args=("$tick_entry" --run "$tick_channel")
   if [ -n "$evidence_channel" ]; then tick_args+=(--evidence-channel "$evidence_channel"); fi
   if [ -n "$allowed_root" ]; then tick_args+=(--allowed-root "$allowed_root"); fi
+  # E1b D1/D2/D7 —— content worker 的 spool 根：经装配链注入；缺省（空）不传 ⇒ tick-entry --run 用兜底。
+  if [ -n "$content_spool_root" ]; then tick_args+=(--content-spool-root "$content_spool_root"); fi
   tick_args+=(--max-writes "$max_writes")
   # E0c10 D5 —— max_clues 经装配链注入；缺省（空）不传 ⇒ tick-entry --run 用 DEFAULT_TICK_CONFIG.maxClues=64。
   if [ -n "$max_clues" ]; then tick_args+=(--max-clues "$max_clues"); fi

@@ -46,10 +46,14 @@ usage:
                      重复播种不会翻倍。channel 不存在 ⇒ 响亮失败并点名；零线索 ⇒ 响亮失败。
                      E0c1 §1.4 / GT-2：--source 必填且非空（真机：sources=[] 的 clue 会被结构性
                      卡为 blocked、派不出 worker）；缺失 ⇒ 响亮失败，⛔ 不静默播一条 sources:[] 的线索。
-... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>] [--max-clues <n>]
+... --run <channel_id> [--max-writes <n>] [--evidence-channel <evidence_channel_id>] [--allowed-root <path>] [--content-spool-root <path>] [--question <研究主问题>] [--prev-coverage <n>] [--prev-zero-growth <n>] [--origin <research_origin>] [--doc-channel <doc_channel_id>] [--one-shot-dir <path>] [--max-clues <n>]
                       写侧：CAS + spawn + 收割 + triage 派发（reclaim/dispatch/block/harvest/triage），exit 0
                       E0c10 D5——--max-clues 板面 clue 上限，由 tick.md 从 {{max_clues}} 注入；缺省 64。
                               影响 harvest 封顶与 decideTermination 的 capHit 判定。
+                      E1b D1/D2/D7——--content-spool-root content worker 的 spool 根目录（= content worker 的
+                              allowed_root，D2：⛔ 不是 --allowed-root）。派发 content 线索前把 transcript body
+                              落成 <spoolRoot>/<digest>.md（D1）。由 tick.md 从 {{content_spool_root}} 注入；
+                              缺省 DEFAULT_CONTENT_SPOOL_ROOT（tmpdir 下兜底）。⛔ D7：不得落 vault 根 / .dev-dispatch/**。
                      G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经
                              本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；
                              JSON 输出含 termination（与 hasPendingWork 并列）。

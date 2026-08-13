@@ -5,14 +5,16 @@ set -euo pipefail
 # 一条命令把现状链路在 **测试总线**（127.0.0.1:7495）上从头跑到终态：
 #   导出 AGENT_BUS_URL / AGENT_BUS_TOKEN_FILE → 生产护栏 →
 #   §1.3 per-run channel 派生 + 预备（含 board:agent-runs）→
-#   §1.2 生产总线 sum(head_seq) 跑前读数 → §1.4 空板自播种（带 --source）→
-#   跑 loop → §1.2 生产总线 sum(head_seq) 跑后读数（两读数写进运行记录，不等则失败）→ 归档。
+#   §1.2 生产总线 sum(head_seq) 跑前读数（仅记录，供人工复盘）→ §1.4 空板自播种（带 --source）→
+#   跑 loop → §1.2 生产总线 sum(head_seq) 跑后读数（仅记录）→
+#   E0c11 §1 生产总线「本次运行零写入」身份判定（GT-P1/GT-P2）→ 归档。
 # 用法：
 #   bash bin/e0-regression.sh                 # 缺省即可跑（profile e0-regression）
 #   bash bin/e0-regression.sh --run <id>      # 可选覆盖 run id（缺省自动生成）
 #   bash bin/e0-regression.sh --profile <p>   # 可选覆盖 profile（缺省 e0-regression）
 #
-# 退出码：0 = 链路跑到终态；非零 = 没跑到终态（含生产护栏拒绝、loop 失败、§1.2 读数不等）。
+# 退出码：0 = 链路跑到终态；非零 = 没跑到终态（含生产护栏拒绝、loop 失败、
+#   E0c11 身份判定发现本次运行写了生产总线）。
 # 绝不以 0 掩盖未跑完。
 
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -206,7 +208,9 @@ _ensure_channel "$DOC_CHANNEL"
 _ensure_channel "$RUNS_CHANNEL_ID"
 
 # E0c1 §1.2 —— 生产总线 sum(head_seq) 跑前读数（http://127.0.0.1:7490，只读 GET）。
-#   两个读数（跑前/跑后）写进运行记录；不等 ⇒ 判失败并非零退出。读失败即失败（⛔ 不得跳过检查）。
+#   两个读数（跑前/跑后）写进运行记录供人工复盘；E0c11 之后**判定不再依赖两者相等**
+#   （GT-P1：本机生产总线始终有别的开发线在写，全量 sum 相等在这台机器上恒为失败，
+#   判据本身设计错了——成败改由 §E0c11 身份判定决定）。读失败即失败（⛔ 不得跳过检查）。
 #   生产总线 URL/token 与测试总线独立（不受 AGENT_BUS_URL 覆盖影响）；
 #   可用 E0C1_PROD_BUS_URL / E0C1_PROD_BUS_TOKEN_FILE 显式覆盖（测试注入用，生产路径不变）。
 PROD_BUS_URL="${E0C1_PROD_BUS_URL:-http://127.0.0.1:7490}"
@@ -538,7 +542,7 @@ while true; do
 done
 
 # ── 运行记录归档（含每轮 drain 记录）。──
-# E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数。
+# E0c1 §1.2 —— 生产总线 sum(head_seq) 跑后读数（仅记录，供人工复盘）。
 echo "[e0-regression] reading production bus sum(head_seq) AFTER run ($PROD_BUS_URL)" >&2
 if ! PROD_SUM_AFTER="$(_read_prod_head_seq_sum)"; then
   echo "[e0-regression] REFUSING to succeed: failed to read production bus sum(head_seq) after run (spec §1.2: read failure is failure). PROD_BUS_URL=$PROD_BUS_URL" >&2
@@ -565,13 +569,74 @@ fi
 echo "[e0-regression] prod_bus_sum(head_seq)_after=$PROD_SUM_AFTER" >&2
 echo "$PROD_SUM_AFTER" > "$RECORD_DIR/prod_bus_sum_after.json"
 
-# §1.2 —— 两个读数不相等 ⇒ 判失败并非零退出。
+# §1.2 —— 跑前/跑后两读数仍写进运行记录供人工复盘（GT-P1：判定不再依赖两者相等）。
 PROD_SUM_BEFORE_NUM="$(printf '%s' "$PROD_SUM_BEFORE" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
 PROD_SUM_AFTER_NUM="$(printf '%s' "$PROD_SUM_AFTER" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const o=JSON.parse(s);process.stdout.write(String(o.sum))})')"
 PROD_DELTA=$((PROD_SUM_AFTER_NUM - PROD_SUM_BEFORE_NUM))
-if [ "$PROD_DELTA" -ne 0 ]; then
-  echo "[e0-regression] REFUSING to succeed: production bus sum(head_seq) grew during the run (before=$PROD_SUM_BEFORE_NUM, after=$PROD_SUM_AFTER_NUM, delta=$PROD_DELTA). spec §1.2: the regression must not write to the production bus." >&2
+
+# E0c11 §1 —— 生产总线「本次运行零写入」身份判定（GT-P1 / GT-P2）。
+#   取代 E0 §1.2 的「全量 sum(head_seq) 跑前 == 跑后」判据：该判据把「这段时间生产总线
+#   有没有人写」当成成败，而本机生产总线始终有别的开发线在写，所以它恒为失败
+#   （GT-P1：这是判据设计错了，不是被测系统的缺陷）。
+#   新判据证明的是「**本次回归运行**没有往生产总线写任何东西」（GT-P2），⛔ 不是「生产总线静止」。
+#   组合 spec §1 两条可行做法：
+#     - 按 run 身份过滤：board:agent-runs 上不得有任何消息属于本次运行（payload.run_id === RUN_ID）；
+#     - 按 channel 存在性：本次 run 派生的 research channel 名在生产总线上不得存在。
+#   ⛔ 不得把守卫删掉或降级成警告：本次运行真的写了 ⇒ 非零退出并点名（GT-P2）。
+#   ⛔ 不得改成只比对某个固定 channel 的绝对值。
+_read_prod_run_verdict() {
+  local _ec _out _err
+  set +e
+  _out="$(AGENT_RUN_BIN="${AGENT_RUN_BIN:-}" E0C1_PROD_BUS_URL="$PROD_BUS_URL" E0C1_PROD_BUS_TOKEN_FILE="$PROD_BUS_TOKEN_FILE" \
+    node "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/e0c11-prod-guard.ts" \
+    --run-id "$RUN_ID" --runs-channel "$RUNS_CHANNEL_ID" \
+    --run-channel "$TICK_CHANNEL" --run-channel "$EVIDENCE_CHANNEL" --run-channel "$DOC_CHANNEL" \
+    2>"$ENTRY_TMP.prod-guard.err")"
+  _ec=$?
+  set -e
+  if [ "$_ec" -ne 0 ]; then
+    _err="$(cat "$ENTRY_TMP.prod-guard.err" 2>/dev/null || true)"
+    rm -f "$ENTRY_TMP.prod-guard.err" 2>/dev/null || true
+    echo "[e0-regression] production bus identity guard read failed (exit=$_ec): ${_err:-<no stderr>}" >&2
+    return "$_ec"
+  fi
+  rm -f "$ENTRY_TMP.prod-guard.err" 2>/dev/null || true
+  printf '%s' "$_out"
+}
+
+echo "[e0-regression] running E0c11 production-bus identity guard (run_id=$RUN_ID, runs_channel=$RUNS_CHANNEL_ID)" >&2
+if ! PROD_VERDICT="$(_read_prod_run_verdict)"; then
+  echo "[e0-regression] REFUSING to succeed: failed to read production bus for identity guard (spec §1: the run-identity read is mandatory; read failure is failure). PROD_BUS_URL=$PROD_BUS_URL" >&2
+  {
+    echo "run_id=$RUN_ID"
+    echo "profile=$PROFILE"
+    echo "tick_channel=$TICK_CHANNEL"
+    echo "evidence_channel=$EVIDENCE_CHANNEL"
+    echo "doc_channel=$DOC_CHANNEL"
+    echo "runs_channel=$RUNS_CHANNEL_ID"
+    echo "loop_run_root=$RECORD_DIR/loop-run"
+    echo "drain_attempts=$DRAIN_ATTEMPT"
+    echo "final_termination_state=$TERMINATION_STATE"
+    echo "prod_bus_sum_before=$PROD_SUM_BEFORE_NUM"
+    echo "prod_bus_sum_after=$PROD_SUM_AFTER_NUM"
+    echo "prod_bus_delta=$PROD_DELTA"
+    echo "prod_bus_guard=READ_FAILED"
+    echo "entry_exit_code=3"
+    echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "drain_records=$(printf '%b' "$DRAIN_RECORDS")"
+  } > "$RECORD_DIR/run.meta"
+  cp "$RECORD_DIR/run.meta" "$RECORD_DIR/run.txt"
+  exit 3
+fi
+echo "$PROD_VERDICT" > "$RECORD_DIR/prod_bus_guard.json"
+
+# verdict.wrote === true ⇒ 本次运行往生产总线写了 ⇒ 非零退出并点名（GT-P2）。
+PROD_VERDICT_WROTE="$(printf '%s' "$PROD_VERDICT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s.trim());process.stdout.write(String(o.wrote===true))}catch{process.stdout.write("false")}})' 2>/dev/null || echo "false")"
+if [ "$PROD_VERDICT_WROTE" = "true" ]; then
+  echo "[e0-regression] REFUSING to succeed: E0c11 production-bus identity guard found messages belonging to THIS run on the production bus (run_id=$RUN_ID). spec §1: the regression must not write to the production bus. verdict=$PROD_VERDICT" >&2
   LOOP_EXIT=3
+else
+  echo "[e0-regression] E0c11 production-bus identity guard: PASS (no message on the production bus belongs to run_id=$RUN_ID; prod_bus_delta=$PROD_DELTA is from other development lines and does not fail this run, GT-P1)" >&2
 fi
 
 # ── 运行记录归档（§2.3.5）。──
@@ -588,6 +653,7 @@ fi
   echo "prod_bus_sum_before=$PROD_SUM_BEFORE_NUM"
   echo "prod_bus_sum_after=$PROD_SUM_AFTER_NUM"
   echo "prod_bus_delta=$PROD_DELTA"
+  echo "prod_bus_guard_wrote=$PROD_VERDICT_WROTE"
   echo "entry_exit_code=$LOOP_EXIT"
   echo "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "drain_records=$(printf '%b' "$DRAIN_RECORDS")"

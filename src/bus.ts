@@ -270,6 +270,208 @@ export async function readProdBusHeadSeqSum(): Promise<{
   return sumHeadSeqAcrossChannels(channels);
 }
 
+/**
+ * E0c11 —— 对**指定** bus 实例读 `GET /v1/channels/<id>/messages`（分页拉满）。
+ *
+ * 与 `getMessages` 同形，但 base/token 由参数显式传入（不读模块级 `BASE_URL`/`token()`），
+ * 供生产总线身份判定在测试总线覆盖 `AGENT_BUS_URL` 时仍能独立读生产总线。
+ * 全程只发 GET。
+ */
+export async function getMessagesAt(
+  baseUrl: string,
+  tokenPath: string,
+  channelId: string,
+  opts: { limit?: number; afterSeq?: number } = {},
+): Promise<BusMessage[]> {
+  let bearer: string;
+  try {
+    bearer = readFileSync(tokenPath, "utf-8").trim();
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `E0c11: failed to read bus token at '${tokenPath}' (${detail}). The production-bus message read is mandatory; refusing to skip it.`,
+    );
+  }
+  if (!bearer) {
+    throw new Error(
+      `E0c11: bus token at '${tokenPath}' is empty. The production-bus message read is mandatory; refusing to skip it.`,
+    );
+  }
+  const params = new URLSearchParams();
+  params.set("limit", String(opts.limit ?? 100));
+  if (opts.afterSeq !== undefined) params.set("after_seq", String(opts.afterSeq));
+  const path = `/v1/channels/${channelId}/messages?${params}`;
+  const resp = await fetch(`${baseUrl}${path}`, {
+    headers: {
+      Authorization: `Bearer ${bearer}`,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new BusError("GET", path, resp.status, body);
+  }
+  const data = (await resp.json()) as { messages?: unknown };
+  return Array.isArray(data.messages) ? (data.messages as BusMessage[]) : [];
+}
+
+/**
+ * 把指定 bus 实例上的某 channel 消息分页拉满（与 `readChannelMessages` 同形，
+ * 但读生产总线）。全程只读 GET。
+ */
+export async function readAllMessagesAt(
+  baseUrl: string,
+  tokenPath: string,
+  channelId: string,
+): Promise<BusMessage[]> {
+  const all: BusMessage[] = [];
+  let afterSeq: number | undefined;
+  for (;;) {
+    const page = await getMessagesAt(baseUrl, tokenPath, channelId, {
+      limit: 100,
+      afterSeq,
+    });
+    all.push(...page);
+    if (page.length === 0) break;
+    const next = page[page.length - 1].channel_seq;
+    if (afterSeq !== undefined && next <= afterSeq) break;
+    afterSeq = next;
+  }
+  return all;
+}
+
+/**
+ * E0c11 §1 / GT-P2 —— 判定一条 bus 消息是否「属于本次运行」。
+ *
+ * 判据（任一命中即算本次运行写的）：
+ *   - `payload.run_id === runId`（agent.run.* / worker.result.v1 / research.* 系列都在 payload 带 run_id）；
+ *   - 消息发在**本次 run 派生的** research channel 上（channel_id 命中该 run 的派生 channel 名集合）。
+ *
+ * ⛔ 不依赖 `sum(head_seq)` 全量相等（GT-P1：别人往生产总线写不能让本次 run 失败）。
+ * ⛔ 纯函数：消费已读消息数组，不发起 IO，可直接喂字面量数组做判别性断言。
+ */
+export function messageBelongsToRun(
+  msg: BusMessage,
+  runId: string,
+  runChannelIds: ReadonlySet<string>,
+): boolean {
+  if (runChannelIds.has(msg.channel_id)) return true;
+  const payload = (msg.payload ?? null) as Record<string, unknown> | null;
+  if (payload !== null && typeof payload === "object") {
+    const rid = payload.run_id;
+    if (typeof rid === "string" && rid === runId) return true;
+  }
+  return false;
+}
+
+/**
+ * E0c11 §1 / GT-P2 —— 在已读消息数组里挑出属于本次运行的违规消息。
+ *
+ * 返回每条违规消息的最小诊断视图（channel_id / kind / message_id / channel_seq + payload run_id），
+ * 供入口点名「哪条 channel / 哪条消息」非零退出（spec §1：⛔ 不得删/降级，必须点名）。
+ * 纯函数。
+ */
+export function findRunMessages(
+  messages: readonly BusMessage[],
+  runId: string,
+  runChannelIds: ReadonlySet<string>,
+): Array<{
+  channel_id: string;
+  kind: string;
+  message_id: string;
+  channel_seq: number;
+  run_id: string | null;
+}> {
+  const offenders: Array<{
+    channel_id: string;
+    kind: string;
+    message_id: string;
+    channel_seq: number;
+    run_id: string | null;
+  }> = [];
+  for (const msg of messages) {
+    if (!messageBelongsToRun(msg, runId, runChannelIds)) continue;
+    const payload = (msg.payload ?? null) as Record<string, unknown> | null;
+    const rid =
+      payload !== null && typeof payload === "object" &&
+      typeof payload.run_id === "string"
+        ? payload.run_id
+        : null;
+    offenders.push({
+      channel_id: msg.channel_id,
+      kind: msg.kind,
+      message_id: msg.message_id,
+      channel_seq: msg.channel_seq,
+      run_id: rid,
+    });
+  }
+  return offenders;
+}
+
+/**
+ * E0c11 §1 —— 生产总线「本次运行零写入」身份判定（GT-P1 / GT-P2）。
+ *
+ * 判据（任一命中 ⇒ 本次运行往生产总线写了 ⇒ 违规）：
+ *   1. **按 channel 存在性**：本次 run 派生的 research channel 在生产总线上**不得存在**
+ *      （spec §1 第二条可行做法：本 run 派生的 research channel 名在生产总线上不得存在）。
+ *   2. **按 run 身份过滤**：在生产总线 `board:agent-runs` 上不得有任何消息属于本次运行
+ *      （`payload.run_id === runId` 即算违规，spec §1 第一条可行做法）。
+ *
+ * ⛔ 不依赖 `sum(head_seq)` 全量相等（GT-P1：别人往生产总线写不能让本次 run 失败）。
+ * ⛔ 不得删/降级：本次 run 真的写了 ⇒ verdict.wrote === true，入口据此非零退出并点名（GT-P2）。
+ *
+ * 运行记录仍保留跑前/跑后的生产总线 `sum(head_seq)` 读数（由 `readProdBusHeadSeqSum` 完成），
+ * 但**判定不再依赖两者相等**（spec §1 末段）。
+ *
+ * `runsChannelId` 是 `board:agent-runs` 的单一真相源（src/run-channels.ts:RUNS_CHANNEL_ID）。
+ * `runChannelIds` 是本次 run 派生的 research channel 名集合（不应在生产总线上存在）。
+ */
+export async function readProdBusRunWriteVerdict(opts: {
+  runId: string;
+  runsChannelId: string;
+  runChannelIds: ReadonlySet<string>;
+}): Promise<{
+  wrote: boolean;
+  existingRunChannels: string[];
+  offenders: Array<{
+    channel_id: string;
+    kind: string;
+    message_id: string;
+    channel_seq: number;
+    run_id: string | null;
+  }>;
+}> {
+  const prodUrl = process.env.E0C1_PROD_BUS_URL ?? "http://127.0.0.1:7490";
+  const prodTokenPath =
+    process.env.E0C1_PROD_BUS_TOKEN_FILE ??
+    "/data/agent-bus/tokens/uther-tui.token";
+
+  // (1) 按 channel 存在性：本次 run 派生的 research channel 在生产总线上不得存在。
+  const channels = await listChannelsAt(prodUrl, prodTokenPath);
+  const presentIds = new Set(channels.map((c) => c.channel_id));
+  const existingRunChannels = opts.runChannelIds.size
+    ? [...opts.runChannelIds].filter((id) => presentIds.has(id))
+    : [];
+
+  // (2) 按 run 身份过滤：board:agent-runs 上不得有任何消息属于本次运行。
+  const runsMessages = await readAllMessagesAt(
+    prodUrl,
+    prodTokenPath,
+    opts.runsChannelId,
+  );
+  const offenders = findRunMessages(
+    runsMessages,
+    opts.runId,
+    opts.runChannelIds,
+  );
+
+  return {
+    wrote: existingRunChannels.length > 0 || offenders.length > 0,
+    existingRunChannels,
+    offenders,
+  };
+}
+
 /** 获取 channel 消息（分页，增量） */
 export async function getMessages(
   channelId: string,

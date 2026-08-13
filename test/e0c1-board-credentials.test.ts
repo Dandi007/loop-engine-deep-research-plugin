@@ -8,7 +8,8 @@
  *  - GT-2  播种未传 --source（sources=[]）⇒ 响亮失败（在 g4e-seed.test.ts 同断言）。
  *  - §1.3  两次运行的 research channel 名不同且各含 run_id；channel 名改回固定值 ⇒ 第二次红。
  *  - §1.3  board:agent-runs 在仓内只有一处真相源（src/）。
- *  - §1.2  生产总线跑前跑后两读数写进记录且相等；不等 ⇒ 失败。
+ *  - §1.2  生产总线跑前/跑后两读数写进记录（供人工复盘）；E0c11 后判定改按本次运行身份
+ *         （GT-P1：别人写不失败；GT-P2：本次运行写 ⇒ 非零退出并点名）。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { spawn } from "node:child_process";
@@ -409,12 +410,20 @@ function startFakeBus(): Promise<{
   createdChannels: () => string[];
   setProdSum: (n: number) => void;
   bumpProdSumAfterNextListRead: (delta: number) => void;
+  publishToChannel: (channelId: string, msg: {
+    kind: string;
+    payload: unknown;
+    entity_id?: string;
+  }) => void;
   close: () => void;
 }> {
   return new Promise((resolve) => {
     const created: string[] = [];
     let prodSum = 0;
     let pendingBump: number | null = null;
+    // channel_id -> messages（按 channel_seq 递增）。E0c11 身份判定需要读 board:agent-runs 的消息。
+    const messagesByChannel = new Map<string, Array<Record<string, unknown>>>();
+    let globalSeq = 0;
     const server = createServer((req, res) => {
       const url = req.url ?? "";
       const method = req.method ?? "GET";
@@ -434,8 +443,17 @@ function startFakeBus(): Promise<{
         return;
       }
       if (method === "GET" && url === "/v1/channels") {
+        // 列表端点把所有有消息的 channel 也列出（E0c11 channel-existence 判定读列表端点）。
+        const msgChannels = [...messagesByChannel.keys()].map((channel_id) => ({
+          channel_id,
+          head_seq: messagesByChannel.get(channel_id)!.length,
+        }));
+        const seen = new Set<string>(["fake:prod", ...msgChannels.map((c) => c.channel_id)]);
+        const extraCreated = created.filter((c) => !seen.has(c)).map((channel_id) => ({ channel_id, head_seq: 0 }));
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ channels: [{ channel_id: "fake:prod", head_seq: prodSum }] }));
+        res.end(JSON.stringify({
+          channels: [{ channel_id: "fake:prod", head_seq: prodSum }, ...msgChannels, ...extraCreated],
+        }));
         // 确定性 bump：下一次列表读完成后把 prodSum 加上 pendingBump（模拟生产总线被写入）。
         // 用回调替代固定 setTimeout，消除测试对入口各阶段耗时的时序耦合。
         if (pendingBump !== null) {
@@ -443,6 +461,22 @@ function startFakeBus(): Promise<{
           pendingBump = null;
           prodSum += d;
         }
+        return;
+      }
+      // GET /v1/channels/<id>/messages —— E0c11 身份判定读 board:agent-runs 消息。
+      if (method === "GET" && url.includes("/messages")) {
+        const chId = decodeURIComponent(url.split("/v1/channels/")[1]?.split("/messages")[0] ?? "");
+        const afterSeqMatch = url.match(/[?&]after_seq=([0-9]+)/);
+        const afterSeq = afterSeqMatch ? Number(afterSeqMatch[1]) : undefined;
+        const limitMatch = url.match(/[?&]limit=([0-9]+)/);
+        const limit = limitMatch ? Number(limitMatch[1]) : 100;
+        const all = messagesByChannel.get(chId) ?? [];
+        const filtered = afterSeq !== undefined
+          ? all.filter((m) => (m.channel_seq as number) > afterSeq)
+          : all;
+        const page = filtered.slice(0, limit);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ messages: page }));
         return;
       }
       if (method === "GET" && url.startsWith("/v1/channels/")) {
@@ -474,6 +508,22 @@ function startFakeBus(): Promise<{
         },
         bumpProdSumAfterNextListRead: (delta: number) => {
           pendingBump = delta;
+        },
+        publishToChannel: (channelId, msg) => {
+          globalSeq += 1;
+          const seq = globalSeq;
+          const list = messagesByChannel.get(channelId) ?? [];
+          list.push({
+            message_id: `m-${seq}`,
+            channel_id: channelId,
+            channel_seq: seq,
+            kind: msg.kind,
+            payload: msg.payload,
+            entity_id: msg.entity_id ?? `e-${seq}`,
+            supersedes: null,
+            created_at: new Date().toISOString(),
+          });
+          messagesByChannel.set(channelId, list);
         },
         close: () => server.close(),
       });
@@ -554,34 +604,135 @@ describe("E0c1 entry integration: per-run channels + board:agent-runs prep + §1
     }
   }, 45000);
 
-  it("§1.2 DISCRIMINATING: prod_bus_delta != 0 ⇒ entry exits 3 and records the delta", async () => {
-    const bus = await startFakeBus();
-    bus.setProdSum(10);
+  it("E0c11 GT-P1 DISCRIMINATING: others write to prod bus during this run ⇒ guard PASSES (does not fail on the delta)", async () => {
+    // GT-P1：构造「本次运行期间，生产总线上由别人写入了若干消息」⇒ 守卫必须放行（不因此失败）。
+    // 判别性：把守卫改回比对全量 sum(head_seq) ⇒ 该测试变红（旧判据会把 delta=89 当失败）。
+    // 真机拓扑：测试总线（AGENT_BUS_URL）与生产总线（E0C1_PROD_BUS_URL）是两个独立实例，
+    // 入口只在测试总线上建 per-run channel；守卫只读生产总线。这里用两个独立 fake bus 复刻该拓扑。
+    const testBus = await startFakeBus();
+    const prodBus = await startFakeBus();
+    prodBus.setProdSum(10);
     const recRoot = mkdtempSync(join(tmpdir(), "e0c1-entry-rec3-"));
     const tokFile = makeTokenFileE0c1();
-    const runId = "e0c1-entry-delta-003";
-    // loop 失败快（CLI 不存在）；用确定性 bump 模拟生产总线被写入：
-    // before-read（入口跑前读数）完成后，把 prodSum 加 89，使 after-read 读到 99 ⇒ delta=89。
-    // 用回调替代固定 setTimeout，消除入口各阶段（RUNS_CHANNEL_ID 解析、channel 预备等）耗时的时序耦合。
-    bus.bumpProdSumAfterNextListRead(89);
+    const runId = "e0c1-entry-gtp1-003";
+    // 别人往生产总线 board:agent-runs 写的消息（payload.run_id 是别人的，不是本次 run）。
+    prodBus.publishToChannel(RUNS_CHANNEL_ID, {
+      kind: "agent.run.started.v1",
+      payload: { run_id: "someone-else-run", role: "goal_coordinator", label: "claude/opus-5/lingzhi" },
+    });
+    // loop 失败快（CLI 不存在）；用确定性 bump 模拟生产总线 sum 被别人写增长：
+    // before-read 完成后 prodSum += 89 ⇒ after-read delta=89。旧判据会据此判失败；新判据必须放行。
+    prodBus.bumpProdSumAfterNextListRead(89);
     try {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
-        AGENT_BUS_URL: bus.base,
+        AGENT_BUS_URL: testBus.base,
         AGENT_BUS_TOKEN_FILE: tokFile,
-        E0C1_PROD_BUS_URL: bus.base,
+        E0C1_PROD_BUS_URL: prodBus.base,
+        E0C1_PROD_BUS_TOKEN_FILE: tokFile,
+        E0_RECORD_ROOT: recRoot,
+        DD_RUN_ID: runId,
+        LOOP_ENGINE_CLI: "/nonexistent/loop-engine/cli.js",
+      };
+      await runEntryDetached(env);
+      const meta = readFileSync(join(recRoot, runId, "run.meta"), "utf8");
+      // delta 仍被记录（供人工复盘）。
+      expect(meta).toMatch(/prod_bus_delta=89/);
+      // 判别性核心：身份判定 wrote=false（别人的消息不算本次运行写的）⇒ 守卫放行。
+      expect(meta).toMatch(/prod_bus_guard_wrote=false/);
+      const verdict = JSON.parse(readFileSync(join(recRoot, runId, "prod_bus_guard.json"), "utf8"));
+      expect(verdict.wrote).toBe(false);
+      expect(verdict.existingRunChannels).toEqual([]);
+      expect(verdict.offenders).toEqual([]);
+    } finally {
+      testBus.close();
+      prodBus.close();
+      rmSync(recRoot, { recursive: true, force: true });
+      rmSync(dirname(tokFile), { recursive: true, force: true });
+    }
+  }, 45000);
+
+  it("E0c11 GT-P2 DISCRIMINATING: THIS run writes to prod bus ⇒ guard FAILS and names the channel/message", async () => {
+    // GT-P2：构造「本次运行自己往生产总线写了一条」⇒ 守卫必须非零退出并点名是哪条 channel / 哪条消息。
+    // 判别性：把该断言删掉（守卫降级）⇒ 该测试变红。
+    const testBus = await startFakeBus();
+    const prodBus = await startFakeBus();
+    prodBus.setProdSum(10);
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c1-entry-rec3b-"));
+    const tokFile = makeTokenFileE0c1();
+    const runId = "e0c1-entry-gtp2-003b";
+    // 本次运行自己往生产总线 board:agent-runs 写了一条（payload.run_id === 本次 run_id）。
+    prodBus.publishToChannel(RUNS_CHANNEL_ID, {
+      kind: "agent.run.started.v1",
+      payload: { run_id: runId, role: "implement", label: "opencode/glm-5.2/zhipu-codeplan" },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AGENT_BUS_URL: testBus.base,
+        AGENT_BUS_TOKEN_FILE: tokFile,
+        E0C1_PROD_BUS_URL: prodBus.base,
         E0C1_PROD_BUS_TOKEN_FILE: tokFile,
         E0_RECORD_ROOT: recRoot,
         DD_RUN_ID: runId,
         LOOP_ENGINE_CLI: "/nonexistent/loop-engine/cli.js",
       };
       const res = await runEntryDetached(env);
-      // 判别性：生产总线零写入是硬不变量；delta != 0 ⇒ 入口判失败（exit 3）。
       const meta = readFileSync(join(recRoot, runId, "run.meta"), "utf8");
-      expect(meta).toMatch(/prod_bus_delta=89/);
-      expect(res.code).toBe(3);
+      // 判别性核心：身份判定 wrote=true（本次运行的消息被点名）⇒ 守卫判失败。
+      expect(meta).toMatch(/prod_bus_guard_wrote=true/);
+      const verdict = JSON.parse(readFileSync(join(recRoot, runId, "prod_bus_guard.json"), "utf8"));
+      expect(verdict.wrote).toBe(true);
+      // 点名是哪条 channel / 哪条消息（spec §1：⛔ 不得删/降级，必须点名）。
+      expect(verdict.offenders.length).toBeGreaterThanOrEqual(1);
+      expect(verdict.offenders[0].channel_id).toBe(RUNS_CHANNEL_ID);
+      expect(verdict.offenders[0].run_id).toBe(runId);
+      // 守卫判失败 ⇒ 入口非零退出（与 loop 自身的失败码无关，至少不是 0）。
+      expect(res.code).not.toBe(0);
     } finally {
-      bus.close();
+      testBus.close();
+      prodBus.close();
+      rmSync(recRoot, { recursive: true, force: true });
+      rmSync(dirname(tokFile), { recursive: true, force: true });
+    }
+  }, 45000);
+
+  it("E0c11 GT-P2 DISCRIMINATING (channel existence): THIS run's derived research channel exists on prod ⇒ guard FAILS and names it", async () => {
+    // spec §1 第二条可行做法：本 run 派生的 research channel 名在生产总线上不得存在。
+    // 判别性：把「按 channel 存在性」这条断言删掉 ⇒ 该测试变红。
+    const testBus = await startFakeBus();
+    const prodBus = await startFakeBus();
+    prodBus.setProdSum(0);
+    const recRoot = mkdtempSync(join(tmpdir(), "e0c1-entry-rec3c-"));
+    const tokFile = makeTokenFileE0c1();
+    const runId = "e0c1-entry-gtp2-chan-003c";
+    const seg = createHash("sha256").update(runId).digest("hex").slice(0, 16);
+    const tickChan = `research:e0-${seg}.index`;
+    // 本次 run 派生的 research channel 在生产总线上存在（本次运行越界建到了生产总线）。
+    prodBus.publishToChannel(tickChan, {
+      kind: "research.clue.v2",
+      payload: { status: "open", text: "leaked", run_id: runId },
+    });
+    try {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AGENT_BUS_URL: testBus.base,
+        AGENT_BUS_TOKEN_FILE: tokFile,
+        E0C1_PROD_BUS_URL: prodBus.base,
+        E0C1_PROD_BUS_TOKEN_FILE: tokFile,
+        E0_RECORD_ROOT: recRoot,
+        DD_RUN_ID: runId,
+        LOOP_ENGINE_CLI: "/nonexistent/loop-engine/cli.js",
+      };
+      const res = await runEntryDetached(env);
+      const verdict = JSON.parse(readFileSync(join(recRoot, runId, "prod_bus_guard.json"), "utf8"));
+      // 判别性核心：派生 channel 在生产总线上存在 ⇒ wrote=true 并点名该 channel。
+      expect(verdict.wrote).toBe(true);
+      expect(verdict.existingRunChannels).toContain(tickChan);
+      expect(res.code).not.toBe(0);
+    } finally {
+      testBus.close();
+      prodBus.close();
       rmSync(recRoot, { recursive: true, force: true });
       rmSync(dirname(tokFile), { recursive: true, force: true });
     }

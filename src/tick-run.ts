@@ -205,8 +205,8 @@ export interface TriageSpawnRuntime {
    *    缺省/缺失即响亮失败，绝不静默构建 argv 后丢弃、返回一个从未启动的假成功。
    */
   spawnProcess: (argv: string[], env: Record<string, string>) => Promise<{ pid?: number }>;
-  /** 从 worker 结果读回 `dr-triage.result.v1` 的决策列表。 */
-  readResult: (runId: string) => Promise<TriageResultDecision[]>;
+  /** 从 worker 结果读回 `dr-triage.result.v1` 的决策列表。缺省使用生产 polling 循环（readTriageResult + readChannelMessages + isRunExited）。 */
+  readResult?: (runId: string) => Promise<TriageResultDecision[]>;
 }
 
 /**
@@ -234,6 +234,9 @@ export async function spawnTriageRole(
       promptFile,
     });
     await runtime.spawnProcess(argv, { AGENT_RUN_BIN: runtime.agentRunBin });
+    if (!runtime.readResult) {
+      throw new Error("spawnTriageRole: readResult is not provided — a triage result reader is required");
+    }
     return await runtime.readResult(runtime.runId);
   } finally {
     rmSync(inputPath, { force: true });
@@ -383,11 +386,17 @@ export class MissingExportRootError extends Error {
  * 本轮 tick 继续处理其余工作并正常返回（§1.1c）。
  */
 export class RunExitedWithoutResultError extends Error {
+  public readonly runId: string;
+  public readonly role: string;
+  public readonly waitedMs: number;
   constructor(runId: string, role: string, waitedMs: number) {
     super(
       `E0c8: run ${runId} (role=${role}) exited without producing a result after ${waitedMs}ms — stopping wait immediately and recording as a local failure`,
     );
     this.name = "RunExitedWithoutResultError";
+    this.runId = runId;
+    this.role = role;
+    this.waitedMs = waitedMs;
   }
 }
 
@@ -866,7 +875,13 @@ export async function runWrite(
         const { decisions: triageDecisions, runId: triageRunId } = await spawnTriage(corpus).catch((err) => {
           if (err instanceof RunExitedWithoutResultError) {
             process.stderr.write(`[deep-research-loop] ${err.message}\n`);
-            return { decisions: [] as TriageResultDecision[], runId: "" };
+            // E0c8 §1.1c —— 该批 proposed 卡的 triage 失败，逐条标注 dropped 并写明原因。
+            const dropDecisions: TriageResultDecision[] = decision.proposedClues.map((c) => ({
+              clue_id: c.clueId,
+              action: "drop" as const,
+              rationale: `triage worker exited without producing a result (runId=${err.runId}). Card dropped to reflect triage failure.`,
+            }));
+            return { decisions: dropDecisions, runId: err.runId };
           }
           throw err;
         });
@@ -1626,39 +1641,45 @@ export async function runChannelWrite(
     spawnTriage:
       opts.spawnTriage ??
       ((corpus) => {
+        const defaultReadResult = async (runId: string) => {
+          const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const result = await readTriageResult(runId);
+            if (result !== null) return result;
+            // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
+            const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+            if (isRunExited(runId, runsMsgs)) {
+              throw new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - (deadline - timeoutMs));
+            }
+            await new Promise((r) => setTimeout(r, pollMs));
+          }
+          throw new Error(
+            `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
+          );
+        };
         const runtime: TriageSpawnRuntime =
-          opts.triageSpawnRuntime ?? {
-            agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
-            runId: randomUUID(),
-            // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
-            //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
-            spawnProcess: async (argv, env) => {
-              await spawnWorkerProcess({
-                cmd: argv[0],
-                args: argv.slice(1),
-                env,
-                onExit: () => {},
-              });
-              return {};
-            },
-            readResult: async (runId) => {
-              const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
-              while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
-                if (result !== null) return result;
-                // E0c8 §1.2 —— run 已退出但无 result ⇒ 立即停止等待。
-                const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
-                if (isRunExited(runId, runsMsgs)) {
-                  throw new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - (deadline - timeoutMs));
-                }
-                await new Promise((r) => setTimeout(r, pollMs));
+          opts.triageSpawnRuntime
+            ? {
+                ...opts.triageSpawnRuntime,
+                readResult: opts.triageSpawnRuntime.readResult ?? defaultReadResult,
               }
-              throw new Error(
-                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
-              );
-            },
-          };
+            : {
+                agentRunBin: opts.workerCmd ?? resolveAgentRunBin(),
+                runId: randomUUID(),
+                // ⛔ 无条件真实 spawn：真正启动 agent-run 子进程（本包不注册 dr-triage.result.v1，
+                //     E2E 真发留 Phase 6；spawn 仍是生产路径，绝非空操作/静默零-spawn 假成功）。
+                spawnProcess: async (argv, env) => {
+                  await spawnWorkerProcess({
+                    cmd: argv[0],
+                    args: argv.slice(1),
+                    env,
+                    onExit: () => {},
+                  });
+                  return {};
+                },
+                readResult: defaultReadResult,
+              };
         return spawnTriageRole(corpus, runtime).then(
             (decisions) => ({ decisions, runId: runtime.runId }),
           );
@@ -1860,6 +1881,8 @@ export interface RunCliOptions {
   triageThreshold?: number;
   /** E0c8 §1.1b —— 最大 clue 数（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues。 */
   maxClues?: number;
+  /** E0c8 —— worker 可执行路径（--worker-cmd）；缺省 `resolveAgentRunBin()`。 */
+  workerCmd?: string;
 }
 
 /**
@@ -1884,6 +1907,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
   let maxClues: number | undefined;
+  let workerCmd: string | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1976,6 +2000,14 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       maxClues = value;
       i += 1;
+    } else if (args[i] === "--worker-cmd") {
+      workerCmd = args[i + 1];
+      if (!workerCmd) {
+        throw new Error(
+          "E0c8: invalid --worker-cmd (must specify the worker executable path).",
+        );
+      }
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1992,6 +2024,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     oneShotDir,
     triageThreshold,
     maxClues,
+    workerCmd,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

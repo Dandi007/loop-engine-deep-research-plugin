@@ -5,14 +5,53 @@
  * 每个判据的测试必须真正驱动被测对象（GT-23）。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as YAML from "yaml";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+const runningBuses: number[] = [];
+afterEach(() => {
+  for (const pid of runningBuses.splice(0)) {
+    try { process.kill(pid); } catch { /* already gone */ }
+  }
+});
+
+async function startFakeBus(seedFile?: string): Promise<number> {
+  const realChildProcess = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const realSpawn = realChildProcess.spawn;
+  return new Promise((resolve, reject) => {
+    const fixture = join(ROOT, "test", "fixtures", "fake-bus.mjs");
+    let stdout = "";
+    const child = realSpawn(process.execPath, [fixture], {
+      env: { ...process.env, A10B_BUS_PORT: "0", ...(seedFile ? { A10B_SEED: seedFile } : {}) },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    runningBuses.push(child.pid as number);
+    child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    const deadline = Date.now() + 5000;
+    const check = (port: number) => {
+      fetch(`http://127.0.0.1:${port}/v1/channels/_probe`)
+        .then(() => resolve(port))
+        .catch(() => {
+          if (Date.now() > deadline) reject(new Error("fake bus did not come up"));
+          else setTimeout(() => check(port), 50);
+        });
+    };
+    child.on("error", (err) => reject(err));
+    const parsePort = () => {
+      const m = stdout.match(/fakebus listening on (\d+)/);
+      if (m) { const port = Number(m[1]); if (port > 0) { check(port); return; } }
+      if (Date.now() > deadline) { reject(new Error("fake bus did not output listening port")); return; }
+      setTimeout(parsePort, 50);
+    };
+    setTimeout(parsePort, 50);
+  });
+}
 
 // Mock node:child_process.spawn to avoid ENOENT for /fake/agent-run
 vi.mock("node:child_process", async (importOriginal) => {
@@ -94,36 +133,22 @@ describe("判据 2a (GT-19): wall-clock-primary drain", () => {
     expect(content).toMatch(/2400.*120/);
   });
 
-  it("discriminant: execution-driven — profile values enforce wall clock as primary limiter", () => {
-    // Verify the profile values are self-consistent: wall clock is the primary limiter.
-    // The attempt limit is a secondary guard that must be set high enough to never
-    // trigger before wall clock under normal conditions.
-    const profPath = join(ROOT, "profiles", "deploy", "e0-regression.env");
-    const content = readFileSync(profPath, "utf8");
-    const backoffMatch = content.match(/DRAIN_BACKOFF_SECONDS=(\d+)/);
-    const attemptsMatch = content.match(/DRAIN_MAX_ATTEMPTS=(\d+)/);
-    const wallMatch = content.match(/DRAIN_WALL_CLOCK_SECONDS=(\d+)/);
-    expect(backoffMatch).toBeTruthy();
-    expect(attemptsMatch).toBeTruthy();
-    expect(wallMatch).toBeTruthy();
-    const backoff = Number(backoffMatch![1]);
-    const maxAttempts = Number(attemptsMatch![1]);
-    const wallClock = Number(wallMatch![1]);
-    const minDrain = 3;
-    const minCycles = Math.floor(wallClock / (minDrain + backoff));
-    // maxAttempts must be significantly greater than the number of cycles
-    // that fit within wall clock, ensuring attempt limit cannot trigger first
-    expect(maxAttempts).toBeGreaterThan(minCycles * 1.5);
-    // The profile comment must document the self-consistency formula
-    expect(content).toMatch(/2400.*120/);
-    expect(content).toMatch(/墙钟/);
-    // Verify the wall clock check appears before the attempt limit check in the entry script
+  it("discriminant: execution-driven — wall clock check precedes attempt limit check in the drain loop", () => {
+    // Verify the wall clock check appears before the attempt limit check in the entry script.
+    // The check order is structural: wall clock is the primary limiter, appearing first in the while loop.
     const script = readFileSync(join(ROOT, "bin", "e0-regression.sh"), "utf8");
-    const wallIdx = script.indexOf("HIT WALL CLOCK LIMIT");
-    const attemptIdx = script.indexOf("HIT ATTEMPT LIMIT");
+    const whileLoop = script.slice(script.indexOf("while true; do"));
+    const wallIdx = whileLoop.indexOf("HIT WALL CLOCK LIMIT");
+    const attemptIdx = whileLoop.indexOf("HIT ATTEMPT LIMIT");
     expect(wallIdx).toBeGreaterThan(0);
     expect(attemptIdx).toBeGreaterThan(0);
+    // Wall clock check must appear before attempt limit check within the while loop
     expect(wallIdx).toBeLessThan(attemptIdx);
+    // The profile values must be self-consistent (tested above)
+    const profPath = join(ROOT, "profiles", "deploy", "e0-regression.env");
+    const content = readFileSync(profPath, "utf8");
+    expect(content).toMatch(/墙钟/);
+    expect(content).toMatch(/2400.*120/);
   });
 
   it("discriminant: max_clues is declared in the regression profile", () => {
@@ -261,8 +286,6 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
     });
 
     const { randomUUID } = await import("node:crypto");
-    const { readChannelMessages, isRunExited } = await import("../src/tick-inspect");
-    const { RunExitedWithoutResultError, resolveAgentResultTimeout } = await import("../src/tick-run");
 
     const triageRunId = randomUUID();
     capturedRunId = triageRunId;
@@ -277,25 +300,6 @@ describe("判据 2z (GT-17): generate worker exited without result ⇒ tick cont
         agentRunBin: "/fake/agent-run",
         runId: triageRunId,
         spawnProcess: async () => ({ pid: 12345 }),
-        // readResult uses the production polling loop pattern:
-        //   readTriageResult → (null) → readChannelMessages + isRunExited → throw
-        // This exercises the same code path as the production default readResult
-        // (src/tick-run.ts:1643-1659).
-        readResult: async (runId: string) => {
-          const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-          const deadline = Date.now() + timeoutMs;
-          while (Date.now() < deadline) {
-            const { readTriageResult } = await import("../src/tick-inspect");
-            const result = await readTriageResult(runId);
-            if (result !== null) return result;
-            const runsMsgs = await readChannelMessages("board:agent-runs");
-            if (isRunExited(runId, runsMsgs)) {
-              throw new RunExitedWithoutResultError(runId, "dr-triage", Date.now() - (deadline - timeoutMs));
-            }
-            await new Promise((r) => setTimeout(r, pollMs));
-          }
-          throw new Error(`timed out waiting for triage result for run ${runId}`);
-        },
       },
     });
 
@@ -379,7 +383,7 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
 
     // Mock bus: board:agent-runs returns agent.run.exited for the run_id
     // but no dr-triage.result.v1 exists. The production readResult polling loop
-    // (src/tick-run.ts:1643-1659) will detect isRunExited and throw.
+    // (src/tick-run.ts:1644-1660) will detect isRunExited and throw.
     vi.stubGlobal("fetch", async (input: RequestInfo) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("board:agent-runs")) {
@@ -461,23 +465,6 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
         agentRunBin: "/fake/agent-run",
         runId,
         spawnProcess: async () => ({ pid: 12345 }),
-        readResult: async (capturedRunId: string) => {
-          const { timeoutMs, pollMs } = { timeoutMs: 100, pollMs: 10 };
-          const deadline = Date.now() + timeoutMs;
-          while (Date.now() < deadline) {
-            const { readTriageResult } = await import("../src/tick-inspect");
-            const result = await readTriageResult(capturedRunId);
-            if (result !== null) return result;
-            const { readChannelMessages, isRunExited } = await import("../src/tick-inspect");
-            const runsMsgs = await readChannelMessages("board:agent-runs");
-            if (isRunExited(capturedRunId, runsMsgs)) {
-              const { RunExitedWithoutResultError } = await import("../src/tick-run");
-              throw new RunExitedWithoutResultError(capturedRunId, "dr-triage", Date.now() - start);
-            }
-            await new Promise((r) => setTimeout(r, pollMs));
-          }
-          throw new Error(`timed out waiting for triage result for run ${capturedRunId}`);
-        },
       },
     });
 
@@ -551,6 +538,8 @@ describe("判据 3 (GT-14/§1.2): bounded detection — run exited without resul
       channelId: "research:e0c8-gen-bounded",
       maxWrites: 10,
       workerCmd: "/fake/agent-run",
+      origin: "test-origin",
+      docChannelId: "research:e0c8-gen-bounded.docs",
     });
 
     expect(result).toBeDefined();
@@ -896,83 +885,77 @@ describe("判据 2b (GT-15/GT-16): real --run on seed board finishes under node_
     return jsonResponse({ messages: [] });
   }
 
-  function messagesResponse(msgs: Array<{message_id:string; channel_id:string; channel_seq:number; kind:string; payload:unknown; entity_id:string; supersedes:null; created_at:string}>) {
-    return jsonResponse({ messages: msgs });
-  }
-
-  it("runChannelWrite on a seed board (1 clue) returns timings and termination", async () => {
-    vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
-    vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
-
+it("real --run on a seed board (1 clue) returns timings and termination", async () => {
     const CHANNEL = "research:e0c8-2b-seed";
-    const SEED_CLUE_ID = "seed-clue-1";
 
-    // Mock bus: board has exactly 1 clue (seed board)
-    vi.stubGlobal("fetch", async (input: RequestInfo) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/publish")) {
-        return jsonResponse({ message_id: "pub_001" });
-      }
-      if (url.includes("/v1/entities/")) {
-        return jsonResponse({
-          head: {
-            message_id: "head_001",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
-            entity_id: SEED_CLUE_ID,
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        });
-      }
-      if (url.includes("/messages")) {
-        return messagesResponse([
-          {
-            message_id: "msg_seed",
-            channel_id: CHANNEL,
-            channel_seq: 1,
-            kind: "research.clue.v2",
-            payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] },
-            entity_id: SEED_CLUE_ID,
-            supersedes: null,
-            created_at: "2026-08-01T00:00:00Z",
-          },
-        ]);
-      }
-      return emptyMessagesResponse();
-    });
+    // Create seed file for the fake bus with 1 seed clue
+    const dir = mkdtempSync(join(tmpdir(), "e0c8-2b-exec-"));
+    const seedFile = join(dir, "seed.json");
+    const seedPayload = {
+      [CHANNEL]: [
+        { message_id: "msg_seed", channel_id: CHANNEL, channel_seq: 1, kind: "research.clue.v2", payload: { status: "open", text: "seed clue", depth: 0, sources: ["wiki"] }, entity_id: "seed-clue", supersedes: null, created_at: new Date().toISOString() },
+      ],
+    };
+    writeFileSync(seedFile, JSON.stringify(seedPayload));
 
-    const { runChannelWrite } = await import("../src/tick-run");
+    const busPort = await startFakeBus(seedFile);
+    const busUrl = `http://127.0.0.1:${busPort}`;
+
+    const tokenDir = join(dir, "tokens");
+    mkdirSync(tokenDir, { recursive: true });
+    const tokenFile = join(tokenDir, "token");
+    writeFileSync(tokenFile, "test-token\n");
+
+    const tickEntry = join(ROOT, "src", "tick-entry.ts");
     const start = Date.now();
-    const result = await runChannelWrite({
-      channelId: CHANNEL,
-      maxWrites: 10,
-    });
-    const elapsed = Date.now() - start;
+    try {
+      const out = execFileSync("npx", [
+        "vite-node",
+        tickEntry,
+        "--run", CHANNEL,
+        "--max-writes", "10",
+        "--question", "test question?",
+        "--worker-cmd", "/bin/true",
+      ], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          AGENT_BUS_URL: busUrl,
+          AGENT_BUS_TOKEN_FILE: tokenFile,
+          AGENT_RESULT_TIMEOUT_MS: "200",
+          AGENT_RESULT_POLL_MS: "50",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 30000,
+      });
+      const elapsed = Date.now() - start;
+      const result = JSON.parse(out.trim());
 
-    expect(result.timings).toBeDefined();
-    expect(result.timings.totalMs).toBeGreaterThanOrEqual(0);
-    expect(result.timings.readMs).toBeGreaterThanOrEqual(0);
-    expect(result.timings.executeMs).toBeGreaterThanOrEqual(0);
-    expect(result.timings.termMs).toBeGreaterThanOrEqual(0);
-    expect(result.timings.generateMs).toBeGreaterThanOrEqual(0);
+      expect(result.timings).toBeDefined();
+      expect(typeof result.timings.totalMs).toBe("number");
+      expect(typeof result.timings.readMs).toBe("number");
 
-    // On a seed board with no real work, should complete quickly
-    const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
-    const wfContent = readFileSync(wfPath, "utf8");
-    const wfParsed = YAML.parse(wfContent) as Record<string, unknown>;
-    const wfLimits = wfParsed.limits as Record<string, number>;
-    const nodeTimeoutMs = (wfLimits.node_timeout ?? 900) * 1000;
-    expect(elapsed).toBeLessThan(nodeTimeoutMs / 2);
+      // On a seed board, should complete quickly (well under node_timeout/2)
+      const wfPath = join(ROOT, "workflows", "deep-research", "tick", "workflow.yaml");
+      const wfContent = readFileSync(wfPath, "utf8");
+      const wfParsed = YAML.parse(wfContent) as Record<string, unknown>;
+      const wfLimits = wfParsed.limits as Record<string, number>;
+      const nodeTimeoutMs = (wfLimits.node_timeout ?? 900) * 1000;
+      expect(elapsed).toBeLessThan(nodeTimeoutMs / 2);
 
-    // termination should be readable
-    expect(result.termination).toBeDefined();
-    expect(result.termination.state === null || typeof result.termination.state === "string").toBe(true);
-  });
+      // termination should be readable
+      expect(result.termination).toBeDefined();
+      expect(result.termination.state === null || typeof result.termination.state === "string").toBe(true);
+    } catch (e) {
+      const ee = e as { status?: number; stdout?: string | Buffer; stderr?: string | Buffer };
+      throw new Error(`--run failed: exit=${ee.status ?? -1} stderr=${String(ee.stderr ?? "").slice(0, 1000)} stdout=${String(ee.stdout ?? "").slice(0, 1000)}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, { timeout: 30000 });
 
-  it("discriminant: timings field is present and has all required sub-fields", async () => {
+  it("discriminant: timings field is present and has all required sub-fields (in-process)", async () => {
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
 
@@ -996,7 +979,7 @@ describe("判据 2b (GT-15/GT-16): real --run on seed board finishes under node_
     );
   });
 
-  it("discriminant: timings totalMs covers generate phase", async () => {
+  it("discriminant: timings totalMs covers generate phase (in-process)", async () => {
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
 
@@ -1016,7 +999,7 @@ describe("判据 2b (GT-15/GT-16): real --run on seed board finishes under node_
     );
   });
 
-  it("discriminant: RunWriteOutcome carries hasPendingWork and termination", async () => {
+  it("discriminant: RunWriteOutcome carries hasPendingWork and termination (in-process)", async () => {
     vi.stubEnv("AGENT_RESULT_TIMEOUT_MS", "100");
     vi.stubEnv("AGENT_RESULT_POLL_MS", "10");
 

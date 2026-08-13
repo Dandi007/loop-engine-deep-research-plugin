@@ -19,8 +19,12 @@ import {
   resolveAgentResultTimeout,
   DEFAULT_AGENT_RESULT_TIMEOUT_MS,
   DEFAULT_AGENT_RESULT_POLL_MS,
+  GenerateWorkerExitedWithoutResultError,
+  TriageWorkerExitedWithoutResultError,
 } from "../src/tick-run";
 import type { RunWriteOptions, WriteCasInput } from "../src/tick-run";
+import type { GenerateDeps, AnchorCheckResult } from "../src/generate";
+import { rmSync, mkdtempSync } from "node:fs";
 import {
   readTriageResult,
   readGenerateResult,
@@ -677,5 +681,449 @@ describe("R6: assertions drive production-assembled deps", () => {
     const body = await deps.spawnRuntime!.readBody(generateRunId);
     expect(body).toBe(generateBody);
     expect(agentRunsReads).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ─── E0c6 §2 criterion 2 (GT-17): generateError on exited worker, tick survives ──
+
+function anchorResult(over: Partial<AnchorCheckResult> = {}): AnchorCheckResult {
+  return {
+    total: 10,
+    current_parsed: 10,
+    current_verified_hit: 10,
+    current_failed: 0,
+    old_format: 0,
+    unparseable: 0,
+    discarded: 0,
+    sums_ok: true,
+    loud_failures: [],
+    ...over,
+  };
+}
+
+function uniqueOneShotDir(label: string): string {
+  return join(tmpdir(), `g6-gt17-${label}-${Math.random().toString(36).slice(2)}`);
+}
+
+describe("E0c6 §2 criterion 2 (GT-17): generate worker exited without result ⇒ tick exit 0, generateError set", () => {
+  beforeEach(() => {
+    capturedTriageRunId = "";
+    capturedGenerateRunId = "";
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  it("GT-17a: generate worker exits without result ⇒ tick still returns 0, generateError is set, other decisions proceed", async () => {
+    const cards = [exploredClueMsg("c1", 1)];
+    const oneShotDir = uniqueOneShotDir("gt17a");
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse(cards);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const generateDeps: GenerateDeps = {
+      readTermination: async () => termState({ state: "converged" }),
+      countBlocked: async () => 0,
+      readQuestion: async () => "test question",
+      readOrigin: async () => "test-origin",
+      readEvidences: async () => [],
+      spawnRole: async () => {
+        throw new GenerateWorkerExitedWithoutResultError("gt17-run-001", "dr-synthesizer", 3159);
+      },
+      spawnAnchorCheck: async () => anchorResult(),
+      spawnExport: async () => {},
+      writeDoc: async () => "msg-1",
+      lockSynthesizer: async () => async () => {},
+    };
+
+    try {
+      const result = await runChannelWrite({
+        channelId: CHANNEL,
+        origin: "test-origin",
+        prevZeroGrowthRounds: 2,
+        oneShotDir,
+        generateDeps,
+      });
+
+      expect(result.generateError).toBeDefined();
+      expect(result.generateError).toContain("gt17-run-001");
+      expect(result.generateError).toContain("exited without producing");
+      expect(result.generateError).toContain("dr-doc.result.v1");
+      expect(result.decisions).toBeDefined();
+      expect(result.hasPendingWork).toBe(false);
+      expect(result.termination).toBeDefined();
+    } finally {
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
+  });
+
+  it("GT-17b reverse: truly unrecoverable error (bus unreachable) still propagates, tick does NOT exit 0", async () => {
+    const cards = [exploredClueMsg("c1", 1)];
+    const oneShotDir = uniqueOneShotDir("gt17b");
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/messages")) return messagesResponse(cards);
+      if (url.includes("/entities")) return jsonResponse({ head: null });
+      return emptyMessagesResponse();
+    });
+
+    const generateDeps: GenerateDeps = {
+      readTermination: async () => termState({ state: "converged" }),
+      countBlocked: async () => 0,
+      readQuestion: async () => "test question",
+      readOrigin: async () => "test-origin",
+      readEvidences: async () => [],
+      spawnRole: async () => {
+        throw new Error("bus unreachable: connection refused");
+      },
+      spawnAnchorCheck: async () => anchorResult(),
+      spawnExport: async () => {},
+      writeDoc: async () => "msg-1",
+      lockSynthesizer: async () => async () => {},
+    };
+
+    try {
+      await expect(
+        runChannelWrite({
+          channelId: CHANNEL,
+          origin: "test-origin",
+          prevZeroGrowthRounds: 2,
+          oneShotDir,
+          generateDeps,
+        }),
+      ).rejects.toThrow("bus unreachable");
+    } finally {
+      rmSync(oneShotDir, { recursive: true, force: true });
+    }
+  });
+
+  it("GT-17c: GenerateWorkerExitedWithoutResultError is caught only in the generate phase; runWrite triage path catches TriageWorkerExitedWithoutResultError", async () => {
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    capturedTriageRunId = "";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
+
+    let agentRunsReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        agentRunsReads += 1;
+        if (capturedTriageRunId && agentRunsReads >= 2) {
+          return messagesResponse([
+            {
+              message_id: "msg_exited",
+              channel_id: "board:agent-runs",
+              channel_seq: 200,
+              kind: "agent.run.exited.v1",
+              payload: { run_id: capturedTriageRunId, exit_code: 0 },
+              entity_id: capturedTriageRunId,
+              supersedes: null,
+              created_at: "2026-08-01T00:00:02Z",
+            },
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+
+    expect(result.triageReports[0].skippedReason).toBeDefined();
+    expect(result.triageReports[0].skippedReason).toContain("exited without producing");
+    expect(result.triageReports[0].skippedReason).toContain("dr-triage");
+    expect(result.triageReports[0].runId).toBe("");
+    expect(result.triageReports[0].budgetSkipped).toBe(false);
+    expect(result.triageReports[0].casCount).toBe(0);
+  });
+});
+
+// ─── E0c6 §2 criterion 3 (GT-14): checkRunExited short-circuits result-wait ──
+
+describe("E0c6 §2 criterion 3 (GT-14): checkRunExited short-circuits result-wait loop immediately", () => {
+  beforeEach(() => {
+    capturedTriageRunId = "";
+    capturedGenerateRunId = "";
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  it("GT-14a: agent.run.exited.v1 on board:agent-runs ⇒ checkRunExited returns true ⇒ triage readResult short-circuits immediately", async () => {
+    capturedTriageRunId = "";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    let boardAgentRunsReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) {
+        boardAgentRunsReads += 1;
+        if (capturedTriageRunId && boardAgentRunsReads >= 2) {
+          return messagesResponse([
+            {
+              message_id: "msg_exited_v1",
+              channel_id: "board:agent-runs",
+              channel_seq: 200,
+              kind: "agent.run.exited.v1",
+              payload: { run_id: capturedTriageRunId, exit_code: 0 },
+              entity_id: capturedTriageRunId,
+              supersedes: null,
+              created_at: "2026-08-01T00:00:02Z",
+            },
+          ]);
+        }
+        return emptyMessagesResponse();
+      }
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      question: "test question?",
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+
+    expect(result.triageReports[0].skippedReason).toBeDefined();
+    expect(result.triageReports[0].skippedReason).toContain("E0c6 §1.2:");
+    expect(result.triageReports[0].skippedReason).toContain("exited without producing");
+    expect(result.triageReports[0].skippedReason).toContain("dr-triage");
+    expect(result.triageReports[0].skippedReason).toContain(capturedTriageRunId);
+    expect(capturedTriageRunId).not.toBe("");
+    expect(boardAgentRunsReads).toBeGreaterThanOrEqual(2);
+  });
+
+  it("GT-14b: TriageWorkerExitedWithoutResultError is thrown when run exits without triage result", async () => {
+    const err = new TriageWorkerExitedWithoutResultError("test-run-id", 1234);
+    expect(err).toBeInstanceOf(TriageWorkerExitedWithoutResultError);
+    expect(err.name).toBe("TriageWorkerExitedWithoutResultError");
+    expect(err.message).toContain("test-run-id");
+    expect(err.message).toContain("dr-triage");
+    expect(err.message).toContain("exited without producing");
+    expect(err.message).toContain("1234");
+  });
+
+  it("GT-14c reverse: if no agent.run.exited.v1 appears, the triage path falls through to the full timeout (not short-circuited), and the test would reject", async () => {
+    capturedTriageRunId = "";
+    process.env.AGENT_RESULT_TIMEOUT_MS = "10";
+    process.env.AGENT_RESULT_POLL_MS = "5";
+
+    const cards = [
+      clueMsg("c1", { status: "proposed" }, 1),
+      clueMsg("c2", { status: "proposed" }, 2),
+      clueMsg("c3", { status: "proposed" }, 3),
+    ];
+
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) return emptyMessagesResponse();
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "c1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) return messagesResponse(cards);
+      return emptyMessagesResponse();
+    });
+
+    await expect(
+      runChannelWrite({
+        channelId: CHANNEL,
+        question: "test question?",
+        workerCmd: "/fake/agent-run",
+        maxWrites: 10,
+      }),
+    ).rejects.toThrow(/G5: timed out waiting for triage result for run/);
+  });
+});
+
+// ─── E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick under half node_timeout ──
+
+describe("E0c6 §2 criterion 2b (GT-15/GT-16): seed board tick completes under half engine node_timeout (30s)", () => {
+  beforeEach(() => {
+    capturedTriageRunId = "";
+    capturedGenerateRunId = "";
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.AGENT_RESULT_TIMEOUT_MS;
+    delete process.env.AGENT_RESULT_POLL_MS;
+  });
+
+  it("GT-16a: seed board with 1 clue completes under 15 seconds (half of node_timeout=30) and termination is readable", async () => {
+    process.env.AGENT_RESULT_TIMEOUT_MS = "500";
+    process.env.AGENT_RESULT_POLL_MS = "10";
+
+    const cards = [
+      clueMsg("seed-1", { status: "proposed" }, 1),
+    ];
+
+    let msgReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) return emptyMessagesResponse();
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "seed-1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) {
+        msgReads += 1;
+        return msgReads <= 1 ? messagesResponse(cards) : emptyMessagesResponse();
+      }
+      return emptyMessagesResponse();
+    });
+
+    const start = Date.now();
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(15_000);
+    expect(result.termination).toBeDefined();
+    expect(result.termination).toHaveProperty("state");
+    expect(result.termination).toHaveProperty("coverage");
+    expect(result.termination).toHaveProperty("zeroGrowthRounds");
+    expect(result.termination).toHaveProperty("capHit");
+    expect(result.termination).toHaveProperty("boardComposition");
+    expect(result.decisions).toBeDefined();
+    expect(result.messageCount).toBe(1);
+  });
+
+  it("GT-16b: time-based polling with AGENT_RESULT_TIMEOUT_MS/POL_MS does not cause the seed tick to exceed half node_timeout", async () => {
+    process.env.AGENT_RESULT_TIMEOUT_MS = "200";
+    process.env.AGENT_RESULT_POLL_MS = "5";
+
+    const cards = [
+      clueMsg("seed-1", { status: "proposed" }, 1),
+    ];
+
+    let msgReads = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("board:agent-runs")) return emptyMessagesResponse();
+      if (url.includes("/publish")) return jsonResponse({ message_id: "pub_001" });
+      if (url.includes("/v1/entities/")) {
+        return jsonResponse({
+          head: {
+            message_id: "head_001",
+            channel_id: CHANNEL,
+            channel_seq: 1,
+            kind: "research.clue.v2",
+            payload: { status: "proposed", text: "clue" },
+            entity_id: "seed-1",
+            supersedes: null,
+            created_at: "2026-08-01T00:00:00Z",
+          },
+        });
+      }
+      if (url.includes("/messages")) {
+        msgReads += 1;
+        return msgReads <= 1 ? messagesResponse(cards) : emptyMessagesResponse();
+      }
+      return emptyMessagesResponse();
+    });
+
+    const start = Date.now();
+    const result = await runChannelWrite({
+      channelId: CHANNEL,
+      workerCmd: "/fake/agent-run",
+      maxWrites: 10,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(15_000);
+    expect(result.termination).toHaveProperty("state");
+    expect(result.termination).toHaveProperty("coverage");
   });
 });

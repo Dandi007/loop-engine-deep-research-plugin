@@ -402,14 +402,18 @@ while true; do
   fi
 
   # 次数上限检查（失控兜底，非主上限——GT-19）
+  # ⛔ 仅首次超限时打印警告 + 读板面构成；后续迭代跳过（避免每轮 stderr 重复 + 多余读操作）。
   if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT (runaway guard): max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT} — wall clock budget remains (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}), continuing because wall clock is the primary limit (GT-19)" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
+    if [ "${ATTEMPT_LIMIT_WARNED:-0}" -eq 0 ]; then
+      echo "[e0-regression] HIT ATTEMPT LIMIT (runaway guard): max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT} — wall clock budget remains (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}), continuing because wall clock is the primary limit (GT-19)" >&2
+      _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+      if [ -f "$_last_stdout" ]; then
+        _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+        if [ -n "$_last_term" ]; then
+          _print_board_composition "$_last_term"
+        fi
       fi
+      export ATTEMPT_LIMIT_WARNED=1
     fi
   fi
 

@@ -553,7 +553,9 @@ export interface TickTimings {
   writeSideMs: number;
   /** 终止判定（decideTermination）耗时（ms）。 */
   decideTerminationMs: number;
-  /** 单 tick 总耗时（ms）。 */
+  /** 生成段（runGenerate）耗时（ms），仅当 origin 配置且 generate 触发时非零。 */
+  generateMs: number;
+  /** 单 tick 总耗时（ms），含 generate 段。 */
   totalMs: number;
 }
 
@@ -1733,6 +1735,7 @@ export async function runChannelWrite(
   );
   const tTerm = Date.now();
 
+  let generateMs = 0;
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
   if (opts.origin) {
     if (decideGenerate(termination)) {
@@ -1741,6 +1744,7 @@ export async function runChannelWrite(
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
+        const tGen0 = Date.now();
         try {
           const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
           await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
@@ -1754,9 +1758,12 @@ export async function runChannelWrite(
             throw err;
           }
         }
+        generateMs = Date.now() - tGen0;
       }
     }
   }
+
+  const tEnd = Date.now();
 
   return {
     channelId: opts.channelId,
@@ -1776,7 +1783,8 @@ export async function runChannelWrite(
       decideTickMs: tDecide - tDecide0,
       writeSideMs: tWrite - tDecide,
       decideTerminationMs: tTerm - tWrite,
-      totalMs: tTerm - t0,
+      generateMs,
+      totalMs: tEnd - t0,
     },
   };
 }

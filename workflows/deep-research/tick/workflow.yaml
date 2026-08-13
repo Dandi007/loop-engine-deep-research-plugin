@@ -6,7 +6,26 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# E0c7 §1.1 —— node_timeout 按实测预算给（GT-18/GT-15）：
+#   前一版 profile 声明 TICK_TIMEOUT_MS=600000（10 分钟）作为 tick 内部超时上界，
+#   但引擎真正用来杀叶子的是本行 node_timeout，旧值 30 秒对一个合法要做 bus I/O +
+#   spawn 的 tick 就是太紧。GT-18 实测：背靠背两跑，一次 0 超时、一次 2 超时
+#   （耗时 30.5–39.9 秒，与 node_timeout:30 吻合），说明 30 秒在间歇性超时的边界上。
+#   GT-15 实测：tick 只做决策计算（--inspect）秒级返回，慢的是 --run 的副作用路径；
+#   大板面上 tick 以 status=TIMEOUT 死亡，单次 904 秒（GT-15 真机实录）。
+#   取 600 秒（10 分钟）：小于 GT-15 记录的 904s 大板面耗时，但大于 GT-18 记录的
+#   30.5–39.9s 引擎 kill 阈值，配合 MAX_CLUES=24 收窄回归范围后，单 tick 在 24 条线索
+#   以内的板上足以完成合法工作（bus I/O + spawn + harvest + triage + generate），
+#   同时保留有界上限语义（非无上限），超时仍响亮失败。
+#   依据：GT-18（30.5–39.9s 引擎 kill）、GT-15（904s TIMEOUT 大板面）、
+#   GT-15 --inspect 子秒级返回（决策计算本身很快，慢的是副作用路径）。
+#   600s 约 6.7× 最短 kill 上限（39.9s），容纳合法副作用路径（bus I/O、spawn、harvest、triage），
+#   且 wall_clock=600 保证引擎不会在 node_timeout 之前截断 tick。
+#   ⛔ 保留上限语义（非无上限），超时仍响亮失败。
+#   wall_clock 抬到 600 秒（与 node_timeout 一致）：引擎 wall_clock 是 run 级墙钟预算，
+#   必须 ≥ node_timeout 才能让 tick 真正用满 node_timeout 上限。旧值 60 秒使 node_timeout 的
+#   600 秒头空间永远无法到达——引擎墙钟会在 60 秒时截断叶子。
+limits: { max_nodes: 64, wall_clock: 600, node_timeout: 600, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:
@@ -30,6 +49,9 @@ seed:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 fleet input 注入 tick.md，
       # 再传给 tick-entry --run。与 MAX_WRITES 同款装配链（缺省 3）。
       triage_threshold: "{{triage_threshold}}"
+      # E0c7 判据 4b —— maxClues 上限（--max-clues）：由 fleet input 注入 tick.md，
+      # 再传给 tick-entry --run。与 MAX_WRITES 同款装配链（缺省 64）。
+      max_clues: "{{max_clues}}"
       trigger_store_dir: "{{trigger_store_dir}}"
       loop_store_cli: "{{loop_store_cli}}"
       loop_engine_runner: "{{loop_engine_runner}}"

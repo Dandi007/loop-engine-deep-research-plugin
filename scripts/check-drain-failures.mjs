@@ -70,11 +70,29 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
+    // G15 —— 原有检测：bash 非零退出
     const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
     if (m) {
       failed = true;
       process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+    }
+    // E0c7 §1.3 —— 检测引擎杀掉的 tick（exec_failed / status=TIMEOUT）。
+    //   引擎在 node_timeout 到期时会给 tick 注入 exec_failed 事件，
+    //   其 journal 形如 {"identity":"tick","result":"[外部调用失败 status=TIMEOUT]\n","error":"exec"}。
+    //   若不检测，drain 会继续烧轮次、最终以 max_rounds 收场，入口只看到"还没收敛"。
+    let journalObj;
+    try { journalObj = JSON.parse(line); } catch { continue; }
+    if (journalObj && typeof journalObj === "object") {
+      // 引擎级 kill：error:"exec" 且 result 含 status=TIMEOUT
+      const hasExecError = journalObj.error === "exec";
+      const result = typeof journalObj.result === "string" ? journalObj.result : "";
+      const hasTimeout = result.includes("status=TIMEOUT");
+      if (hasExecError && hasTimeout) {
+        failed = true;
+        process.stderr.write(`[deep-research-loop] TICK FAILURE (engine-killed): run_dir=${entry.run_dir} error=exec status=TIMEOUT\n`);
+        process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      }
     }
   }
 }

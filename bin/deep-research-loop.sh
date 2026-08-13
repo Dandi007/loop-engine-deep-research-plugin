@@ -123,6 +123,9 @@ export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
 export DOC_CHANNEL="${DOC_CHANNEL:-}"
 # E0c3b §1.1 —— triage 触发阈值（profile 声明，缺省 3；⛔ 不得改 DEFAULT_TICK_CONFIG 缺省）。
 export TRIAGE_THRESHOLD="${TRIAGE_THRESHOLD:-3}"
+# E0c7 判据 4b —— maxClues 上限（profile 声明，缺省 DEFAULT_TICK_CONFIG.maxClues=64；⛔ 不得改缺省）。
+# 回归 profile 可声明更小的 MAX_CLUES 收窄研究范围使墙钟预算内可收敛（判据 6 自洽）。
+export MAX_CLUES="${MAX_CLUES:-64}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

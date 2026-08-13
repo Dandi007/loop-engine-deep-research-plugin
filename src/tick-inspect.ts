@@ -357,6 +357,50 @@ export async function readTriageResult(
 }
 
 /**
+ * E0c7 §1.2 —— 从已读的消息数组里，检查一个 run 是否已 exited（agent.run.exited.*）。
+ * 返回 { exited, exitCode }；找不到运行事件 ⇒ { exited: false }。
+ */
+export function findRunExited(
+  runId: string,
+  messages: InspectMessage[],
+): { exited: boolean; exitCode?: number } {
+  for (const msg of messages) {
+    const m = /^agent\.run\.(started|exited)(?:\.(.*))?$/.exec(msg.kind);
+    if (!m) continue;
+    const state = m[1] as "started" | "exited";
+    const suffixRunId = m[2];
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    const payloadRunId = typeof payload.run_id === "string" ? payload.run_id : undefined;
+    const candidateRunId = payloadRunId || suffixRunId;
+    if (candidateRunId !== runId) continue;
+    if (state === "exited") {
+      const exitCode = typeof payload.exit_code === "number" ? payload.exit_code : undefined;
+      return { exited: true, exitCode };
+    }
+    // started 但还没 exited ⇒ 仍在跑
+    return { exited: false };
+  }
+  return { exited: false };
+}
+
+/**
+ * E0c7 §1.2 —— 等待 agent 结果时，若 run 已 exited 却无 result，立即停止等待并记录诊断。
+ * 抛出 E0c7RunExitedWithoutResultError（点名 run_id、已等时长），由上层捕获后记录诊断但不毙掉 tick。
+ */
+export class E0c7RunExitedWithoutResultError extends Error {
+  constructor(
+    public readonly runId: string,
+    role: string,
+    elapsedMs: number,
+  ) {
+    super(
+      `E0c7 §1.2: run ${runId} (role=${role}) exited without producing a result after ${elapsedMs}ms — stopping wait immediately and recording as local failure.`,
+    );
+    this.name = "E0c7RunExitedWithoutResultError";
+  }
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

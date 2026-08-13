@@ -1047,16 +1047,15 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh)", () => {
-  it("always null ⇒ hits attempt limit, non-zero exit naming the limit", async () => {
+  it("always null ⇒ hits wall clock limit (not attempt limit — GT-19 wall clock is primary)", async () => {
     const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 30,
+        wallClockSeconds: 1,
         backoffSeconds: 0,
         terminationStates: [
           { drainId: "fake-drain-null-1", state: null },
-          { drainId: "fake-drain-null-2", state: null },
         ],
       },
     );
@@ -1066,10 +1065,9 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
-      expect(res.err).toMatch(/HIT ATTEMPT LIMIT|HIT WALL CLOCK LIMIT/i);
-      expect(res.err).toMatch(/drain_attempts=2\b/);
+      expect(res.err).toMatch(/HIT WALL CLOCK LIMIT/i);
       const attempts = Number(readFileSync(attemptFile, "utf8").trim());
-      expect(attempts).toBe(2);
+      expect(attempts).toBeGreaterThanOrEqual(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

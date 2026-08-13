@@ -403,7 +403,7 @@ while true; do
 
   # 次数上限检查（失控兜底，非主上限——GT-19）
   if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
+    echo "[e0-regression] HIT ATTEMPT LIMIT (runaway guard): max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT} — wall clock budget remains (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}), continuing because wall clock is the primary limit (GT-19)" >&2
     _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
     if [ -f "$_last_stdout" ]; then
       _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
@@ -411,8 +411,6 @@ while true; do
         _print_board_composition "$_last_term"
       fi
     fi
-    LOOP_EXIT=4
-    break
   fi
 
   DRAIN_ATTEMPT=$((DRAIN_ATTEMPT + 1))

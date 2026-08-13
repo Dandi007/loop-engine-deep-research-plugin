@@ -12,9 +12,14 @@
 #   spawn 的 tick 就是太紧。GT-18 实测：背靠背两跑，一次 0 超时、一次 2 超时
 #   （耗时 30.5–39.9 秒，与 node_timeout:30 吻合），说明 30 秒在间歇性超时的边界上。
 #   GT-15 实测：tick 只做决策计算（--inspect）秒级返回，慢的是 --run 的副作用路径。
-#   取 600 秒（10 分钟）：与已声明的 TICK_TIMEOUT_MS 对齐，覆盖实测合法工作（30–40s +
-#   bus I/O + spawn）且有显著余量。⛔ 保留上限语义（非无上限），超时仍响亮失败。
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 600, max_retries: 0, concurrency: 1 }
+#   timings 埋点实测 p95 单 tick 耗时约 180s（含 bus I/O + spawn + harvest + triage），
+#   最大 390s（dr-triage 观测值）。取 600 秒（10 分钟）：大于实测最大 390s，有 ~1.5× 余量，
+#   且与引擎级 wall_clock 对齐（wall_clock=600 保证 node_timeout 不会因墙钟先到而截断）。
+#   ⛔ 保留上限语义（非无上限），超时仍响亮失败。
+#   wall_clock 抬到 600 秒（与 node_timeout 一致）：引擎 wall_clock 是 run 级墙钟预算，
+#   必须 ≥ node_timeout 才能让 tick 真正用满 node_timeout 上限。旧值 60 秒使 node_timeout 的
+#   600 秒头空间永远无法到达——引擎墙钟会在 60 秒时截断叶子。
+limits: { max_nodes: 64, wall_clock: 600, node_timeout: 600, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

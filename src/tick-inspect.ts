@@ -388,7 +388,11 @@ export function findRunExited(
  * 抛出 E0c7RunExitedWithoutResultError（点名 run_id、已等时长），由上层捕获后记录诊断但不毙掉 tick。
  */
 export class E0c7RunExitedWithoutResultError extends Error {
-  constructor(runId: string, role: string, elapsedMs: number) {
+  constructor(
+    public readonly runId: string,
+    role: string,
+    elapsedMs: number,
+  ) {
     super(
       `E0c7 §1.2: run ${runId} (role=${role}) exited without producing a result after ${elapsedMs}ms — stopping wait immediately and recording as local failure.`,
     );

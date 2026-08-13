@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findTriageResult,
   findWorkerResult,
+  hasRunExited,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
@@ -1325,6 +1326,14 @@ export function assembleGenerateDeps(
         while (Date.now() < deadline) {
           const result = await readGenerateResult(runId);
           if (result) return result.body;
+          // E0c9 §1.2: check if the run has exited without producing a result
+          const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+          if (hasRunExited(runId, runsMsgs)) {
+            process.stderr.write(
+              `[tick] run ${runId} (generate) exited without producing a dr-doc.result.v1 — recording as local failure, continuing\n`,
+            );
+            return "";
+          }
           await new Promise((r) => setTimeout(r, pollMs));
         }
         throw new Error(
@@ -1602,6 +1611,13 @@ export async function runChannelWrite(
               while (Date.now() < deadline) {
                 const result = await readTriageResult(runId);
                 if (result !== null) return result;
+                // E0c9 §1.2: check if the run has exited without producing a result
+                const runsMsgs = await readChannelMessages(RUNS_CHANNEL_ID);
+                if (hasRunExited(runId, runsMsgs)) {
+                  throw new Error(
+                    `G5: triage run ${runId} exited without producing a dr-triage.result.v1 — refusing to dead-wait`,
+                  );
+                }
                 await new Promise((r) => setTimeout(r, pollMs));
               }
               throw new Error(

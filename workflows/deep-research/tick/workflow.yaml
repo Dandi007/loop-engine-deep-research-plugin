@@ -6,7 +6,12 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+# E0c9 §1.1 —— node_timeout 取 1800s，大于实测最大单 tick 耗时（904.2s，派发方 2026-08-13 真机取证）。
+#   1800 / 904.2 ≈ 2.0× 余量：覆盖合法 tick 工作（bus I/O + spawn + 等 worker 结果 + harvest + triage + generate），
+#   同时保留「超过上界要响亮失败」的语义（非无上限）。引擎闸刀必须大于一次合法的等待预算：
+#   DEFAULT_AGENT_RESULT_TIMEOUT_MS = 900_000（15 分钟）是 agent 结果等待预算，若 node_timeout ≤ 它，
+#   合法等待仍会被腰斩。1800s = 30 分钟 > 15 分钟，保证引擎闸刀在合法等待预算之后。
+limits: { max_nodes: 64, wall_clock: 60, node_timeout: 1800, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:

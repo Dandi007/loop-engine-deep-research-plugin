@@ -70,12 +70,33 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
-    const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
-    if (m) {
+    // E0c9 §1.3: detect tick failures from both non-zero exit and engine-killed timeout
+    const exitMatch = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
+    if (exitMatch) {
       failed = true;
-      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${exitMatch[1]}\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      continue;
     }
+    const timeoutMatch = line.match(/\[外部调用失败 status=TIMEOUT\]/);
+    if (timeoutMatch) {
+      failed = true;
+      process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec status=TIMEOUT\n`);
+      process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+      continue;
+    }
+    // Also detect error="exec" in journal entries for engine-killed ticks
+    try {
+      const rec = JSON.parse(line);
+      if (rec.identity === "tick" && rec.error === "exec") {
+        const result = rec.result;
+        if (typeof result === "string" && result.includes("[外部调用失败 status=TIMEOUT]")) {
+          failed = true;
+          process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} error=exec status=TIMEOUT\n`);
+          process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+        }
+      }
+    } catch {}
   }
 }
 

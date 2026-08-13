@@ -357,6 +357,23 @@ export async function readTriageResult(
 }
 
 /**
+ * E0c9 §1.2 —— 从已读消息数组里检查指定 run_id 是否已有 `agent.run.exited` 事件。
+ * 在所有 `agent.run.exited.*` 消息中查找 payload.run_id 匹配的条目。
+ * 找到 ⇒ 该 run 已退出；未找到 ⇒ 仍在运行或尚未启动。
+ */
+export function hasRunExited(
+  runId: string,
+  messages: InspectMessage[],
+): boolean {
+  for (const msg of messages) {
+    if (!msg.kind.startsWith("agent.run.exited")) continue;
+    const payload = (msg.payload ?? {}) as Record<string, unknown>;
+    if (payload.run_id === runId) return true;
+  }
+  return false;
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

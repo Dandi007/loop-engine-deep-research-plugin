@@ -6,7 +6,22 @@
 #   修复：把 max_nodes 设成明显非绑定的大值（本板面自然 drain 的 pass 数远小于它），
 #   使收敛只由板面状态（tick 依 hasPendingWork 停止续投）确定性推出；max_rounds=16 仍是失控兜底。
 #   （B1-guard 收敛成因测试钉死本配置，调回 1/2 即被拦截。）
-limits: { max_nodes: 64, wall_clock: 60, node_timeout: 30, max_retries: 0, concurrency: 1 }
+#
+# E0c10 D1（GT-A/GT-B）—— node_timeout / wall_clock 抬到 1810：
+#   真机取证（GT-A，逐字照抄派发方）：tick 会被引擎级 `node_timeout` 杀掉，且**与板面规模无关**。
+#     同一交付背靠背两跑：一次零超时、一次两次超时 ⇒ 超时是间歇性的。
+#     `journal: {"identity":"tick","result":"[外部调用失败 status=TIMEOUT]\n","error":"exec"}`，
+#     时长 39.9s / 30.5s；另一次单次 **904.2 秒**死于 TIMEOUT。⇒ 30s 对一个合法地要做
+#     bus I/O + spawn + 等结果的 tick 就是太紧；**实测最大单 tick 耗时 = 904.2 秒**。
+#   1810 的两条理由（GT-A/GT-B，⛔ 不得断言与某个源码常量对齐，spec §2 判据 3）：
+#     (a) 声明的余量倍数 = 2.0×：1810 ≥ 904.2 × 2.0 = 1808.4（GT-A 的余量倍数，真机取证来源）；
+#     (b) 1810 > DEFAULT_AGENT_RESULT_TIMEOUT_MS(900_000ms = 900s)（GT-B：闸刀必须大于
+#         一次合法等待的预算，否则 readResult/readBody 的一次合法等待会被腰斩）。
+#   wall_clock 与 node_timeout 同单位（秒），同 map：一个合法 tick 可达 904.2s，
+#   wall_clock=60 会在 node_timeout 触发前先把整条 pipeline 节点杀掉（GT-A 同源），
+#   故一并抬到 1810（同一余量倍数，同一 GT-A 取证）。max_nodes/max_retries/concurrency 不变。
+#   （D1 判别性测试钉死 node_timeout >= 904.2 × 2.0；调回 < 904.2 即被拦截。）
+limits: { max_nodes: 64, wall_clock: 1810, node_timeout: 1810, max_retries: 0, concurrency: 1 }
 harness:
   sh: { runtime: bash, write: false }
 seed:
@@ -21,6 +36,10 @@ seed:
       allowed_root: "{{allowed_root?}}"
       # A10c —— 写入预算（--max-writes）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
       max_writes: "{{max_writes}}"
+      # E0c10 D5 —— 板面 clue 上限（--max-clues）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
+      # 可选（`?` 后缀，与 evidence_channel/allowed_root 同款）：缺省（null/空）⇒ tick.md 不传
+      # --max-clues ⇒ tick-entry --run 用 DEFAULT_TICK_CONFIG.maxClues=64。
+      max_clues: "{{max_clues?}}"
       # G4a —— 研究主问题（--question）：由 fleet input 注入 tick.md，再传给 tick-entry --run。
       research_question: "{{research_question}}"
       # G4c —— 研究 origin（--origin）：由 fleet input 注入 tick.md，再传给 tick-entry --run。

@@ -110,6 +110,11 @@ export ALLOWED_ROOT="${ALLOWED_ROOT:-}"
 #    旧默认 5 让任何产出 ≥5 条 evidence 的卡永远收割不了 ⇒ 恒 max_rounds 死锁（本包根因）。
 #    预算仍是**不可回退写的有限护栏**，绝不设成无穷大（spec §4 非目标）；显式覆盖语义保留（MAX_WRITES）。
 export MAX_WRITES="${MAX_WRITES:-64}"
+# E0c10 D5 —— 板面 clue 上限：从 bin 一路导出 → fleet → workflow → tick.md → `tick-entry --run --max-clues`。
+# ⛔ 缺省留空（非 0）：tick.md 据此**不传** --max-clues，tick-entry --run 用 DEFAULT_TICK_CONFIG.maxClues=64，
+#    生产 profile（agent-harness）行为逐字不变。回归 profile 显式声明 MAX_CLUES=24（GT-D）。
+#    装配链判别性：删掉 fleet.yaml.tpl 的 max_clues 注入 ⇒ 测试变红（spec §2 判据 5）。
+export MAX_CLUES="${MAX_CLUES:-}"
 # D1 —— 导出落点根（§1.3 / E6）：走 profile 配置（受版本管理），源码不硬编码 vault 路径。
 # 未配置时留空；实际导出由 src/export.ts 以 vaultRoot 参数接入（不在此推导）。
 export EXPORT_ROOT="${EXPORT_ROOT:-}"
@@ -199,8 +204,9 @@ TRIGGER_ID="a9-$(date +%s%N)-$$"
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"
 # G15: drain 后检查 tick 失败 —— 捕获 drain 输出，解析 drain_id，
-# 遍历 index.jsonl → journal.jsonl 查找 [bash 非零退出 EXIT:<n>]，
-# 命中则响亮失败并点名 run_dir 与退出码。
+# 遍历 index.jsonl → journal.jsonl 查找 [bash 非零退出 EXIT:<n>]（G15）或
+# 引擎级 node_timeout/wall_clock 杀掉的 [外部调用失败 status=TIMEOUT] + error:"exec"（E0c10 D7 / GT-A），
+# 命中任一则响亮失败并点名 run_dir。
 DRAIN_TMP=$(mktemp)
 trap 'rm -f "$DRAIN_TMP"' EXIT
 set +e

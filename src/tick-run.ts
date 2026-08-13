@@ -35,6 +35,7 @@ import {
   buildRunsFromMessages,
   findTriageResult,
   findWorkerResult,
+  hasRunExited,
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
@@ -48,6 +49,10 @@ import {
   type HarvestReport,
 } from "./harvest";
 import { casUpdateClue, getEntity, publishClue, publishEvidence, publishDoc } from "./bus";
+import {
+  RunExitedWithoutResultError,
+  type RunExitWithoutResultDiagnostic,
+} from "./run-exit-diagnostic";
 import {
   runGenerate,
   decideGenerate,
@@ -95,6 +100,77 @@ export function resolveAgentResultTimeout(): { timeoutMs: number; pollMs: number
   const timeoutMs = Number(process.env.AGENT_RESULT_TIMEOUT_MS) || DEFAULT_AGENT_RESULT_TIMEOUT_MS;
   const pollMs = Number(process.env.AGENT_RESULT_POLL_MS) || DEFAULT_AGENT_RESULT_POLL_MS;
   return { timeoutMs, pollMs };
+}
+
+/**
+ * E0c10 D4（GT-D）—— run exited 无 result 的判定宽限窗口（ms）。
+ *
+ * 真机（GT-D）：`exited without producing a dr-doc.result.v1 after 3159ms — refusing
+ * to wait the full timeout`。一旦观察到 `agent.run.exited`，再宽限一段时间等 result 落到
+ * channel（exit 与 result 发布之间有竞态：worker 先发 result 再 exited，或 exited 先到）。
+ * 宽限后仍无 result ⇒ 判「exited without result」，记录诊断并继续本轮 tick。
+ *
+ * 缺省 4000ms（覆盖 GT-D 观测的 3159ms 并留余量）；可用 `RUN_EXIT_GRACE_MS` 覆盖（测试注入极小值）。
+ * ⛔ 不得为 0：exit 与 result 的发布有竞态，立刻判会误报「exited 无 result」。
+ */
+export const DEFAULT_RUN_EXIT_GRACE_MS = 4000;
+
+export function resolveRunExitGraceMs(): number {
+  const v = Number(process.env.RUN_EXIT_GRACE_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return DEFAULT_RUN_EXIT_GRACE_MS;
+}
+
+/**
+ * E0c10 D4（GT-D）—— 轮询 agent 结果，区分三种结局：
+ *   1. result 到达 ⇒ 返回 result（正常路径）。
+ *   2. run 已 exited 且宽限后仍无 result ⇒ 抛 `RunExitedWithoutResultError`（上层捕获 ⇒
+ *      记录诊断、标失败、继续本轮 tick；tick 仍以 0 退出）。GT-D 的核心情形。
+ *   3. 超时且 run 未 exited ⇒ 抛 timeout 错误（bus 不可达 / 真挂起，判据 4 反向 ⇒ tick 非零退出）。
+ *
+ * triage（readResult）与 generate（readBody）两条生产轮询路径都走本函数（判据 4：两条路径都要）。
+ * ⛔ 测试必须驱动真实的轮询读取路径，不得只 new 一个异常再自己 catch、不得只断言纯谓词（spec §2 判据 4）。
+ *
+ * @param readResult 每次 poll 读 result；返回非 null 即视为到达（null = 暂未到达）。
+ * @param readExited 每次 poll 读 `agent.run.exited` 事件是否已观察到该 runId。
+ * @param role 角色（诊断用：dr-triage / dr-debater-* / dr-synthesizer）。
+ * @param buildTimeoutMessage 超时（run 未 exited，bus 不可达/真挂起）的错误消息构造器。
+ *   保留各路径旧消息形态以兼容既有测试（R3a/R3b）。
+ */
+export async function pollForResultOrExit<T>(
+  runId: string,
+  role: string,
+  opts: {
+    readResult: () => Promise<T | null>;
+    readExited: () => Promise<boolean>;
+    timeoutMs: number;
+    pollMs: number;
+    exitGraceMs: number;
+    buildTimeoutMessage: (runId: string, timeoutMs: number) => string;
+  },
+): Promise<T> {
+  const start = Date.now();
+  let exitedObservedAt: number | null = null;
+  while (true) {
+    const result = await opts.readResult();
+    if (result !== null && result !== undefined) {
+      return result;
+    }
+    const exited = await opts.readExited();
+    const now = Date.now();
+    if (exited && exitedObservedAt === null) {
+      exitedObservedAt = now;
+    }
+    if (exitedObservedAt !== null && now - exitedObservedAt >= opts.exitGraceMs) {
+      // GT-D：run 已 exited，宽限后仍无 result ⇒ 记录诊断并交上层处理（tick 继续以 0 退出）。
+      throw new RunExitedWithoutResultError(runId, role, now - start);
+    }
+    if (now - start >= opts.timeoutMs) {
+      // 判据 4 反向：bus 不可达 / 真挂起（run 未 exited，纯超时）⇒ tick 非零退出。
+      throw new Error(opts.buildTimeoutMessage(runId, opts.timeoutMs));
+    }
+    await new Promise((r) => setTimeout(r, opts.pollMs));
+  }
 }
 
 /** v1 冻结只读 channel 前缀（spec §2 / §8：不得触碰）。 */
@@ -374,6 +450,14 @@ export class MissingExportRootError extends Error {
     this.name = "MissingExportRootError";
   }
 }
+
+// E0c10 D4 —— 「run exited 无 result」的错误与诊断类型定义在 ./run-exit-diagnostic（避免
+//   generate.ts ↔ tick-run.ts 循环 import）。此处 re-export，保持调用方 import 路径不变。
+export {
+  RunExitedWithoutResultError,
+  type RunExitWithoutResultDiagnostic,
+  isRunExitedWithoutResultError,
+} from "./run-exit-diagnostic";
 
 /**
  * G4b —— 从 trigger body 字符串解析 {coverage, zeroGrowthRounds}（spec §1.2）。
@@ -1049,6 +1133,36 @@ export interface RunWriteOutcome {
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
   triageThreshold: number;
+  /**
+   * E0c10 D4（GT-D）—— 本轮观察到的「run exited 无 result」诊断列表。
+   * 每条含 run_id / role / 已等时长 / phase（triage|generate）。tick 仍以 0 退出；
+   * 该 doc/clue 被标成失败（未发布 / 未 CAS），不静默当成功（GT-D）。
+   */
+  diagnostics: RunExitWithoutResultDiagnostic[];
+  /**
+   * E0c10 D6 —— 本轮 tick 的分阶段耗时（ms）。覆盖整个 tick（含 generate 段），
+   * 用于 D1 的依据溯源（spec §2 判据 7：数字必须可溯源到具体字段）。
+   */
+  timings: TickTimings;
+}
+
+/**
+ * E0c10 D6 —— 一次 tick 的分阶段耗时（ms）。各阶段可溯源到具体字段（spec §2 判据 7）。
+ * `total` 覆盖整个 tick（从 runChannelWrite 入口到返回），含 generate 段；用于 D1 依据。
+ */
+export interface TickTimings {
+  /** 读板 + 组装（readChannelMessages / assembleBoard）耗时。 */
+  readBoardMs: number;
+  /** 决策（decideTick）耗时。 */
+  decideMs: number;
+  /** 写侧执行（runWrite：CAS/spawn/收割/triage）耗时。 */
+  writeMs: number;
+  /** 终止判定（decideTermination）耗时。 */
+  terminationMs: number;
+  /** 生成段（runGenerate，含 anchor-check/export）耗时；未运行 generate 为 0。 */
+  generateMs: number;
+  /** 整个 tick 的总耗时（从 runChannelWrite 入口到返回前）。≥ 上述各项之和。 */
+  totalMs: number;
 }
 
 /**
@@ -1279,6 +1393,9 @@ export function assembleGenerateDeps(
   postWriteState: BoardState,
 ): GenerateDeps {
   const synthLockDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
+  // E0c10 D4 —— runId → role 映射：spawnProcess 抽取 argv 的 --role/--run-id 存入，
+  //   供 readBody 在 run exited 无 result 时抛出带 role 的诊断（GT-D）。
+  const roleByRunId = new Map<string, string>();
   return {
     readTermination: async () => termination,
     countBlocked: async () =>
@@ -1310,7 +1427,15 @@ export function assembleGenerateDeps(
     spawnRuntime: {
       get agentRunBin() { return opts.workerCmd ?? resolveAgentRunBin(); },
       newRunId: () => randomUUID(),
+      // E0c10 D4 —— 记录每个 runId 对应的 role，供 readBody 在抛 RunExitedWithoutResultError 时
+      //   带上 role（诊断必含，GT-D）。spawnProcess 的 argv 含 --role <role> --run-id <runId>，
+      //   在此抽出来存进 roleByRunId；readBody 据此查 role。
       spawnProcess: async (argv, env) => {
+        const roleIdx = argv.indexOf("--role");
+        const runIdIdx = argv.indexOf("--run-id");
+        if (roleIdx >= 0 && runIdIdx >= 0) {
+          roleByRunId.set(argv[runIdIdx + 1], argv[roleIdx + 1]);
+        }
         await spawnWorkerProcess({
           cmd: argv[0],
           args: argv.slice(1),
@@ -1321,15 +1446,20 @@ export function assembleGenerateDeps(
       },
       readBody: async (runId: string) => {
         const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          const result = await readGenerateResult(runId);
-          if (result) return result.body;
-          await new Promise((r) => setTimeout(r, pollMs));
-        }
-        throw new Error(
-          `G4c: timed out waiting for generate result for run ${runId}`,
-        );
+        const exitGraceMs = resolveRunExitGraceMs();
+        const role = roleByRunId.get(runId) ?? "dr-generate";
+        return await pollForResultOrExit(runId, role, {
+          readResult: async () => {
+            const r = await readGenerateResult(runId);
+            return r ? r.body : null;
+          },
+          readExited: () => hasRunExited(runId),
+          timeoutMs,
+          pollMs,
+          exitGraceMs,
+          buildTimeoutMessage: (rid, _tms) =>
+            `G4c: timed out waiting for generate result for run ${rid}`,
+        });
       },
     },
     spawnAnchorCheck: async (): Promise<AnchorCheckResult> => {
@@ -1491,9 +1621,18 @@ export function assembleGenerateDeps(
 export async function runChannelWrite(
   opts: RunWriteOptions,
 ): Promise<RunWriteOutcome> {
+  // E0c10 D6 —— 分阶段耗时（ms），覆盖整个 tick（含 generate 段）。各字段可溯源（spec §2 判据 7）。
+  const _t0 = Date.now();
+  let _tReadBoard = 0;
+  let _tDecide = 0;
+  let _tWrite = 0;
+  let _tTerm = 0;
+  let _tGen = 0;
   if (isFrozenChannel(opts.channelId)) {
     throw new FrozenChannelError(opts.channelId);
   }
+  // E0c10 D4 —— 收集「run exited 无 result」诊断（triage / generate 两路径）。
+  const diagnostics: RunExitWithoutResultDiagnostic[] = [];
   const nonce = randomUUID();
   const runsChannelId = opts.runsChannelId ?? RUNS_CHANNEL_ID;
   const messages = await readChannelMessages(opts.channelId);
@@ -1522,14 +1661,22 @@ export async function runChannelWrite(
     }
   }
   const state = assembled.state;
+  _tReadBoard = Date.now() - _t0;
+  // E0c10 D5 —— maxClues 也进 tickConfig（不仅喂 harvest 的封顶），否则 decideTermination
+  //   的 capHit 判定（count >= cfg.maxClues）永远用缺省 64，--max-clues 对终态毫无影响，
+  //   装配链只接到一半（spec §2 判据 5：断言 max_clues 真的传到了 tick，含终态判定）。
+  const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
+  const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
   const tickConfig = {
     ...DEFAULT_TICK_CONFIG,
     ...(opts.triageThreshold !== undefined ? { triageThreshold: opts.triageThreshold } : {}),
+    ...(opts.maxClues !== undefined ? { maxClues: opts.maxClues } : {}),
+    ...(opts.maxDepth !== undefined ? { maxDepth: opts.maxDepth } : {}),
   };
+  const _tDecideStart = Date.now();
   const decisions = decideTick(state, tickConfig);
+  _tDecide = Date.now() - _tDecideStart;
   // A8e——maxDepth/maxClues 取配置（不硬编码，spec §6）。
-  const maxDepth = opts.maxDepth ?? DEFAULT_TICK_CONFIG.maxDepth;
-  const maxClues = opts.maxClues ?? DEFAULT_TICK_CONFIG.maxClues;
   const deps: WriteDeps = {
     cas: (input) => realCas(opts.channelId, input, nonce),
     spawnWorker:
@@ -1598,15 +1745,16 @@ export async function runChannelWrite(
             },
             readResult: async (runId) => {
               const { timeoutMs, pollMs } = resolveAgentResultTimeout();
-              const deadline = Date.now() + timeoutMs;
-              while (Date.now() < deadline) {
-                const result = await readTriageResult(runId);
-                if (result !== null) return result;
-                await new Promise((r) => setTimeout(r, pollMs));
-              }
-              throw new Error(
-                `G5: timed out waiting for triage result for run ${runId} — no dr-triage.result.v1 found on board:agent-runs after ${timeoutMs}ms`,
-              );
+              const exitGraceMs = resolveRunExitGraceMs();
+              return await pollForResultOrExit<TriageResultDecision[]>(runId, TRIAGE_ROLE, {
+                readResult: () => readTriageResult(runId),
+                readExited: () => hasRunExited(runId),
+                timeoutMs,
+                pollMs,
+                exitGraceMs,
+                buildTimeoutMessage: (rid, tms) =>
+                  `G5: timed out waiting for triage result for run ${rid} — no dr-triage.result.v1 found on board:agent-runs after ${tms}ms`,
+              });
             },
           };
         return spawnTriageRole(corpus, runtime).then(
@@ -1614,11 +1762,39 @@ export async function runChannelWrite(
           );
       }),
   };
+  // E0c10 D4 —— 包裹默认 spawnTriage：run exited 无 result ⇒ 记录诊断、返回空决策（proposed
+  //   clues 不被 CAS，保持 proposed，⛔ 不静默当成功）；tick 继续以 0 退出（GT-D）。
+  //   仅包裹「生产缺省」分支（opts.spawnTriage 未注入时）；测试注入的 spawnTriage 保持原样，
+  //   由测试自行决定如何处理（判别性测试据此驱动真实轮询读取路径，spec §2 判据 4）。
+  if (deps.spawnTriage && opts.spawnTriage === undefined) {
+    const _injectedTriadge = deps.spawnTriage;
+    deps.spawnTriage = async (corpus) => {
+      try {
+        return await _injectedTriadge(corpus);
+      } catch (e) {
+        if (e instanceof RunExitedWithoutResultError) {
+          diagnostics.push({
+            runId: e.runId,
+            role: e.role,
+            elapsedMs: e.elapsedMs,
+            phase: "triage",
+          });
+          // ⛔ 不静默当成功：返回的 decisions 经 applyTriageBatch 后零 CAS，
+          //   proposed clues 保持 proposed（待下一 tick 重派），与「triage 失败」语义一致。
+          //   诊断已进 diagnostics（GT-D：记录 run_id/role/已等时长）。
+          return { decisions: [], runId: e.runId };
+        }
+        throw e;
+      }
+    };
+  }
+  const _tWriteStart = Date.now();
   const result = await runWrite(
     deps,
     decisions,
     opts.maxWrites ?? DEFAULT_MAX_WRITES,
   );
+  _tWrite = Date.now() - _tWriteStart;
   // A9 —— hasPendingWork 必须反映**写后**板面（本 tick 已把某些非终态卡推进到终态），
   //   而不是写前快照 `state`：否则一个把最后一张非终态卡推到终态的 tick 仍会报 true，
   //   多投一条触发（下一 tick 才消掉）。用成功 CAS 的写后 status 重建板面再判定（spec §1.3）。
@@ -1659,6 +1835,7 @@ export async function runChannelWrite(
       : postWriteState.cards;
   //   coverage 取本轮 evidence 已覆盖的 clue_id 集合大小（coveredClueIds 已并入证据 channel
   //      的覆盖；经 Set 去重后的大小，与 decideTermination 内部 computeCoverage 一致）。
+  const _tTermStart = Date.now();
   const termination = decideTermination(
     {
       cards: termCards,
@@ -1668,6 +1845,7 @@ export async function runChannelWrite(
     },
     tickConfig,
   );
+  _tTerm = Date.now() - _tTermStart;
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
   if (opts.origin) {
@@ -1677,8 +1855,18 @@ export async function runChannelWrite(
       const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
+        // E0c10 D4 —— 生产 generate deps 注入 onRunExitedWithoutResult：任一角色 run exited 无
+        //   result ⇒ 记录诊断、跳过该 doc、终止本次 generate（tick 继续以 0 退出，GT-D）。
+        //   仅在生产装配（opts.generateDeps 未注入）时注入；测试注入的 generateDeps 保持原样。
         const generateDeps = opts.generateDeps ?? assembleGenerateDeps(opts, termination, postWriteState);
+        if (opts.generateDeps === undefined && !generateDeps.onRunExitedWithoutResult) {
+          generateDeps.onRunExitedWithoutResult = ({ role, runId, elapsedMs }) => {
+            diagnostics.push({ runId, role, elapsedMs, phase: "generate" });
+          };
+        }
+        const _tGenStart = Date.now();
         await runGenerate(generateDeps, DEFAULT_GENERATE_CONFIG);
+        _tGen = Date.now() - _tGenStart;
         mkdirSync(oneShotDir, { recursive: true });
         writeFileSync(markerPath, "");
       }
@@ -1697,6 +1885,15 @@ export async function runChannelWrite(
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
     triageThreshold: tickConfig.triageThreshold,
+    diagnostics,
+    timings: {
+      readBoardMs: _tReadBoard,
+      decideMs: _tDecide,
+      writeMs: _tWrite,
+      terminationMs: _tTerm,
+      generateMs: _tGen,
+      totalMs: Date.now() - _t0,
+    },
   };
 }
 
@@ -1789,6 +1986,12 @@ export interface RunCliOptions {
   oneShotDir?: string;
   /** E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。 */
   triageThreshold?: number;
+  /**
+   * E0c10 D5 —— 板面 clue 上限（--max-clues）；缺省 DEFAULT_TICK_CONFIG.maxClues(64)。
+   * 生产由 tick.md 从 `{{max_clues}}` 注入；空串/不传 ⇒ runChannelWrite 用缺省 64。
+   * 影响 harvest 封顶与 decideTermination 的 capHit 判定（spec §2 判据 5）。
+   */
+  maxClues?: number;
 }
 
 /**
@@ -1812,6 +2015,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let docChannelId: string | undefined;
   let oneShotDir: string | undefined;
   let triageThreshold: number | undefined;
+  let maxClues: number | undefined;
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
@@ -1895,6 +2099,15 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
       }
       triageThreshold = value;
       i += 1;
+    } else if (args[i] === "--max-clues") {
+      const value = Number(args[i + 1]);
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(
+          "E0c10: invalid --max-clues (must be a positive integer).",
+        );
+      }
+      maxClues = value;
+      i += 1;
     }
   }
   if (isFrozenChannel(channelId)) {
@@ -1910,6 +2123,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     docChannelId,
     oneShotDir,
     triageThreshold,
+    maxClues,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

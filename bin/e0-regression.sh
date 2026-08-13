@@ -379,24 +379,41 @@ _drain_fail_echo() {
 }
 
 while true; do
-  # 次数上限检查（先于增量，使 drain_attempts 反映实际执行次数而非 off-by-one）
-  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    echo "[e0-regression] HIT ATTEMPT LIMIT: max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT}" >&2
-    _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
-    if [ -f "$_last_stdout" ]; then
-      _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
-      if [ -n "$_last_term" ]; then
-        _print_board_composition "$_last_term"
-      fi
-    fi
-    LOOP_EXIT=4
-    break
-  fi
-
-  # 墙钟上限检查（先于自增，使 drain_attempts 反映实际执行次数而非 off-by-one）
+  # E0c10 D2/D3 —— 墙钟为主、次数为失控兜底（GT-C：固定 attempt 次数上限会把「研究这次慢」变成「基线失败」）。
+  #   判据 2（判别性，本包最难的一条）：
+  #     (A) 墙钟预算充足但 DRAIN_MAX_ATTEMPTS 已用尽 ⇒ 入口**必须继续跑**（⛔ 不得次数优先）。
+  #     (B) 墙钟与次数都用尽 ⇒ 入口**非零退出**且点名撞的是哪个上限（D3 兜底真能终止）。
+  #   实现顺序：
+  #     1. 先查次数兜底，但**仅在墙钟也已用尽时**才终止（点名 DRAIN_MAX_ATTEMPTS）。墙钟未用尽 ⇒ 继续跑。
+  #     2. 再查墙钟：用尽即终止（点名 DRAIN_WALL_CLOCK_SECONDS）。
+  #   这样 (A) 次数用尽但墙钟充足 ⇒ 继续跑；(B) 两者都用尽 ⇒ 次数兜底先终止并点名。
   NOW=$(date +%s)
   ELAPSED=$((NOW - WALL_START))
+  WALL_EXHAUSTED=0
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
+    WALL_EXHAUSTED=1
+  fi
+
+  # D3 —— 次数失控兜底：撞上**且墙钟也已用尽**才终止并非零退出（GT-C：次数不得先于墙钟决定成败）。
+  if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
+    if [ "$WALL_EXHAUSTED" -eq 1 ]; then
+      echo "[e0-regression] HIT DRAIN_MAX_ATTEMPTS BACKSTOP (runaway): max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT} wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} (both budget and backstop exhausted ⇒ non-zero exit, GT-C/D3)" >&2
+      _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
+      if [ -f "$_last_stdout" ]; then
+        _last_term="$(printf '%s' "$DRAIN_SUMMARY" | node "$PLUGIN_ROOT/scripts/read-termination.mjs" 2>/dev/null)" || _last_term=""
+        if [ -n "$_last_term" ]; then
+          _print_board_composition "$_last_term"
+        fi
+      fi
+      LOOP_EXIT=4
+      break
+    fi
+    # D2 —— 次数用尽但墙钟仍充足 ⇒ 继续跑（墙钟为主）。点名继续的原因，便于观测。
+    echo "[e0-regression] DRAIN_MAX_ATTEMPTS reached but wall clock remains (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}); continuing per wall-clock-primary policy (GT-C/D2)" >&2
+  fi
+
+  # D2 —— 墙钟用尽即终止（墙钟为主）。此时次数兜底未撞或已在上面的分支处理。
+  if [ "$WALL_EXHAUSTED" -eq 1 ]; then
     echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
     if [ "$DRAIN_ATTEMPT" -gt 0 ]; then
       _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"

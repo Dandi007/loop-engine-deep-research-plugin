@@ -20,6 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TerminationState } from "./tick";
 import type { DocV2 } from "./protocol";
+import {
+  isRunExitedWithoutResultError,
+} from "./run-exit-diagnostic";
 
 /** 单个生成角色：role（persona）。 */
 export interface GenerateRoleSpec {
@@ -371,6 +374,13 @@ export interface GenerateDeps {
    * 缺省（未接线）⇒ 不作复用检查，行为与今天逐字一致。
    */
   readDocs?(origin: string): Promise<ExistingDoc[]>;
+  /**
+   * E0c10 D4（GT-D）—— 任一生成角色 run exited 无 result 时的诊断回调。
+   * runGenerate 在 spawnRole 抛 `RunExitedWithoutResultError` 时调用本回调（带 role/runId/elapsedMs），
+   * 然后**跳过该角色的 doc 发布**并继续（⛔ 不让 tick 非零退出；⛔ 该 doc 被标成失败，不静默当成功）。
+   * 缺省（未接线）⇒ 该错误向上传播（保留旧行为；生产装配链在 tick-run.ts 注入本回调）。
+   */
+  onRunExitedWithoutResult?(info: { role: string; runId: string; elapsedMs: number }): void;
 }
 
 /**
@@ -433,15 +443,39 @@ export async function runGenerate(
   if (!isReuse) {
     // debater：advocate / opponent 并行；judge 需先拿到二者的 body 作为 prior_arguments（G2a §2.2）。
     const [advocate, opponent, judge] = cfg.debaters;
-    const [advOut, oppOut] = await Promise.all([
-      spawnRole(advocate.role, { question, evidences }),
-      spawnRole(opponent.role, { question, evidences }),
-    ]);
-    const judgeOut = await spawnRole(judge.role, {
-      question,
-      evidences,
-      prior_arguments: [advOut.body, oppOut.body],
-    });
+    // E0c10 D4（GT-D）—— 任一 debater run exited 无 result ⇒ 记录诊断、跳过该 doc 发布、
+    //   终止本次 generate（⛔ 不让 tick 非零退出；⛔ 该 doc 标成失败，不静默当成功）。
+    //   judge 依赖 advocate/opponent 的 body，故 advocate/opponent 任一失败 ⇒ 不再派 judge。
+    //   诊断经 deps.onRunExitedWithoutResult 回调上交（生产由 tick-run.ts 注入，进 tick 输出）。
+    let advOut: { body: string } | null = null;
+    let oppOut: { body: string } | null = null;
+    let judgeOut: { body: string } | null = null;
+    try {
+      [advOut, oppOut] = await Promise.all([
+        spawnRole(advocate.role, { question, evidences }),
+        spawnRole(opponent.role, { question, evidences }),
+      ]);
+    } catch (e) {
+      if (isRunExitedWithoutResultError(e)) {
+        deps.onRunExitedWithoutResult?.({ role: e.role, runId: e.runId, elapsedMs: e.elapsedMs });
+        // 该 doc 标成失败：不发布、不导出、本轮 generate 即此终止（tick 继续，GT-D）。
+        return;
+      }
+      throw e;
+    }
+    try {
+      judgeOut = await spawnRole(judge.role, {
+        question,
+        evidences,
+        prior_arguments: [advOut.body, oppOut.body],
+      });
+    } catch (e) {
+      if (isRunExitedWithoutResultError(e)) {
+        deps.onRunExitedWithoutResult?.({ role: e.role, runId: e.runId, elapsedMs: e.elapsedMs });
+        return;
+      }
+      throw e;
+    }
 
     // 产物回写：三条 debater 的 body → research.doc.v2（doc_kind=argument，由 role 推出）。
     const debaterOuts = [advOut, oppOut, judgeOut];
@@ -464,6 +498,13 @@ export async function runGenerate(
     const release = await deps.lockSynthesizer();
     try {
       synthBody = (await spawnRole(cfg.synthesizer.role, synthCorpus)).body;
+    } catch (e) {
+      if (isRunExitedWithoutResultError(e)) {
+        deps.onRunExitedWithoutResult?.({ role: e.role, runId: e.runId, elapsedMs: e.elapsedMs });
+        // synthesizer exited 无 result ⇒ report doc 标成失败：不发布 report、不导出（tick 继续，GT-D）。
+        return;
+      }
+      throw e;
     } finally {
       await release();
     }

@@ -70,10 +70,22 @@ for (const entry of laneEntries) {
 
   for (const line of journalContent.trim().split("\n")) {
     if (!line) continue;
+    // G15 —— tick 以 bash 非零退出收尾（节点进程退出码 ≠ 0）。
     const m = line.match(/\[bash 非零退出 EXIT:(\d+)\]/);
     if (m) {
       failed = true;
       process.stderr.write(`[deep-research-loop] TICK FAILURE: run_dir=${entry.run_dir} exit=${m[1]}\n`);
+      process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
+    }
+    // E0c10 D7 —— tick 被引擎级 node_timeout / wall_clock 杀掉（GT-A 真机取证）：
+    //   journal: {"identity":"tick","result":"[外部调用失败 status=TIMEOUT]\n","error":"exec"}
+    //   仅认 `[bash 非零退出 EXIT:n]` 会把「引擎杀掉的 tick」当成成功（GT-A：超时是间歇性的，
+    //   板上只有种子那一条线索时也会发生 ⇒ 与板面规模无关）。此处同时认 TIMEOUT + exec 两条标志。
+    //   ⛔ 必须两条同时命中：只认 `error:"exec"` 会误报普通 exec 失败；只认 TIMEOUT 会误报
+    //   业务层偶然出现的 TIMEOUT 字样。引擎杀掉的 tick 两条同时出现（GT-A 逐字照抄）。
+    if (/\[外部调用失败 status=TIMEOUT\]/.test(line) && /"error"\s*:\s*"exec"/.test(line)) {
+      failed = true;
+      process.stderr.write(`[deep-research-loop] TICK FAILURE (engine-killed): run_dir=${entry.run_dir} reason=TIMEOUT/exec\n`);
       process.stderr.write(`[deep-research-loop]   journal: ${line.trim()}\n`);
     }
   }

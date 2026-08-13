@@ -1047,12 +1047,15 @@ describe("判据 5 (GT-3): cross-drain loop until convergence (executing e0-regr
 // ══════════════════════════════════════════════════════════════════════
 
 describe("判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh)", () => {
-  it("always null ⇒ hits attempt limit, non-zero exit naming the limit", async () => {
+  it("always null ⇒ both budget and backstop exhausted ⇒ non-zero exit naming the backstop (D3)", async () => {
+    // E0c10 D3 —— 次数失控兜底：撞上且墙钟也已用尽 ⇒ 非零退出并点名 DRAIN_MAX_ATTEMPTS。
+    // 构造「次数与墙钟都用尽」（判据 2 反向）：maxAttempts=2、wallClock 极小、backoff=0，
+    // 两次快速 null drain 后墙钟也耗尽 ⇒ 命中 BACKSTOP。
     const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 30,
+        wallClockSeconds: 0,
         backoffSeconds: 0,
         terminationStates: [
           { drainId: "fake-drain-null-1", state: null },
@@ -1066,14 +1069,59 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
     try {
       const res = runE0Regression(e0regression, env);
       expect(res.code).not.toBe(0);
-      expect(res.err).toMatch(/HIT ATTEMPT LIMIT|HIT WALL CLOCK LIMIT/i);
-      expect(res.err).toMatch(/drain_attempts=2\b/);
-      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
-      expect(attempts).toBe(2);
+      // D2/D3 —— 墙钟为主、次数为失控兜底；两者用尽 ⇒ 点名 BACKSTOP 或 WALL CLOCK。
+      expect(res.err).toMatch(/HIT DRAIN_MAX_ATTEMPTS BACKSTOP|HIT WALL CLOCK LIMIT/i);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("E0c10 D2: wall clock sufficient but attempts exhausted ⇒ entry keeps running (wall-clock-primary)", async () => {
+    // 判据 2（判别性，本包最难的一条）：墙钟预算充足（wallClock 大）但 DRAIN_MAX_ATTEMPTS 已用尽 ⇒
+    //   入口必须继续跑（⛔ 不得次数优先）。构造：maxAttempts=2、wallClock=4（足够跑 >2 次快速 drain）、
+    //   backoff=0。次数会在第 3 次迭代撞顶，但墙钟未用尽 ⇒ 继续跑，直到墙钟用尽才停。
+    //   断言：drain_attempts > maxAttempts（继续跑过了次数上限），退出非零（墙钟最终用尽），
+    //   消息点名 WALL CLOCK（次数未单独决定成败）。
+    const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
+      "always-null",
+      {
+        maxAttempts: 2,
+        wallClockSeconds: 4,
+        backoffSeconds: 0,
+        terminationStates: [
+          { drainId: "fake-drain-null-1", state: null },
+          { drainId: "fake-drain-null-2", state: null },
+        ],
+      },
+    );
+    // E0c10 D2 —— 次数用尽但墙钟未用尽 ⇒ 继续跑。4 秒窗口内（backoff=0、fake drain 即时）
+    //   会跑远多于 2 次 drain；为每个可能产生的 drain_id（null-1..null-40）预备 termination
+    //   运行目录（state=null），使 read-termination 不在「继续跑」阶段误判为失败。
+    for (let _i = 1; _i <= 40; _i++) {
+      setupRuntimeDir(
+        join(dir, "engine-root"),
+        join(dir, "engine-root", "runs"),
+        `fake-drain-null-${_i}`,
+        null,
+      );
+    }
+    const [busPort, prodBusPort] = await Promise.all([startFakeBus(), startFakeBus()]);
+    env.AGENT_BUS_URL = `http://127.0.0.1:${busPort}`;
+    env.E0C1_PROD_BUS_URL = `http://127.0.0.1:${prodBusPort}`;
+    try {
+      const res = runE0Regression(e0regression, env);
+      expect(res.code).not.toBe(0);
+      // 关键判别：次数已用尽但入口继续跑 ⇒ drain_attempts 远大于 maxAttempts(2)。
+      const attempts = Number(readFileSync(attemptFile, "utf8").trim());
+      expect(attempts).toBeGreaterThan(2);
+      // D2 生效：观测到「次数撞顶但墙钟未用尽 ⇒ 继续跑」的点名（次数没有先于墙钟决定成败）。
+      expect(res.err).toMatch(/wall clock remains|continuing per wall-clock-primary/i);
+      // 终止时非零；墙钟最终用尽（次数兜底仅在墙钟也用尽时才终止，D3）。
+      expect(res.err).toMatch(/HIT DRAIN_MAX_ATTEMPTS BACKSTOP|HIT WALL CLOCK LIMIT/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, { timeout: 30000 });
 
   it("always null ⇒ hits wall clock limit, non-zero exit naming the limit", async () => {
     const { dir, env, e0regression, attemptFile } = setupE0RegressionEnv(
@@ -1129,13 +1177,16 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
 // ══════════════════════════════════════════════════════════════════════
 
 describe("E0c3b 判据 4: board composition and triage deadlock naming on limit hit", () => {
-  it("HIT ATTEMPT LIMIT with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
+  it("limit hit with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK", async () => {
+    // E0c10 D2/D3 —— 次数兜底 + 墙钟用尽 ⇒ 终止并打印板面构成。构造：maxAttempts=2、
+    // wallClock=2、backoff=1 ⇒ 两次 drain（各带 proposed=1 / triageThreshold=3 的 termination）
+    // 加两次 1s 退避恰好耗尽墙钟 ⇒ 两者用尽命中 BACKSTOP，读最后一次 drain 的 termination 打印构成。
     const { dir, env, e0regression } = setupE0RegressionEnv(
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 30,
-        backoffSeconds: 0,
+        wallClockSeconds: 2,
+        backoffSeconds: 1,
         terminationStates: [
           { drainId: "fake-drain-null-1", state: null },
           { drainId: "fake-drain-null-2", state: null },

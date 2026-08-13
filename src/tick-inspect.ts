@@ -357,6 +357,39 @@ export async function readTriageResult(
 }
 
 /**
+ * E0c10 D4（GT-D）—— 从已读的消息数组里，按 run_id 找该 run 是否已有 `agent.run.exited` 事件。
+ * 用于 triage / generate 轮询路径判别「run 已 exited 但无 result」（GT-D 真机：
+ * `run … exited without producing a dr-doc.result.v1 after 3159ms`）。
+ * 纯函数：供轮询循环复用同一份已读消息列表，避免额外分页读。
+ */
+export function findRunExited(
+  runId: string,
+  messages: InspectMessage[],
+): boolean {
+  for (const msg of messages) {
+    const parsed = parseRunEvent(msg);
+    if (!parsed) continue;
+    if (parsed.runId === runId && parsed.event.state === "exited") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * E0c10 D4（GT-D）—— 按 run_id 读 `board:agent-runs`，判别该 run 是否已 exited。
+ * 轮询路径在每次 poll 时调用：exit 已观察到且仍无 result ⇒ 记录诊断并继续本轮 tick
+ * （⛔ tick 不得非零退出；⛔ 该 doc/clue 不得静默当成功）。
+ */
+export async function hasRunExited(
+  runId: string,
+  channelId = RUNS_CHANNEL_ID,
+): Promise<boolean> {
+  const messages = await readChannelMessages(channelId);
+  return findRunExited(runId, messages);
+}
+
+/**
  * 只读跑一次 --inspect：分页读 channel + 真实 runs → 决策 → 打印 JSON → 返回 0。
  * ⛔ 终态任何值都 exit 0（本模式是观察，不是判决，spec §1 step 6 / H10）。
  */

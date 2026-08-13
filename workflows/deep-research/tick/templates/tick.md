@@ -23,6 +23,8 @@ tick_channel="{{tick_channel}}"
 evidence_channel="{{evidence_channel}}"
 allowed_root="{{allowed_root}}"
 max_writes="{{max_writes}}"
+# E0c10 D5 —— 板面 clue 上限（--max-clues）：由 fleet input 注入。缺省（空串）⇒ 不传 ⇒ tick-entry 用 64。
+max_clues="{{max_clues}}"
 research_question="{{research_question}}"
 research_origin="{{research_origin}}"
 doc_channel="{{doc_channel}}"
@@ -49,6 +51,8 @@ if [ -n "$tick_channel" ]; then
   if [ -n "$evidence_channel" ]; then tick_args+=(--evidence-channel "$evidence_channel"); fi
   if [ -n "$allowed_root" ]; then tick_args+=(--allowed-root "$allowed_root"); fi
   tick_args+=(--max-writes "$max_writes")
+  # E0c10 D5 —— max_clues 经装配链注入；缺省（空）不传 ⇒ tick-entry --run 用 DEFAULT_TICK_CONFIG.maxClues=64。
+  if [ -n "$max_clues" ]; then tick_args+=(--max-clues "$max_clues"); fi
   if [ -n "$research_question" ]; then tick_args+=(--question "$research_question"); fi
   # G4c —— research origin 与 doc channel 可选注入 tick-entry --run。
   if [ -n "$research_origin" ]; then tick_args+=(--origin "$research_origin"); fi

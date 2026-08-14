@@ -21,6 +21,11 @@
  */
 import type { ClueV2, EvidenceV2 } from "./protocol";
 import { parseContentClueText } from "./ingest";
+import {
+  scanEvidenceForSecretPatterns,
+  type SecretFieldHit,
+  type SecretScanField,
+} from "./secret-scan";
 
 /** worker.result.v1 里一条 evidence 的最小视图（spec §1.3 / §7）。 */
 export interface WorkerEvidenceItem {
@@ -498,6 +503,36 @@ export interface EvidenceRejection {
 }
 
 /**
+ * E1k D3 ⭐ —— 一条 evidence 因**命中密钥形态**而被拒发的记录（条目级，⛔ 不连坐整卡）。
+ *
+ * spec §1 D3 / §2 判据 2(c)(d)：记录必须点名 `clue_id`、命中的 **pattern 名**、命中的
+ * **字段名**；⛔ **不得含命中内容本身**，⛔ 不得回抄 `quote` 全文——把密钥再抄进运行记录
+ * 本身就是二次泄漏（与 `EvidenceRejection` / `AnchorAuthorityMismatch` 同一条纪律）。
+ *
+ * ⚠️ 与 `EvidenceRejection` 的区别：那条记录带 `source` 的前 32 字符与 locator/revision 的
+ *    形态摘要；本记录**一个 worker 正文字段都不带**——被扫的三个字段里已确证有密钥形态，
+ *    任何正文摘要都可能把它抄出来。
+ */
+export interface SecretScanRejection {
+  /** 被拒发的 evidence 所属的卡（点名 clue_id，D3）。 */
+  clueId: string;
+  /** 该条 evidence 在 worker.result.v1.evidences 中的稳定序号（便于回查，⛔ 不回抄正文）。 */
+  index: number;
+  /** 拒发原因（常量串，点名失败的判据）。 */
+  reason: string;
+  /** 命中的字段名（quote / claim / anchor），⛔ 不含字段内容。 */
+  fields: SecretScanField[];
+  /** 命中的 pattern 名（跨字段去重），⛔ 不含命中内容。 */
+  patterns: string[];
+  /** 逐字段明细：哪个字段命中了哪几条 pattern。⛔ 同样不含任何内容。 */
+  hits: SecretFieldHit[];
+}
+
+/** E1k D3——密钥形态命中的拒发原因（常量：记录里只出现它与 pattern/字段名）。 */
+export const SECRET_PATTERN_REJECTION_REASON =
+  "evidence field matched a secret-shaped pattern; refusing to publish it to the append-only evidence channel (spec §13.1; the record names the pattern and the field only, never the matched content)";
+
+/**
  * E1c D1 / E1d D3——一条证据因**卡上没有权威元数据**而被拒发的原因（条目级，不连坐整卡）。
  * 两种命中形态，字面原因相同（都是"这张卡拼不出可核验的 content 锚点"）：
  *   - content 卡但 text 不是 `web://<uri>@<digest>` 形态 ⇒ D3 响亮失败；
@@ -620,6 +655,13 @@ export interface HarvestReport {
    */
   evidenceRejections: EvidenceRejection[];
   /**
+   * E1k D5 ⭐ —— 因命中密钥形态而被拒发的 evidence 记录（条目级，⛔ 不连坐整卡）。
+   * 与 `evidenceRejections` **并列**（同构：条目级、点名 clue_id 与判据、不回抄正文）。
+   * ⛔ 静默拦截即未交付（spec §1 D5）：条数 = `secretScanRejections.length`，
+   *    随 `HarvestReport` 一并进 tick 的运行记录（`TickOutcome.harvestReports`）。
+   */
+  secretScanRejections: SecretScanRejection[];
+  /**
    * E1c D2 ⭐ —— worker 回报的锚点三件套与调度器侧权威值不一致的记录（条目级）。
    * ⛔ 不一致**不拒发**该条 evidence（quote 是对的，锚点由调度器补正）；
    * ⛔ 也不得静默丢弃这个不一致（那是持续观察 worker 行为的唯一窗口）。
@@ -658,6 +700,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      secretScanRejections: [],
       anchorMismatches: [],
       casExplored: false,
     };
@@ -712,6 +755,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      secretScanRejections: [],
       anchorMismatches: [],
       casExplored: false,
     };
@@ -724,6 +768,7 @@ export async function harvestCard(
   let contentCluesBlocked = 0;
   let skippedContentClues = 0;
   const evidenceRejections: EvidenceRejection[] = [];
+  const secretScanRejections: SecretScanRejection[] = [];
   const anchorMismatches: AnchorAuthorityMismatch[] = [];
   // E1d D1 ⭐⭐⭐——本卡的锚点策略（是不是 content 卡 + 调度器侧权威 `<uri>@<digest>`）。
   //   ⛔ 在循环外算一次，且**只**由卡算出：它是本卡所有 evidence 的路由信号，
@@ -734,6 +779,46 @@ export async function harvestCard(
   //    都不会把板面冲到 maxClues 之上（§1.6 / H12；attempt 2 major finding：卡间必须累计）。
   //    这里取的是对共享对象的引用，跨卡持久。
   const boardClueCount = hd.boardClueCount;
+
+  /**
+   * E1k D2 ⭐⭐ —— **发布 evidence 的唯一出口**：`publishEvidence` 之前先跑密钥形态扫描。
+   *
+   * ⛔ 两条锚点路径（content 权威锚点 / 通用模板）都必须经由本函数发布——闸门只有**一个**
+   *    出口才不会被下一次改动从旁路绕过（E1b/E1c/E1d 三次栽在「闸门被绕过」上，spec §4）。
+   * ⛔ 命中 ⇒ 该条**不发布**、不消耗预算，只留一条**不含命中内容**的记录（D3）；
+   *    ⛔ 同卡其余 evidence 与 clue **不连坐**（复用 E2b 的条目级拒发纪律，GT-2）。
+   *
+   * @returns true ⇒ 已发布；false ⇒ 被密钥形态闸门拦下。
+   */
+  const publishEvidenceGuarded = async (
+    evidence: EvidenceV2,
+    index: number,
+  ): Promise<boolean> => {
+    // D2——对 quote / claim / anchor 三个字段跑规则集（anchor 是拼装后的最终值，
+    //   ⛔ 必须扫**实际要发出去的**那个串，而不是 worker 回报的原始字段）。
+    const hits = scanEvidenceForSecretPatterns(evidence);
+    if (hits.length > 0) {
+      // D3——记录只含 clue_id、稳定序号、命中的字段名与 pattern 名。
+      //   ⛔ 不含命中内容本身、⛔ 不回抄 quote 全文（把密钥再抄进日志就是二次泄漏）。
+      secretScanRejections.push({
+        clueId: card.clueId,
+        index,
+        reason: SECRET_PATTERN_REJECTION_REASON,
+        fields: hits.map((h) => h.field),
+        patterns: [...new Set(hits.flatMap((h) => h.patterns))],
+        hits,
+      });
+      return false;
+    }
+    await hd.publishEvidence(
+      hd.evidenceChannelId,
+      evidence,
+      `dr-evidence:${runId}:${index}`,
+    );
+    budget.consume(1);
+    evidencePublished += 1;
+    return true;
+  };
 
   // 先发 evidence（幂等键：dr-evidence:<run_id>:<index>，§1.2 / H8 / H9）。
   // E2b §1.3 ⭐——条目级机械拒发：活 URL evidence 不发布，但**不连坐**整张卡的其余 evidence。
@@ -776,13 +861,8 @@ export async function harvestCard(
       // ⛔ E2b 的活 URL 拒发判据在此路径**不适用**：锚点里的 `<digest>` 是调度器 spool 下来的
       //    transcript 的权威摘要，本身就是可回放快照（E2b 要防的正是"无快照的活页面引用"）。
       const evidence = evidenceFromWorker(card.clueId, item, policy);
-      await hd.publishEvidence(
-        hd.evidenceChannelId,
-        evidence,
-        `dr-evidence:${runId}:${i}`,
-      );
-      budget.consume(1);
-      evidencePublished += 1;
+      // E1k D2——发布前过密钥形态闸门（唯一出口）。命中 ⇒ 该条不发布，不连坐同卡其余条目。
+      await publishEvidenceGuarded(evidence, i);
       continue;
     }
     // ⛔ 纵深防御（**非路由**，E1d D1）：非 content 卡上 worker 自称 content ——
@@ -812,13 +892,8 @@ export async function harvestCard(
       continue;
     }
     const evidence = evidenceFromWorker(card.clueId, item);
-    await hd.publishEvidence(
-      hd.evidenceChannelId,
-      evidence,
-      `dr-evidence:${runId}:${i}`,
-    );
-    budget.consume(1);
-    evidencePublished += 1;
+    // E1k D2——发布前过密钥形态闸门（唯一出口）。命中 ⇒ 该条不发布，不连坐同卡其余条目。
+    await publishEvidenceGuarded(evidence, i);
   }
 
   // 再发新 clue（幂等键：dr-clue:<run_id>:<index>，§1.2 / H8 / H9）。
@@ -875,6 +950,7 @@ export async function harvestCard(
     contentCluesBlocked,
     skippedContentClues,
     evidenceRejections,
+    secretScanRejections,
     anchorMismatches,
     casExplored: true,
   };

@@ -1,93 +1,65 @@
-# E1d —— content 锚点的判定必须取自**卡片自身**，而不是 worker 回传的任何字段
+# E1k —— 证据发布前的密钥形态扫描闸门（补交付：spec §13.1 的 K1/K2 从未落地）
 
-**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（base = 含 E1c 的 `main`）
-**⛔ 改动面极小：只换「哪个信号触发 content 锚点路径」，不重做 E1c 的任何机制。**
+**目标仓**：`Dandi007/loop-engine-deep-research-plugin`（base = 含 E1d 的 `main`，`fb524b9`）
+**⛔ 改动面小：只在既有拒发链路上加一道确定性扫描。**
 
 ---
 
-## 0　⛔ 地面真相（派发方真机取证，照抄，不得推测、不得由 fixture 反推）
+## 0　⛔ 地面真相（派发方 2026-08-14 09:2x 在 `origin/main` 上真机取证，照抄）
 
-### GT-1　⭐⭐⭐ `dr-worker-content` 在**四次真跑**里吐出了**四种互不相同**的字段布局
+### GT-1　⭐ 这道闸门**从未交付**
 
-同一个 role、同类输入，派发方 2026-08-14 02:40–07:20 四次真机取证，逐字：
-
-```
-第一次（board:agent-runs seq 733）
-  source   = "content"
-  locator  = "web://http://127.0.0.1:50287/e1-material.png"
-  revision = "63ac13ab…"（完整 64 位）
-  range    = "L9"
-
-第二次（seq 751）
-  source   = "content"
-  locator  = "63ac13abaabf5726.md"          ← spool 的本地文件名
-  revision = "63ac13abaabf5726"             ← 截断成 16 位
-  range    = "9"                            ← 无 L 前缀
-
-第三次（E1b Z2，16 条证据）
-  source   = "content"
-  locator  = "http://127.0.0.1:50287/e1-material2.png"   ← 裸 URI
-  revision = "9bee527f…"（完整 64 位）
-  range    = "L3:1-43"                      ← 行:字符起-字符止
-
-第四次（E1c Z2，10 条证据，run 27dd238b-1375-4b2d-acdf-8c2063e446f8）
-  source   = "web://http://127.0.0.1:50287/e1-material4.png"   ← ⭐ 整个 URI 跑进了 source
-  locator  = "L3"                                              ← ⭐ 行号跑进了 locator
-  revision = "b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d"
-  range    = "L3"
-```
-
-### GT-2　E1c 的闸门钉在 `source` 上，被第四种形态绕过
-
-E1c 交付的 `src/harvest.ts` 逐字：
-
-```ts
-export function anchorForEvidence(
-  item: WorkerEvidenceItem,
-  authority?: ContentAnchorAuthority | null,
-): string {
-  const source = item.source;
-  // E1c D1：闸门钉在 source 语义字段上（⛔ 不嗅探 locator 前缀）。
-  if ((source ?? "").trim() === CONTENT_SOURCE) {
-    if (!authority) { throw new Error("E1c D1: content evidence requires the dispatcher-side authority …"); }
-    return contentAnchor(authority, item.range);
-  }
-  const locator = item.locator;
-  const revision = item.revision;
-  …
-  return composeAnchor(source, locator, revision, item.range);
-}
-```
-
-第四种形态的 `source` 不是 `"content"` ⇒ **不命中** ⇒ 落回通用模板
-`${source}://${locator}@${revision}#${range}` ⇒ 真机上 10 条证据**全部**被发成（逐字）：
+canonical spec §13.1 明写它属于「E1 增补」，但派发方写 E1 的 spec 时把范围收窄到 ingest，
+**漏了它**（派发方的责任，不是实现者的）。对 `origin/main` 全量核查，逐字：
 
 ```
-web://http://127.0.0.1:50287/e1-material4.png://L3@b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d#L3
-web://http://127.0.0.1:50287/e1-material4.png://L7@b9eba894…#L7
-web://http://127.0.0.1:50287/e1-material4.png://L9@b9eba894…#L9
-…（10 条，scheme 分布 {'web': 10}，digest 全部是权威的 64 位值）
+$ for f in $(git ls-tree -r --name-only origin/main -- src | grep '\.ts$'); do
+    n=$(git show origin/main:$f | grep -cE "AKIA|ghp_|xoxb-|BEGIN .* PRIVATE KEY"); [ "$n" -gt 0 ] && echo "$f: $n"; done
+(无输出)
 ```
 
-URI 段被污染成 `…e1-material4.png://L3`。
+⇒ 证据正文可以带着任何形态的密钥被发到**没有 DELETE 的 append-only bus** 上，且不可撤回。
 
-> 说明：digest 之所以是对的，是因为 clue text 里带着它、worker 照抄了一份——
-> **这是巧合，不是保证**（第二次它就截断成了 16 位）。
+### GT-2　⭐ 可直接复用的既有机制（⛔ 不要另造一套）
 
-### GT-3　⭐⭐ 由此得出的、本包要落实的**唯一正确原则**
+`origin/main` 的 `src/harvest.ts` 逐字：
 
-**⛔ 任何由 worker 回传的字段（`source` / `locator` / `revision`）都不得参与闸门判定，
-也不得作为锚点的数据源。**
+```
+443:export function webEvidenceRejectionReason(item: WorkerEvidenceItem): string | null {
+485:export interface EvidenceRejection {
+490:  /** 拒发原因（与 webEvidenceRejectionReason 返回值一致，点名失败的判据）。 */
+517: * ⛔ 不回抄 `quote` 全文（与 `EvidenceRejection` 同纪律：不把未经核验的内容再落一遍）。
+```
 
-调度器**自己就知道**这张卡是不是 content 卡：是它把一条 `sources:["content"]` 的 clue
-经 triage → dispatch 派给 `dr-worker-content` 的，`authority`（uri + digest）也是它从
-自己 propose 的 content-clue 与自己 spool 的 transcript 里拿到的。
+E2b 已交付**条目级拒发 + 不连坐 + 不回抄 quote** 的完整纪律（活 URL evidence 那条闸门），
+真机实证过：一张卡里两条被拒、同卡的 proposed_clue 照常发布、证据 channel head_seq 保持 0。
 
-⇒ **判定必须取自卡片自身（clue 的 `sources` / 该 harvest 卡的 authority 是否存在），
-worker 只提供 `quote` 与 `range`。** 这才是宪法第十一条「闸门归代码，persona 只作纵深防御」。
+### GT-3　spec §13.1 的原文（照抄，本包的判据来源）
 
-⚠️ 本包是本线**第三次**修这同一处闸门（E1b 钉 `locator` 前缀 → 被绕过；
-E1c 钉 `source` 字段 → 被绕过）。**再钉在任何 worker 可控的字段上都会被第五种形态绕过。**
+> - harvest 发布链路（`publishEvidence` 之前）加确定性扫描：对 evidence 的 quote / claim / anchor
+>   字段跑密钥形态 regex 集——`AKIA[0-9A-Z]{16}`、`ghp_[A-Za-z0-9]{36}`、`xoxb-`、
+>   `-----BEGIN .* PRIVATE KEY-----`、≥40 字符连续 base64/hex 高熵串。
+> - 命中 ⇒ 该条 evidence **不发布**，标失败并写运行记录（宪法第四条现形；记录只含命中的
+>   pattern 名与字段名，⛔ 不含命中内容本身——防止把密钥再抄进日志）。整卡其余 evidence
+>   不连坐（与转写失败粒度下沉同构）。
+> - 扫描器为纯函数 + 正反向单测；⛔ 不用模型判断（宪法第二条）。persona 的自扫描纪律保留作
+>   纵深防御，但机械闸门才是判据（宪法第十一条：闸门归代码）。
+> - 硬验收：**K1** ⭐ 判别性——预置一条 quote 含 `AKIA` 形态的 evidence ⇒ 不出现在 bus，
+>   运行记录含拦截条目。**K2** 回归——正常 evidence 发布行为逐字不变。
+
+### GT-4　⛔ 高熵串那条的现实陷阱（派发方实测，务必处理）
+
+本线的**合法** anchor 里天然含有 **64 位十六进制 sha256**，逐字实例：
+
+```
+web://http://127.0.0.1:50287/e1-material5.png@fc246f0aff9b5c82971135989a5ff0f770210c488466534d16b6220652c1cb9b#L1
+code://src/dispatch.ts@efebe270bf1e1fe88af4b9d47fc155ed068645ab#L1287
+```
+
+「≥40 字符连续 hex」这条规则会**命中每一条合法证据**，把整条链路判死。
+⇒ 高熵规则**必须**排除掉「作为 anchor 的 digest / commit sha 出现在其结构位置上」的情形。
+⛔ 不得因此把高熵规则整条删掉（那是把闸门砍了）；也⛔ 不得简单地对 `anchor` 字段整体豁免
+（真密钥若被塞进 anchor 的 locator 段同样要拦）。
 
 ---
 
@@ -95,65 +67,60 @@ E1c 钉 `source` 字段 → 被绕过）。**再钉在任何 worker 可控的字
 
 | # | 必须交付 | 关键约束 |
 |---|---|---|
-| **D1** | **content 锚点路径的触发信号改为卡片侧事实**：该 harvest 卡是 content 卡（其 clue 的 `sources` 含 `content` / 该卡持有 `ContentAnchorAuthority`）⇒ **一律**走 `contentAnchor(authority, range)` | ⛔ 判定不得读 `item.source` / `item.locator` / `item.revision`（GT-3）。⛔ `code://` 路径逐字不变 |
-| **D2** | content 卡上，**worker 回传的 `source`/`locator`/`revision` 与权威值不一致时仍记入 `anchorMismatches`**（E1c 已有该机制，本包只需覆盖新的 `source` 维度） | ⛔ 不得因此拒发证据；⛔ 记录里不得回抄 quote 全文 |
-| **D3** | **content 卡缺 `authority` ⇒ 响亮失败**（E1c 已有，⛔ 保留且判据要覆盖） | ⛔ 不得回退成用 worker 字段兜底 |
-| **D4** | `range` 归一覆盖第四种形态（`"L3"`，已带 L 前缀 ⇒ 原样保留） | E1c 已交付归一逻辑，本包只需判据覆盖 |
+| **D1** | **纯函数扫描器**：对给定字段文本返回命中的 pattern 名列表（无命中则空） | ⛔ 纯函数、无 IO、⛔ 不用模型判断（宪法第二条）。规则集至少含 GT-3 列出的五类 |
+| **D2** | **接进 `publishEvidence` 之前**：对 evidence 的 `quote` / `claim` / `anchor` 三个字段扫描 | 命中 ⇒ **该条不发布**；⛔ 整卡其余 evidence 与 clue **不连坐**（复用 GT-2 的既有纪律） |
+| **D3** | **拦截记录进运行记录**：含 `clue_id`、命中的 **pattern 名**、命中的**字段名** | ⛔ **不得含命中内容本身**，⛔ 不得回抄 `quote` 全文（GT-3 / GT-2 同纪律） |
+| **D4** | **高熵规则不得误伤合法 anchor**（GT-4） | 排除「结构位置上的 digest / commit sha」；⛔ 不得整条删除高熵规则，⛔ 不得对 `anchor` 字段整体豁免 |
+| **D5** | 计数进 `HarvestReport`，与既有 `evidenceRejections` 同构或并列 | ⛔ 静默拦截即未交付 |
 
 ## 2　验收判据
 
 1. `npm ci && npm run typecheck && npm test` **连跑两次都全绿**。
-2. **⭐⭐⭐ D1 判别性（本包核心）**：设该 content 卡的权威值为
-   `uri=http://127.0.0.1:50287/e1-material4.png`、
-   `digest=b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d`。
-   把 GT-1 那**四条逐字的真实 worker 回报**（含第四种：
-   `source="web://http://127.0.0.1:50287/e1-material4.png"`、`locator="L3"`、`range="L3"`）
-   分别喂进**生产收割路径**，**四条都必须**产出：
-
-   ```
-   web://http://127.0.0.1:50287/e1-material4.png@b9eba8944c549188e11213dc85c85f32b4900bd5d9230f0724c3d99a161fb04d#L3
-   ```
-
-   （前三条按各自的 range 归一后结尾分别为 `#L9`、`#L9`、`#L3:1-43`；uri 与 digest 段**四条完全相同**。）
-
-   ⛔ 断言里出现 `.png://`、`content://`、`.md`、16 位截断 digest，任一即为方向钉反。
-   把触发信号改回读 `item.source` ⇒ **第四条必须变红**。
-3. **⭐ D2 判别性**：喂第四条 ⇒ 证据**照常发布**且 anchor 是权威形态，
-   **同时** `anchorMismatches` 里有一条含 clue_id 与两侧值（⛔ 不含 quote 全文）；
-   删掉该记录 ⇒ 变红。另配：喂一条三字段全与权威一致的 ⇒ **不产生** mismatch 记录。
-4. **⭐ D3 判别性**：content 卡但 `authority` 缺失 ⇒ **响亮失败**；
-   改成用 worker 字段兜底 ⇒ 变红。
-5. **⭐ 回归**：`source="code"` 的 evidence ⇒ `code://src/dispatch.ts@efebe27#L1287` 逐字不变。
-6. **⛔ 断言打在生产组装出的 deps 上**；⛔ 源码字符串匹配不构成证据；
-   ⛔ 不得在测试里绕过装配链直接给 `anchorForEvidence` 传参——**必须驱动 `harvestCard`
-   并检查 `publishEvidence` 实际收到的 anchor**。
+2. **⭐⭐ K1 判别性**：一张卡两条 evidence，其一 `quote` 含 `AKIA` 形态
+   （如 `AKIAIOSFODNN7EXAMPLE`）⇒
+   (a) 该条**不出现在证据 channel 上**；(b) **同卡另一条照常发布**；
+   (c) 运行记录含拦截条目且含 pattern 名与字段名；
+   (d) ⛔ 该记录**不含** `AKIA…` 这个串本身、也不含 quote 全文。
+   把扫描删掉 ⇒ (a) 变红；把记录改成回抄命中内容 ⇒ (d) 变红。
+3. **⭐ 五类规则各一条正向用例**：`AKIA[0-9A-Z]{16}` / `ghp_[A-Za-z0-9]{36}` / `xoxb-` /
+   `-----BEGIN RSA PRIVATE KEY-----` / ≥40 字符高熵串，**各自**都能被拦下并点名对应 pattern。
+4. **⭐⭐ D4 判别性（本包最容易做歪的一条）**：把 GT-4 那两条**逐字的**合法 anchor
+   （`web://…@fc246f0aff9b5c82971135989a5ff0f770210c488466534d16b6220652c1cb9b#L1` 与
+   `code://src/dispatch.ts@efebe270bf1e1fe88af4b9d47fc155ed068645ab#L1287`）
+   配正常 quote/claim 喂进发布路径 ⇒ **必须照常发布、零拦截**；
+   把高熵规则的排除逻辑去掉 ⇒ 该用例**变红**（证明排除是真起作用的，不是摆设）。
+   **反向**：把一个 `ghp_` 真形态塞进 anchor 的 locator 段 ⇒ **仍要被拦下**
+   （⛔ 证明不是对 anchor 字段整体豁免）。
+5. **⭐ K2 回归**：不含任何密钥形态的正常 evidence，发布行为与 base **逐字不变**
+   （条数、幂等键 `dr-evidence:<run_id>:<index>`、预算消耗、发布顺序）。
+6. **⛔ 断言打在生产组装出的 deps 上**：必须驱动 `harvestCard`，
+   检查 `publishEvidence` **实际收到/未收到**哪些 evidence；
+   ⛔ 不得只断言纯函数、⛔ 不得绕过装配链直接传参、⛔ 源码字符串匹配不构成证据。
 7. **回归**：`main` 上已有的一切行为逐字不变（E0 回归基线全套、E2b 活 URL 条目级拒发不连坐、
    E1 权威 digest / 去重 / content-clue 幂等 / 失败粒度下沉 / 串行化 / maxClues、
-   E1b spool 与 allowed_root、E1c 的 authority 机制 / anchorMismatches / range 归一 /
-   D5 blocked 断言 / D6 spool 根进运行记录）。
-8. **Z1（真机，派发方执行）**：`bash bin/e0-regression.sh` 仍退出 0、`prod_bus_guard_wrote=false`。
-9. **⭐⭐ Z2（真机，派发方执行）**：真派一条 content clue ⇒ 发到证据 channel 上的 anchor
-   **逐字**为 `web://<uri>@<64位digest>#<range>`，且 `<uri>` 段**不含任何** worker 拼进来的残渣。
+   E1b spool 与 allowed_root、E1c/E1d 的锚点权威机制与 `anchorMismatches`）。
+8. **Z1（真机，派发方执行）**：`bash bin/e0-regression.sh` 仍退出 0、`prod_bus_guard_wrote=false`，
+   且**证据照常发布**（⛔ 本包不得把正常链路误伤成零证据）。
 
-> 判据 8–9 由派发方在真机上验证。⚠️ 本线前两次（E1b / E1c）都栽在判据 9 上，
-> 每次都是 worker 换了一种字段布局。**D1 若仍读任何 worker 字段，第三次还会栽。**
+> 判据 8 由派发方在真机上验证。
 
 ## 3　⛔ 明确不做
 
 | 不做 | 理由 |
 |---|---|
-| 重做 E1c 的 `ContentAnchorAuthority` / `contentAnchor` / `anchorMismatches` / range 归一 | 已交付且判据 7 要求逐字保住；本包只换触发信号 |
-| 改 `agent-runtime` 的 persona 去「教 worker 填对字段」 | persona 只作纵深防御；GT-1 证明它不可靠。⛔ 本包不碰另一个仓 |
-| anchor-check 认 `web://`（核验侧） | **E3** |
+| 用模型判断是否是密钥 | 宪法第二条：闸门必须确定性 |
+| 改 persona 的自扫描纪律 | 保留作纵深防御，但机械闸门才是判据；⛔ 本包不碰 agent-runtime 仓 |
+| 对 clue / doc / transcript 也做扫描 | 本包只管 evidence 发布链路（spec §13.1 的范围）；扩面另议 |
+| anchor-check 认 `web://`（核验侧） | **E3**（并行包，katana 仓） |
 | 收工仲裁者 / 原子产物 / 驱动入口重写 | E5 / E4 / E7 |
 | 注册 protocol / 建 channel | 不可逆，拍板级 |
 
 ## 4　评审口径
 
-- **REJECT 只用于 blocker 级**：判定仍读 worker 字段、判据 2 的第四条不成立、
-  判别性缺失或方向钉反、越出 §1 范围、改坏判据 7 的既有行为。
-- ⚠️ 本线累计因「测试绕开被测对象」被驳回 10 次以上，且**本处闸门已被绕过两次**。
-  **判据 2–5 的测试必须驱动 `harvestCard` 并检查实际发布出去的 anchor。**
-- ⚠️ §0 的四组字段布局**都是真机跑出来的**，⛔ 不得改造它们去迁就实现。
+- **REJECT 只用于 blocker 级**：闸门可被绕过、拦截记录回抄了命中内容、判据 4 不成立
+  （高熵规则误伤合法 anchor，或对 anchor 整体豁免）、连坐了同卡其余证据、
+  判别性缺失或方向钉反、越出 §1 范围。
+- ⚠️ 本线累计因「测试绕开被测对象」被驳回 10 次以上。**判据 2–5 的测试必须驱动 `harvestCard`。**
+- ⚠️ §0 的 anchor 样本**都是真机跑出来的**，⛔ 不得改造它们去迁就实现。
 - reviewer 只读，判据 1–7 由 acceptance 命令的执行结果作证。
 - ⛔ 实现者不得写 `.dd-evidence/**` 与 `.dev-dispatch/**`。

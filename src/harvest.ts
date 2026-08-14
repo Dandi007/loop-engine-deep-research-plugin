@@ -21,6 +21,12 @@
  */
 import type { ClueV2, EvidenceV2 } from "./protocol";
 import { parseContentClueText } from "./ingest";
+import {
+  scanSecretFields,
+  type SecretFieldHit,
+  type SecretPatternName,
+  type SecretScanField,
+} from "./secret-scan";
 
 /** worker.result.v1 里一条 evidence 的最小视图（spec §1.3 / §7）。 */
 export interface WorkerEvidenceItem {
@@ -498,6 +504,64 @@ export interface EvidenceRejection {
 }
 
 /**
+ * E1k2 D5 ⭐ —— 一条 evidence 因命中凭证形态而被拒发的固定原因。
+ * ⛔ 固定文案：拦截记录里**不得**出现命中的内容本身（那等于把凭证换个地方再落一遍）。
+ */
+export const SECRET_PATTERN_REJECTION_REASON =
+  "evidence field matches a credential-shaped pattern (see patterns/fields); refusing to publish it to the append-only evidence channel, which has no DELETE";
+
+/**
+ * E1k2 D5 ⭐⭐ —— 一条 evidence 被凭证形态闸门拦下的记录（条目级，⛔ 不连坐同卡其余证据）。
+ *
+ * 记录内容严格限定为「**哪张卡、第几条、命中了哪些 pattern、在哪些字段**」：
+ * ⛔ 不含命中的串本身、⛔ 不回抄 `quote` 全文（与 `EvidenceRejection` 同纪律）。
+ * 否则这道闸门就成了「把凭证从证据 channel 搬进运行记录」的搬运工——两边都是留痕介质。
+ */
+export interface SecretPatternRejection {
+  /** 被拒发的 evidence 所属的卡（点名 clue_id，D5）。 */
+  clueId: string;
+  /** 该条 evidence 在 worker.result.v1.evidences 中的稳定序号（便于回查，⛔ 不回抄 quote）。 */
+  index: number;
+  /** 固定拒发原因（`SECRET_PATTERN_REJECTION_REASON`）。 */
+  reason: string;
+  /** 逐字段的命中明细：字段名 + 该字段命中的 pattern 名。 */
+  hits: SecretFieldHit[];
+  /** 命中的字段名（去重，便于聚合；D5 要求点名字段）。 */
+  fields: SecretScanField[];
+  /** 命中的 pattern 名（去重，便于聚合；D5 要求点名 pattern）。 */
+  patterns: SecretPatternName[];
+}
+
+/**
+ * E1k2 D4/D5 ⭐⭐ —— 发布前的凭证形态判定：扫 `quote` / `claim` / `anchor` 三字段。
+ *
+ * ⛔ 在 `publishEvidence` **之前**调用：证据 channel 是 append-only、没有 DELETE，
+ *    发出去就不可撤回（GT-1）。
+ *
+ * @returns 命中 ⇒ 一条拒发记录（⛔ 不含命中内容）；返回 null 表示三字段干净、可发布。
+ */
+export function secretPatternRejection(
+  clueId: string,
+  index: number,
+  evidence: EvidenceV2,
+): SecretPatternRejection | null {
+  const hits = scanSecretFields({
+    quote: evidence.quote,
+    claim: evidence.claim,
+    anchor: evidence.anchor,
+  });
+  if (hits.length === 0) return null;
+  return {
+    clueId,
+    index,
+    reason: SECRET_PATTERN_REJECTION_REASON,
+    hits,
+    fields: hits.map((h) => h.field),
+    patterns: [...new Set(hits.flatMap((h) => h.patterns))],
+  };
+}
+
+/**
  * E1c D1 / E1d D3——一条证据因**卡上没有权威元数据**而被拒发的原因（条目级，不连坐整卡）。
  * 两种命中形态，字面原因相同（都是"这张卡拼不出可核验的 content 锚点"）：
  *   - content 卡但 text 不是 `web://<uri>@<digest>` 形态 ⇒ D3 响亮失败；
@@ -620,6 +684,14 @@ export interface HarvestReport {
    */
   evidenceRejections: EvidenceRejection[];
   /**
+   * E1k2 D6 ⭐⭐ —— 被凭证形态闸门拦下的 evidence 记录（条目级，与 `evidenceRejections` 并列同构）。
+   *
+   * ⛔ 静默拦截即未交付：本数组是「这一轮为什么证据数少了」的唯一解释——
+   *    每条点名 clue_id、命中的 pattern 名与字段名（⛔ 不含命中内容、⛔ 不回抄 quote）。
+   *    `HarvestReport` 由 tick-entry 直接 JSON 落进运行记录，故拦截天然可观测。
+   */
+  secretRejections: SecretPatternRejection[];
+  /**
    * E1c D2 ⭐ —— worker 回报的锚点三件套与调度器侧权威值不一致的记录（条目级）。
    * ⛔ 不一致**不拒发**该条 evidence（quote 是对的，锚点由调度器补正）；
    * ⛔ 也不得静默丢弃这个不一致（那是持续观察 worker 行为的唯一窗口）。
@@ -658,6 +730,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      secretRejections: [],
       anchorMismatches: [],
       casExplored: false,
     };
@@ -712,6 +785,7 @@ export async function harvestCard(
       contentCluesBlocked: 0,
       skippedContentClues: 0,
       evidenceRejections: [],
+      secretRejections: [],
       anchorMismatches: [],
       casExplored: false,
     };
@@ -724,6 +798,7 @@ export async function harvestCard(
   let contentCluesBlocked = 0;
   let skippedContentClues = 0;
   const evidenceRejections: EvidenceRejection[] = [];
+  const secretRejections: SecretPatternRejection[] = [];
   const anchorMismatches: AnchorAuthorityMismatch[] = [];
   // E1d D1 ⭐⭐⭐——本卡的锚点策略（是不是 content 卡 + 调度器侧权威 `<uri>@<digest>`）。
   //   ⛔ 在循环外算一次，且**只**由卡算出：它是本卡所有 evidence 的路由信号，
@@ -776,6 +851,15 @@ export async function harvestCard(
       // ⛔ E2b 的活 URL 拒发判据在此路径**不适用**：锚点里的 `<digest>` 是调度器 spool 下来的
       //    transcript 的权威摘要，本身就是可回放快照（E2b 要防的正是"无快照的活页面引用"）。
       const evidence = evidenceFromWorker(card.clueId, item, policy);
+      // E1k2 D4 ⭐⭐——凭证形态闸门：扫 quote/claim/anchor 三字段，命中 ⇒ 该条不发布。
+      //   ⛔ 必须在 publishEvidence **之前**：证据 channel 是 append-only、没有 DELETE。
+      //   ⛔ 条目级（continue），不连坐同卡其余 evidence 与 clue（复用 E2b 的失败粒度纪律）。
+      //   注：content 锚点里的 `<digest>` 是标准摘要形态，D3 豁免使其不会被高熵规则误伤。
+      const contentSecret = secretPatternRejection(card.clueId, i, evidence);
+      if (contentSecret) {
+        secretRejections.push(contentSecret);
+        continue;
+      }
       await hd.publishEvidence(
         hd.evidenceChannelId,
         evidence,
@@ -812,6 +896,13 @@ export async function harvestCard(
       continue;
     }
     const evidence = evidenceFromWorker(card.clueId, item);
+    // E1k2 D4 ⭐⭐——凭证形态闸门（非 content 路径，与上方 content 路径同一道闸）。
+    //   ⛔ 在 publishEvidence 之前；命中 ⇒ 条目级拒发，不连坐整卡。
+    const secret = secretPatternRejection(card.clueId, i, evidence);
+    if (secret) {
+      secretRejections.push(secret);
+      continue;
+    }
     await hd.publishEvidence(
       hd.evidenceChannelId,
       evidence,
@@ -875,6 +966,7 @@ export async function harvestCard(
     contentCluesBlocked,
     skippedContentClues,
     evidenceRejections,
+    secretRejections,
     anchorMismatches,
     casExplored: true,
   };

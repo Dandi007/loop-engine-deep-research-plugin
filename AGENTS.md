@@ -20,7 +20,9 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 
 - [001 开发纪律](docs/constitution/001-development-discipline.md) —— 开发走 dd、不自造基建、**协议与 CAS 不变量**、**被测试钉死的文档**、验收面、文档纪律
 
-**`docs/specs/`** —— 设计与规格。**当前无条目**：设计 SSoT 在 work folder `wf-dc0c15`。
+**[`docs/specs/`](docs/specs/)** —— 设计与规格。
+
+- [001 declarative deployment contract](docs/specs/001-declarative-deployment-contract.md) —— C1 contract and preflight boundary.
 
 **其他（被测试按路径钉死，明确不迁、不适用 `NNN-` 命名）**
 

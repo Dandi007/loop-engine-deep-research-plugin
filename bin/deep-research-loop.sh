@@ -182,6 +182,17 @@ LOOP_ENGINE_CLI="${LOOP_ENGINE_CLI:-/data/code/self/loop-engine/dist/cli.js}"
 LOOP_STORE_CLI="${LOOP_STORE_CLI:-$(dirname "$LOOP_ENGINE_CLI")/lib/store-cli.js}"
 export LOOP_STORE_CLI
 
+# The supplied loop-engine build validates the current registry schema, while
+# the machine-wide legacy registry may still use the older chain-entry shape.
+# Prefer the registry shipped with the selected CLI when the caller did not
+# explicitly provide one; this keeps the driver and its dependency compatible.
+if [ -z "${LOOP_ENGINE_MODEL_REGISTRY:-}" ]; then
+  LOOP_ENGINE_MODEL_REGISTRY_CANDIDATE="$(dirname "$LOOP_ENGINE_CLI")/lib/model-registry.data.json"
+  if [ -f "$LOOP_ENGINE_MODEL_REGISTRY_CANDIDATE" ]; then
+    export LOOP_ENGINE_MODEL_REGISTRY="$LOOP_ENGINE_MODEL_REGISTRY_CANDIDATE"
+  fi
+fi
+
 if [ -n "$DRY_RUN" ]; then
   render
   cat "$RUNTIME_FLEET"

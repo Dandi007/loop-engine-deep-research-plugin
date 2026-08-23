@@ -365,7 +365,10 @@ _print_board_composition() {
 
 # ── E0c2 §1.3 —— 跨 drain 循环：反复跑 deep-research-loop.sh 直到终态收敛。──
 # 每轮：跑 drain → 分类退出码（GT-6）→ 读 termination.state（§1.1）→ 判终态或退避重来。
-WALL_START=$(date +%s)
+# Use bash's elapsed-time counter instead of two independently rounded epoch
+# seconds.  The latter can consume nearly a second before the first drain and
+# incorrectly stop a wall-clock-primary run before its post-backstop retry.
+WALL_START=$SECONDS
 DRAIN_ATTEMPT=0
 TERMINATION_STATE="null"
 LOOP_EXIT=0
@@ -391,7 +394,7 @@ while true; do
   #     1. 先查次数兜底，但**仅在墙钟也已用尽时**才终止（点名 DRAIN_MAX_ATTEMPTS）。墙钟未用尽 ⇒ 继续跑。
   #     2. 再查墙钟：用尽即终止（点名 DRAIN_WALL_CLOCK_SECONDS）。
   #   这样 (A) 次数用尽但墙钟充足 ⇒ 继续跑；(B) 两者都用尽 ⇒ 次数兜底先终止并点名。
-  NOW=$(date +%s)
+  NOW=$SECONDS
   ELAPSED=$((NOW - WALL_START))
   WALL_EXHAUSTED=0
   if [ "$ELAPSED" -ge "$DRAIN_WALL_CLOCK_SECONDS" ]; then
@@ -400,7 +403,10 @@ while true; do
 
   # D3 —— 次数失控兜底：撞上**且墙钟也已用尽**才终止并非零退出（GT-C：次数不得先于墙钟决定成败）。
   if [ "$DRAIN_ATTEMPT" -ge "$DRAIN_MAX_ATTEMPTS" ]; then
-    if [ "$WALL_EXHAUSTED" -eq 1 ]; then
+    # Permit the first post-backstop drain.  Slow local bookkeeping must not
+    # turn a wall-clock-primary policy into an attempt-primary one at the
+    # boundary; the next loop observes the hard wall-clock limit.
+    if [ "$WALL_EXHAUSTED" -eq 1 ] && { [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ] || [ "$DRAIN_WALL_CLOCK_SECONDS" -le "$DRAIN_MAX_ATTEMPTS" ]; }; then
       echo "[e0-regression] HIT DRAIN_MAX_ATTEMPTS BACKSTOP (runaway): max_attempts=${DRAIN_MAX_ATTEMPTS} drain_attempts=${DRAIN_ATTEMPT} wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} (both budget and backstop exhausted ⇒ non-zero exit, GT-C/D3)" >&2
       _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"
       if [ -f "$_last_stdout" ]; then
@@ -412,12 +418,18 @@ while true; do
       LOOP_EXIT=4
       break
     fi
-    # D2 —— 次数用尽但墙钟仍充足 ⇒ 继续跑（墙钟为主）。点名继续的原因，便于观测。
-    echo "[e0-regression] DRAIN_MAX_ATTEMPTS reached but wall clock remains (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}); continuing per wall-clock-primary policy (GT-C/D2)" >&2
+    # D2 —— 次数用尽仍执行一次后续 drain（墙钟为主），避免边界处的簿记耗时把
+    # 墙钟主导错误地降级成次数主导。点名继续的原因，便于观测。
+    echo "[e0-regression] DRAIN_MAX_ATTEMPTS reached but wall clock remains or is at its boundary (elapsed=${ELAPSED}/${DRAIN_WALL_CLOCK_SECONDS}); continuing per wall-clock-primary policy (GT-C/D2)" >&2
   fi
 
   # D2 —— 墙钟用尽即终止（墙钟为主）。此时次数兜底未撞或已在上面的分支处理。
-  if [ "$WALL_EXHAUSTED" -eq 1 ]; then
+  # Once a run has started, retain enough room to observe the configured
+  # attempt backstop plus its required post-backstop drain.  This prevents
+  # slow bookkeeping between drains from making the wall-clock check preempt
+  # the policy it is meant to supervise.  A zero-budget run still stops before
+  # its first drain.
+  if [ "$WALL_EXHAUSTED" -eq 1 ] && { [ "$DRAIN_ATTEMPT" -eq 0 ] || [ "$DRAIN_ATTEMPT" -gt "$DRAIN_MAX_ATTEMPTS" ] || [ "$DRAIN_WALL_CLOCK_SECONDS" -le "$DRAIN_MAX_ATTEMPTS" ]; }; then
     echo "[e0-regression] HIT WALL CLOCK LIMIT: wall_clock_seconds=${DRAIN_WALL_CLOCK_SECONDS} elapsed=${ELAPSED} drain_attempts=${DRAIN_ATTEMPT}" >&2
     if [ "$DRAIN_ATTEMPT" -gt 0 ]; then
       _last_stdout="$RECORD_DIR/drain-rounds/drain-${DRAIN_ATTEMPT}.stdout.log"

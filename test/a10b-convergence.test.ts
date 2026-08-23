@@ -202,6 +202,9 @@ async function runRealE2E(opts: {
         AGENT_BUS_URL: `http://127.0.0.1:${port}`,
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
+        // Keep the real drain independent of the host's generated registry, whose
+        // schema can lag behind the supplied loop-engine build.
+        LOOP_ENGINE_MODEL_REGISTRY: join(dirname(LOOP_ENGINE_CLI), "lib", "model-registry.data.json"),
         DD_RUN_ROOT: runRoot,
         // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
         // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。
@@ -256,8 +259,8 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       return;
     }
     it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
-      const { code, out } = await runRealE2E({});
-      expect(code).toBe(0);
+      const { code, out, err } = await runRealE2E({});
+      expect(code, err).toBe(0);
       const result = drainResult(out) as { reason?: string };
       expect(result.reason).toBe("drained");
     });
@@ -342,6 +345,7 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
         env: { EVIDENCE_CHANNEL: "research:p02-smoke-1dce60.evidence" },
       });
       rmSync(dir, { recursive: true, force: true });
+      expect(res.code, res.err).toBe(0);
       expect(res.out).toContain("drained");
       const msgs = await readChannel(res.port, "research:p02-smoke-1dce60.evidence");
       const evidence = msgs.filter((m) => (m as { kind?: string }).kind === "research.evidence.v2");

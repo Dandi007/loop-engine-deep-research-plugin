@@ -13,7 +13,7 @@
  *
  * B1/B2 是「真实端到端」：真实驱动脚本 + 真实 loop-engine CLI（bun 跑）+ 本地受控 agent-bus
  * （node 起的 127.0.0.1 假 bus，零外网）。⛔ 不打桩 fetch —— 产品代码走真实 HTTP 读一个本地 bus。
- * 依赖缺失（bun / loop-engine worktree / node）时以显式 it.skip 标记，绝不裸 return 静默通过。
+ * 依赖缺失（bun / loop-engine worktree / node）必须使 B1/B2 响亮失败，不能将冻结验收降级为 skip。
  */
 import { execFile, execFileSync, spawn } from "node:child_process";
 import {
@@ -49,7 +49,6 @@ function resolveBun(): string | undefined {
   return undefined;
 }
 const LOOP_ENGINE_CLI = "/data/worktrees/loop-engine-v1build/dist/cli.js";
-const HAS_REAL_DEPS = Boolean(resolveBun()) && existsSync(LOOP_ENGINE_CLI);
 
 const runningBuses: number[] = [];
 afterEach(() => {
@@ -202,6 +201,10 @@ async function runRealE2E(opts: {
         AGENT_BUS_URL: `http://127.0.0.1:${port}`,
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
+        // The supplied CLI prefers a machine-global registry whose chain entries
+        // are incompatible with this build. Exercise the CLI's bundled registry
+        // so these hermetic drain tests do not depend on host deployment state.
+        LOOP_ENGINE_MODEL_REGISTRY: join(dirname(LOOP_ENGINE_CLI), "lib", "model-registry.data.json"),
         DD_RUN_ROOT: runRoot,
         // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
         // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。
@@ -250,19 +253,14 @@ function state(over: Partial<BoardState> = {}): BoardState {
 // ⛔ 不得全局调大 testTimeout 掩盖别处卡死，⛔ 不得改回续投门或 skip/删用例。
 
 describe("B1: real end-to-end drain converges to reason='drained'", () => {
-  const guard = (fn: () => void) => {
-    if (!HAS_REAL_DEPS) {
-      it.skip("B1 requires bun + loop-engine worktree (explicit skip, not silent pass)", fn);
-      return;
-    }
-    it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
-      const { code, out } = await runRealE2E({});
-      expect(code).toBe(0);
-      const result = drainResult(out) as { reason?: string };
-      expect(result.reason).toBe("drained");
-    });
-  };
-  guard(() => {});
+  it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
+    expect(resolveBun(), "B1 requires bun").toBeTruthy();
+    expect(existsSync(LOOP_ENGINE_CLI), "B1 requires the supplied loop-engine worktree").toBe(true);
+    const { code, out } = await runRealE2E({});
+    expect(code).toBe(0);
+    const result = drainResult(out) as { reason?: string };
+    expect(result.reason).toBe("drained");
+  });
 });
 
 describe("B1-guard: dependency-missing B1 must not silently pass", () => {
@@ -282,15 +280,12 @@ describe("B1-guard: dependency-missing B1 must not silently pass", () => {
 // ── B2：真实端到端，收割发布 evidence 并回读常数 > 0 ──────────────
 
 describe("B2: real end-to-end harvest publishes evidence readable back from the channel", () => {
-  const guard = (fn: () => void) => {
-    if (!HAS_REAL_DEPS) {
-      it.skip("B2 requires bun + loop-engine worktree (explicit skip, not silent pass)", fn);
-      return;
-    }
-    it("drains and leaves research.evidence.v2 in the evidence channel", { timeout: 30000 }, async () => {
-      const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
-      const seed = join(dir, "seed.json");
-      writeFileSync(
+  it("drains and leaves research.evidence.v2 in the evidence channel", { timeout: 30000 }, async () => {
+    expect(resolveBun(), "B2 requires bun").toBeTruthy();
+    expect(existsSync(LOOP_ENGINE_CLI), "B2 requires the supplied loop-engine worktree").toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
+    const seed = join(dir, "seed.json");
+    writeFileSync(
         seed,
         JSON.stringify({
           "research:p02-smoke-1dce60": [
@@ -336,22 +331,20 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
           ],
           "research:p02-smoke-1dce60.evidence": [],
         }),
-      );
-      const res = await runRealE2E({
-        seedPath: seed,
-        env: { EVIDENCE_CHANNEL: "research:p02-smoke-1dce60.evidence" },
-      });
-      rmSync(dir, { recursive: true, force: true });
-      expect(res.out).toContain("drained");
-      const msgs = await readChannel(res.port, "research:p02-smoke-1dce60.evidence");
-      const evidence = msgs.filter((m) => (m as { kind?: string }).kind === "research.evidence.v2");
-      expect(evidence.length).toBeGreaterThan(0);
-      // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），
-      //    故增量 == 回读到的 evidence 条数；收割的 evidence+clue 发布都计入预算（src/tick-run.ts）。
-      expect(evidence.length).toBeLessThanOrEqual(5);
+    );
+    const res = await runRealE2E({
+      seedPath: seed,
+      env: { EVIDENCE_CHANNEL: "research:p02-smoke-1dce60.evidence" },
     });
-  };
-  guard(() => {});
+    rmSync(dir, { recursive: true, force: true });
+    expect(res.out).toContain("drained");
+    const msgs = await readChannel(res.port, "research:p02-smoke-1dce60.evidence");
+    const evidence = msgs.filter((m) => (m as { kind?: string }).kind === "research.evidence.v2");
+    expect(evidence.length).toBeGreaterThan(0);
+    // §2.1 —— 跑前跑后消息数增量 ≤ --max-writes（默认 5）。证据 channel 预置为空（head_seq 0），
+    //    故增量 == 回读到的 evidence 条数；收割的 evidence+clue 发布都计入预算（src/tick-run.ts）。
+    expect(evidence.length).toBeLessThanOrEqual(5);
+  });
 });
 
 // ── B3 / B4：判别对 —— 板面非终态 ⇒ 续投；全终态 ⇒ 不投 ───────────

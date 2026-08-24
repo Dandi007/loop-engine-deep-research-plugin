@@ -49,6 +49,7 @@ function resolveBun(): string | undefined {
   return undefined;
 }
 const LOOP_ENGINE_CLI = "/data/worktrees/loop-engine-v1build/dist/cli.js";
+const LOOP_ENGINE_MODEL_REGISTRY = join(dirname(LOOP_ENGINE_CLI), "lib", "model-registry.data.json");
 const HAS_REAL_DEPS = Boolean(resolveBun()) && existsSync(LOOP_ENGINE_CLI);
 
 const runningBuses: number[] = [];
@@ -202,6 +203,10 @@ async function runRealE2E(opts: {
         AGENT_BUS_URL: `http://127.0.0.1:${port}`,
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
+        // The supplied loop-engine eagerly loads its default external registry, whose
+        // chain selectors predate the required route field. Use its compatible bundled
+        // registry so this scheduling test can execute without selecting a model.
+        LOOP_ENGINE_MODEL_REGISTRY,
         DD_RUN_ROOT: runRoot,
         // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
         // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。

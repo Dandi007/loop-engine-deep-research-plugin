@@ -1,0 +1,7 @@
+{
+  "application": "deep-research",
+  "deploymentCommit": "HEAD",
+  "dependencies": ["node", "agent-bus"],
+  "roles": ["researcher", "dr-triage", "dr-synthesizer"],
+  "channels": ["research", "board:agent-runs"]
+}

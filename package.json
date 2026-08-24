@@ -12,6 +12,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "smoke:cas": "vitest run --config vitest.smoke.config.ts",
+    "preflight": "vite-node src/preflight.ts",
     "tick": "vite-node src/tick-entry.ts",
     "tick:help": "vite-node src/tick-entry.ts -- --help",
     "tick:selfcheck": "vite-node src/tick-entry.ts -- --selfcheck",

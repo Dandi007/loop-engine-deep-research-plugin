@@ -7,6 +7,7 @@ import {
   runBoundedChecks,
   type DeploymentContract,
 } from "../src/deployment-contract";
+import { runProbe } from "../src/preflight-probe";
 
 const contract = (name: string) => JSON.parse(readFileSync(resolve("profiles/deployment-contracts", name), "utf8")) as DeploymentContract;
 
@@ -14,7 +15,7 @@ describe("deployment contract preflight", () => {
   it("evaluates the Deep Research declaration green", () => {
     const dr = contract("deep-research.json");
     const result = evaluateDeploymentContract(dr, {
-      checkedOutCommit: "HEAD",
+      checkedOutCommit: dr.deploymentCommit,
       readyDependencies: dr.dependencies,
       dispatchableRoles: dr.roles,
       availableChannels: dr.channels,
@@ -26,7 +27,7 @@ describe("deployment contract preflight", () => {
   it("reports an explicit controlled Deep Research failure", () => {
     const dr = contract("deep-research.json");
     const result = evaluateDeploymentContract(dr, {
-      checkedOutCommit: "HEAD",
+      checkedOutCommit: dr.deploymentCommit,
       readyDependencies: dr.dependencies,
       dispatchableRoles: dr.roles,
       availableChannels: ["research"],
@@ -41,7 +42,7 @@ describe("deployment contract preflight", () => {
   it("uses the same generic evaluator for a second application", () => {
     const chatgroup = contract("chatgroup.json");
     const result = evaluateDeploymentContract(chatgroup, {
-      checkedOutCommit: "HEAD",
+      checkedOutCommit: chatgroup.deploymentCommit,
       readyDependencies: chatgroup.dependencies,
       dispatchableRoles: chatgroup.roles,
       availableChannels: chatgroup.channels,
@@ -49,9 +50,34 @@ describe("deployment contract preflight", () => {
     expect(result).toMatchObject({ application: "chatgroup", passed: true });
   });
 
+  it("requires the declared immutable deployment commit", () => {
+    const dr = contract("deep-research.json");
+    const result = evaluateDeploymentContract(dr, {
+      checkedOutCommit: "0".repeat(40),
+      readyDependencies: dr.dependencies,
+      dispatchableRoles: dr.roles,
+      availableChannels: dr.channels,
+    });
+    expect(dr.deploymentCommit).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.checks.find((check) => check.id === "checked-out-commit")).toMatchObject({ passed: false });
+  });
+
   it("turns a bounded timeout into a terminal attributable failed check", async () => {
     const [result] = await runBoundedChecks([{ id: "B2-role-probe", timeoutMs: 5, run: () => new Promise(() => {}) }]);
     expect(result).toEqual({ id: "B2-role-probe", passed: false, diagnostic: "timed out after 5ms" });
+  });
+
+  it("kills a probe that ignores SIGTERM when its timeout expires", async () => {
+    const [result] = await runBoundedChecks([{
+      id: "ignores-sigterm",
+      timeoutMs: 25,
+      run: (signal) => runProbe({
+        id: "ignores-sigterm",
+        timeoutMs: 25,
+        command: [process.execPath, "-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      }, signal),
+    }]);
+    expect(result).toEqual({ id: "ignores-sigterm", passed: false, diagnostic: "timed out after 25ms" });
   });
 
   it("includes declared bounded probes in the generic preflight result", async () => {
@@ -60,7 +86,7 @@ describe("deployment contract preflight", () => {
       ...dr,
       boundedChecks: [{ id: "B2-role-probe", timeoutMs: 5, command: ["role-probe"] }],
     }, {
-      checkedOutCommit: "HEAD",
+      checkedOutCommit: dr.deploymentCommit,
       readyDependencies: dr.dependencies,
       dispatchableRoles: dr.roles,
       availableChannels: dr.channels,

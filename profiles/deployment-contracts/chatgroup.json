@@ -1,6 +1,6 @@
 {
   "application": "chatgroup",
-  "deploymentCommit": "HEAD",
+  "deploymentCommit": "8a2a249d29eaa96fca378434d60f6d6f8922fdee",
   "dependencies": ["node", "agent-bus"],
   "roles": ["chat-moderator"],
   "channels": ["chatgroup", "board:agent-runs"]

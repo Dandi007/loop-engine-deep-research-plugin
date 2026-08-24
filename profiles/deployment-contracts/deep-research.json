@@ -3,5 +3,8 @@
   "deploymentCommit": "HEAD",
   "dependencies": ["node", "agent-bus"],
   "roles": ["researcher", "dr-triage", "dr-synthesizer"],
-  "channels": ["research", "board:agent-runs"]
+  "channels": ["research", "board:agent-runs"],
+  "boundedChecks": [
+    {"id": "node-runtime", "timeoutMs": 5000, "command": ["node", "--version"]}
+  ]
 }

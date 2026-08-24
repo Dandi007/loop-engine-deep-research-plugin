@@ -1078,7 +1078,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
 
   it("E0c10 D2: wall clock sufficient but attempts exhausted ⇒ entry keeps running (wall-clock-primary)", async () => {
     // 判据 2（判别性，本包最难的一条）：墙钟预算充足（wallClock 大）但 DRAIN_MAX_ATTEMPTS 已用尽 ⇒
-    //   入口必须继续跑（⛔ 不得次数优先）。构造：maxAttempts=2、wallClock=4（足够跑 >2 次快速 drain）、
+    //   入口必须继续跑（⛔ 不得次数优先）。构造：maxAttempts=2、wallClock=12（足够跑 >2 次快速 drain）、
     //   backoff=0。次数会在第 3 次迭代撞顶，但墙钟未用尽 ⇒ 继续跑，直到墙钟用尽才停。
     //   断言：drain_attempts > maxAttempts（继续跑过了次数上限），退出非零（墙钟最终用尽），
     //   消息点名 WALL CLOCK（次数未单独决定成败）。
@@ -1086,7 +1086,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
       "always-null",
       {
         maxAttempts: 2,
-        wallClockSeconds: 4,
+        wallClockSeconds: 12,
         backoffSeconds: 0,
         terminationStates: [
           { drainId: "fake-drain-null-1", state: null },
@@ -1094,7 +1094,7 @@ describe("判据 6 (GT-3 limits): always null termination hits limit (executing 
         ],
       },
     );
-    // E0c10 D2 —— 次数用尽但墙钟未用尽 ⇒ 继续跑。4 秒窗口内（backoff=0、fake drain 即时）
+    // E0c10 D2 —— 次数用尽但墙钟未用尽 ⇒ 继续跑。12 秒窗口内（backoff=0、fake drain 即时）
     //   会跑远多于 2 次 drain；为每个可能产生的 drain_id（null-1..null-40）预备 termination
     //   运行目录（state=null），使 read-termination 不在「继续跑」阶段误判为失败。
     for (let _i = 1; _i <= 40; _i++) {

@@ -202,6 +202,10 @@ async function runRealE2E(opts: {
         AGENT_BUS_URL: `http://127.0.0.1:${port}`,
         LOOP_ENGINE_CLI,
         LOOP_ENGINE_RUNNER: bun,
+        // The supplied CLI prefers a machine-global registry whose chain entries
+        // are incompatible with this build. Exercise the CLI's bundled registry
+        // so these hermetic drain tests do not depend on host deployment state.
+        LOOP_ENGINE_MODEL_REGISTRY: join(dirname(LOOP_ENGINE_CLI), "lib", "model-registry.data.json"),
         DD_RUN_ROOT: runRoot,
         // 真实 E2E 的测试板 channel（fake bus 上的字符串，非生产 smoke 板）。B2 把 clue 种在
         // 该 channel，TICK_CHANNEL 须指向它 tick 才读得到（D1 前由脚本缺省值提供同款语义）。

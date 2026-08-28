@@ -1,0 +1,33 @@
+{
+  "schema_version": "deep-research.mcp-tool.v1",
+  "name": "deep_research",
+  "description": "Launch deep research from one entry that routes to a session-level workflow (light tier) or full V2 loop-engine orchestration (heavy tier) by a documented fan-out scale threshold.",
+  "application": "deep-research",
+  "entry": "bin/deep-research.sh",
+  "input_schema": {
+    "type": "object",
+    "required": ["topic"],
+    "properties": {
+      "topic": {
+        "type": "string",
+        "description": "The research topic (a single natural-language question or subject)."
+      },
+      "sources": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 1,
+        "description": "Fan-out scale (number of named research sources). sources < 4 routes to the light tier (session-level workflow.js); sources >= 4 routes to the heavy tier (full V2 orchestration)."
+      },
+      "tier": {
+        "type": "string",
+        "enum": ["auto", "light", "heavy"],
+        "default": "auto",
+        "description": "Explicit tier override; 'auto' uses the documented scale threshold."
+      },
+      "profile": {
+        "type": "string",
+        "description": "Deploy profile for the heavy tier (default agent-harness). The heavy tier auto-completes profile selection and channel preparation with zero manual steps."
+      }
+    }
+  }
+}

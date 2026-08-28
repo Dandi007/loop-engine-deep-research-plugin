@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ⛔ C2 —— 内部实现细节（不是 user-facing entry）。
+# 用户/agent/人 一律走统一入口 bin/deep-research.sh（single entry，路由 light/heavy）。
+# 本脚本只承载 heavy tier（V2 全编排）的 loop 落地，直接调用视为「legacy direct-run path」
+# —— 已降级为内部实现，不再作为第二个面向用户的入口。
+
 # A7 —— deep-research loop 驱动脚本。
 # 渲染 workflows/deep-research/fleet.yaml.tpl → 调 loop-engine CLI。
 # --dry-run 只渲染并打印渲染结果（spec G1/G2）：不依赖 loop-engine CLI 可执行，

@@ -1,0 +1,9 @@
+{
+  "schema_version": "preflight-result.v1",
+  "phase": "preflight",
+  "status": "PASS",
+  "application": "deep-research",
+  "preflight_only": true,
+  "commit": "c76594d5f9e45a557b56044d585419a30a3113a8",
+  "digest": "sha256:a1d647fb22d40c88ed58b128bb95870fb813c14fc389024e51e6903158f4a8d5"
+}

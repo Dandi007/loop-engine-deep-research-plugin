@@ -27,6 +27,7 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 - [docs/deploy.md](docs/deploy.md) —— 部署四步。`test/d1-deploy-config.test.ts:247-249` 读它并**断言正文内容**，改它等于改验收面。
 - [`docs/dev-notes/`](docs/dev-notes/) —— 32 份 dd 单实施笔记。其中 `dev_ledr_a7_plugin_wiring_01.md` 与 `dev_ledr_a8e_harvest_01.md` 被 `test/plugin-wiring.test.ts:163`、`test/harvest.test.ts:415` 断言存在。
 - `workflows/deep-research/tick/templates/tick.md` —— 产品内容（注入 pipeline 的模板），被 `bin/deep-research-loop.sh` 依赖。
+- [`deploy/README.md`](deploy/README.md) —— 声明式部署契约（C1）：schema、声明、`preflight` 命令、失败即关断错误码、部署对齐证明。产物在 `deploy/contract/`（schema）、`deploy/declarations/`（声明）、`deploy/applications.json`（注册表）。
 
 ## 开发纪律
 

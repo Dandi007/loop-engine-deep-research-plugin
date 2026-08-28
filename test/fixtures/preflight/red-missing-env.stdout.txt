@@ -1,0 +1,9 @@
+{
+  "schema_version": "preflight-result.v1",
+  "phase": "preflight",
+  "status": "FAIL",
+  "application": "deep-research",
+  "preflight_only": true,
+  "error_code": "REQUIRED_ENV_MISSING",
+  "error": "required environment key(s) missing or empty: TICK_CHANNEL"
+}

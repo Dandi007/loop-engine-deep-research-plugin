@@ -1,0 +1,7 @@
+{
+  "schema_version": "application-registry.v1",
+  "applications": {
+    "deep-research": "declarations/deep-research.json",
+    "chatgroup-daemon": "declarations/chatgroup-daemon.json"
+  }
+}

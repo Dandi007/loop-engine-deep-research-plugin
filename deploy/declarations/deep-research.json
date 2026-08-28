@@ -1,0 +1,40 @@
+{
+  "schema_version": "application-declaration.v1",
+  "application": "deep-research",
+  "artifact": {
+    "ref": ".",
+    "commit": "c76594d5f9e45a557b56044d585419a30a3113a8"
+  },
+  "command": [
+    "bash",
+    "bin/deep-research-loop.sh",
+    "--profile",
+    "agent-harness"
+  ],
+  "working_directory": ".",
+  "required_environment": [
+    "TICK_CHANNEL",
+    "EVIDENCE_CHANNEL",
+    "ALLOWED_ROOT",
+    "CONTENT_SPOOL_ROOT",
+    "MAX_WRITES",
+    "RESEARCH_QUESTION",
+    "DOC_CHANNEL",
+    "RESEARCH_ORIGIN",
+    "ANCHOR_CHECK_BIN",
+    "EXPORT_ROOT"
+  ],
+  "health": {
+    "command": [
+      "bash",
+      "bin/deep-research-loop.sh",
+      "--profile",
+      "agent-harness",
+      "--dry-run"
+    ]
+  },
+  "rollback": {
+    "ref": ".",
+    "commit": "35cef84dfa813cd5bae83bd70fe32c7afce993a2"
+  }
+}

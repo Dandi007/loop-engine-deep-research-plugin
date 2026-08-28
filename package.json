@@ -16,7 +16,9 @@
     "tick:help": "vite-node src/tick-entry.ts -- --help",
     "tick:selfcheck": "vite-node src/tick-entry.ts -- --selfcheck",
     "tick:seed": "vite-node src/tick-entry.ts -- --seed",
-    "deep-research:dry-run": "bash bin/deep-research-loop.sh --dry-run"
+    "deep-research:dry-run": "bash bin/deep-research-loop.sh --dry-run",
+    "preflight": "vite-node src/preflight-entry.ts",
+    "preflight:only": "vite-node src/preflight-entry.ts --preflight-only"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

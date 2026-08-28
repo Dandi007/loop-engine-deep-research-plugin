@@ -20,6 +20,13 @@ bin/deep-research.sh "<研究主题>" --tier heavy   # full V2 orchestration
 - `sources < 4` → **light tier**（session-level `workflow.js`，单会话轻量研究）。
 - `sources >= 4` → **heavy tier**（V2 全编排，loop-engine 多轮调度）。
 
+## light tier —— 既有引擎，本入口只路由
+
+light tier 的 session-level `workflow.js` 是部署方落地的**既有实现**，本入口只加路由、
+不重新实现。非 dry-run 的 light 调用需经环境变量 `DEEP_RESEARCH_SESSION_WORKFLOW` 指向
+既有 workflow.js 的落地路径（`--topic` / `--sources` 会被原样转发）；未配置时入口响亮失败
+（`outcome=refused`，exit 2），不会伪造「研究完成」。
+
 ## heavy tier —— 一条命令，零手工步骤
 
 heavy 路径自动完成 profile 选择（缺省 `agent-harness`）与 channel 预备（per-topic

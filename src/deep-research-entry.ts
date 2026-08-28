@@ -20,6 +20,12 @@
  *   4. 非 dry-run：create-or-reuse channel，再以一条命令起 heavy loop
  *      （bin/deep-research-loop.sh --profile <profile>）。
  *
+ * light tier：
+ *   session-level `workflow.js` 是**既有实现**（spec C2 约束：本仓只加路由、不重新实现）。
+ *   非 dry-run 的 light 调用经 `DEEP_RESEARCH_SESSION_WORKFLOW` 指向既有 workflow.js 的落地
+ *   路径，并把 `--topic` / `--sources` 原样转发；未配置则响亮失败（outcome=refused，exit 2），
+ *   绝不内置空壳伪造「研究完成」。
+ *
  * 输出恒为单个机器可解析 JSON（stdout）。--help 打印用法 exit 0。
  */
 import { spawn } from "node:child_process";
@@ -36,7 +42,6 @@ import {
   HEAVY_TIER_MIN_SOURCES,
   DEFAULT_PROFILE,
   INVOCATION_SCHEMA_VERSION,
-  SESSION_WORKFLOW_DEFAULT,
 } from "./invocation";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -70,6 +75,8 @@ usage:
 
 The heavy tier auto-completes profile selection and channel preparation (create-or-reuse),
 with zero manual profile/channel steps. The C1 preflight runner gate refuses a non-green start.
+The light tier routes to the existing session-level workflow.js (pointed to by the
+DEEP_RESEARCH_SESSION_WORKFLOW env var) and refuses loudly if it is not configured.
 `;
 
 interface ParsedArgs {
@@ -153,23 +160,47 @@ export async function main(argv: string[]): Promise<number> {
   const decision = decideTier(parsed.topic, parsed.sources, parsed.tierOverride);
 
   if (decision.tier === "light") {
-    const workflow =
-      process.env.DEEP_RESEARCH_SESSION_WORKFLOW ?? SESSION_WORKFLOW_DEFAULT;
+    const workflow = process.env.DEEP_RESEARCH_SESSION_WORKFLOW;
     const doc = {
       schema_version: INVOCATION_SCHEMA_VERSION,
       tier: "light",
       topic: parsed.topic,
       sources: parsed.sources,
       reason: decision.reason,
-      session_workflow: workflow,
+      session_workflow: workflow ?? null,
       dry_run: parsed.dryRun,
     };
+    if (parsed.dryRun) {
+      process.stdout.write(JSON.stringify(doc, null, 2) + "\n");
+      return 0;
+    }
+    // ⛔ spec C2 约束：light 引擎是既有实现，本仓不重新实现、也不内置空壳。
+    //    非 dry-run 的 light 调用必须由部署方经 DEEP_RESEARCH_SESSION_WORKFLOW 指向既有
+    //    workflow.js，否则响亮失败（绝不伪造「research complete」）。--sources 一并转发。
+    if (!workflow) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            ...doc,
+            outcome: "refused",
+            error:
+              "light tier requires DEEP_RESEARCH_SESSION_WORKFLOW: this repo only routes to " +
+              "the existing session-level workflow.js (spec C2 constraint) and does not bundle " +
+              "a light engine; point DEEP_RESEARCH_SESSION_WORKFLOW at the deployed workflow path, " +
+              "or use --dry-run to plan only",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      return 2;
+    }
     process.stdout.write(JSON.stringify(doc, null, 2) + "\n");
-    if (parsed.dryRun) return 0;
-    const child = spawn("node", [workflow, "--topic", parsed.topic], {
-      cwd: REPO_ROOT,
-      stdio: "inherit",
-    });
+    const child = spawn(
+      "node",
+      [workflow, "--topic", parsed.topic, "--sources", String(parsed.sources)],
+      { cwd: REPO_ROOT, stdio: "inherit" },
+    );
     return await new Promise<number>((resolve) => {
       child.on("error", () => resolve(1));
       child.on("close", (code) => resolve(code ?? 1));

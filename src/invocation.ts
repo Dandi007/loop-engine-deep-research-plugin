@@ -29,10 +29,16 @@ export const HEAVY_TIER_MIN_SOURCES = 4;
  *  语义：heavy tier 的 profile 选择无需手工步骤。 */
 export const DEFAULT_PROFILE = "agent-harness";
 
-/** session-level 轻量引擎（light tier）的约定路径。外部部署可用
- *  DEEP_RESEARCH_SESSION_WORKFLOW 覆盖（指向既有 workflow.js 的落地位置）。
- *  ⛔ 本仓不重新实现 light 引擎（spec 约束），只路由到它。 */
-export const SESSION_WORKFLOW_DEFAULT = "workflows/deep-research/session/workflow.js";
+/**
+ * light tier 的 session-level 轻量引擎来自**既有实现**（部署方落地的 `workflow.js`），
+ * 经 `DEEP_RESEARCH_SESSION_WORKFLOW` 环境变量指向其真实路径。
+ *
+ * ⛔ spec C2 约束：本仓只加**路由入口**、不重新实现 light 引擎，因此不提供任何
+ *    内置的 workflow.js 缺省路径 —— 此前把 SESSION_WORKFLOW_DEFAULT 指向仓内不存在的
+ *    `workflows/deep-research/session/workflow.js`，导致非 dry-run 的 light 调用
+ *    module-not-found；而把仓内补一个「伪造成功」的空引擎又违反 spec。正确语义：
+ *    非 dry-run 的 light 调用若未配置 DEEP_RESEARCH_SESSION_WORKFLOW ⇒ 响亮失败。
+ */
 
 export type Tier = "light" | "heavy";
 

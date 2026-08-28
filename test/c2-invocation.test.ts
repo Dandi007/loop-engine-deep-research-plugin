@@ -141,7 +141,10 @@ describe("C2 (a): the SAME entry routes light vs heavy per scale rule", () => {
     expect(res.code).toBe(0);
     const doc = JSON.parse(res.out) as Record<string, unknown>;
     expect(doc.tier).toBe("light");
-    expect(String(doc.session_workflow)).toMatch(/workflow\.js/);
+    // ⛔ light 引擎是既有实现（不在本仓），dry-run 只报路由计划：未配置
+    //    DEEP_RESEARCH_SESSION_WORKFLOW 时 session_workflow 为 null，路由理由点名 workflow.js。
+    expect(doc.reason).toMatch(/workflow\.js/);
+    expect(doc.session_workflow).toBeNull();
     expect(doc.dry_run).toBe(true);
   });
 
@@ -153,12 +156,26 @@ describe("C2 (a): the SAME entry routes light vs heavy per scale rule", () => {
     expect(doc.preflight).toBeTruthy();
   });
 
-  it("sources below threshold, non-dry-run, reaches the real session workflow.js (exit 0)", () => {
+  it("sources below threshold, non-dry-run, without DEEP_RESEARCH_SESSION_WORKFLOW => refuses loudly (exit non-zero)", () => {
     const res = runEntry(["PPO vs SAC", "--sources", "2"]);
+    expect(res.code).not.toBe(0);
+    const doc = JSON.parse(res.out) as Record<string, unknown>;
+    expect(doc.tier).toBe("light");
+    expect(doc.outcome).toBe("refused");
+    expect(String(doc.error)).toMatch(/DEEP_RESEARCH_SESSION_WORKFLOW/);
+  });
+
+  it("sources below threshold, non-dry-run, with DEEP_RESEARCH_SESSION_WORKFLOW => spawns it with --topic AND --sources", () => {
+    const env = cleanEnv();
+    const record = join(mkdtempSync(join(tmpdir(), "c2-light-")), "argv.json");
+    env.DEEP_RESEARCH_SESSION_WORKFLOW = join(ROOT, "test", "fixtures", "session-workflow.js");
+    env.SESSION_RECORD_FILE = record;
+    const res = runEntry(["PPO vs SAC", "--sources", "2"], env);
     expect(res.code).toBe(0);
-    expect(res.out).toContain('"tier": "light"');
-    expect(res.out).toContain("session-complete");
-    expect(res.out).toContain("PPO vs SAC");
+    const rec = JSON.parse(readFileSync(record, "utf8")) as { argv: string[] };
+    // ⛔ 判别性：入口必须把 --topic 与 --sources 原样转发给既有 light 引擎，
+    //    不得只传 --topic（否则 fan-out scale 被静默丢回默认 1）。
+    expect(rec.argv).toEqual(["--topic", "PPO vs SAC", "--sources", "2"]);
   });
 });
 

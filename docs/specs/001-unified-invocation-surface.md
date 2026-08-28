@@ -19,6 +19,14 @@ legacy 双系统并存（两个并行入口）被消除。
 
 阈值常量唯一真相源：`src/invocation.ts:HEAVY_TIER_MIN_SOURCES`。
 
+## light tier —— 既有引擎，本仓只路由
+
+light tier 的 session-level `workflow.js` 是**既有实现**（部署方落地），本仓只加路由、
+不重新实现、也不内置空壳（spec C2 约束）。非 dry-run 的 light 调用经环境变量
+`DEEP_RESEARCH_SESSION_WORKFLOW` 指向既有 workflow.js 的落地路径，入口把 `--topic` 与
+`--sources` 原样转发；未配置 `DEEP_RESEARCH_SESSION_WORKFLOW` 时入口响亮失败
+（`outcome=refused`，exit 2），绝不伪造「研究完成」。
+
 ## heavy tier —— 一条命令，零手工步骤
 
 `bin/deep-research.sh "<topic>" --sources <n>`（heavy 分支）自动完成：

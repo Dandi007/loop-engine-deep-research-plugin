@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-aff1d8d764b3",
- "generation": 1,
+ "generation": 4,
  "acceptance_commands": [
   [
    "npm",
@@ -13,7 +13,9 @@
   ],
   [
    "npm",
-   "test"
+   "test",
+   "--",
+   "test/c1-preflight.test.ts"
   ],
   [
    "npm",

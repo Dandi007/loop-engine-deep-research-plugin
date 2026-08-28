@@ -19,6 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import {
   decideTier,
   deriveTopicChannels,
+  deriveResearchOrigin,
   planChannelPrep,
   HEAVY_TIER_MIN_SOURCES,
   DEFAULT_PROFILE,
@@ -113,6 +114,17 @@ describe("C2: deriveTopicChannels is deterministic and topic-scoped", () => {
   });
 });
 
+describe("C2: deriveResearchOrigin is deterministic and topic-scoped", () => {
+  it("same profile+topic => same origin; different topic => different origin", () => {
+    const a1 = deriveResearchOrigin("agent-harness", "PPO vs SAC");
+    const a2 = deriveResearchOrigin("agent-harness", "PPO vs SAC");
+    const b = deriveResearchOrigin("agent-harness", "另一项研究");
+    expect(a1).toBe(a2);
+    expect(a1).not.toBe(b);
+    expect(a1).toMatch(/^dr-agent-harness-[0-9a-f]{12}$/);
+  });
+});
+
 describe("C2: planChannelPrep splits desired channels into create vs reuse", () => {
   it("existing => reuse, absent => create", () => {
     const plan = planChannelPrep(["a", "c"], ["a", "b", "c"]);
@@ -139,6 +151,14 @@ describe("C2 (a): the SAME entry routes light vs heavy per scale rule", () => {
     const doc = JSON.parse(res.out) as Record<string, unknown>;
     expect(doc.tier).toBe("heavy");
     expect(doc.preflight).toBeTruthy();
+  });
+
+  it("sources below threshold, non-dry-run, reaches the real session workflow.js (exit 0)", () => {
+    const res = runEntry(["PPO vs SAC", "--sources", "2"]);
+    expect(res.code).toBe(0);
+    expect(res.out).toContain('"tier": "light"');
+    expect(res.out).toContain("session-complete");
+    expect(res.out).toContain("PPO vs SAC");
   });
 });
 
@@ -215,6 +235,24 @@ describe("C2 (d): legacy direct-run is no longer a user-facing entry", () => {
     );
     expect(skill).toMatch(/bin\/deep-research\.sh/);
   });
+
+  it("package.json + application declaration + AGENTS.md no longer expose the loop script as a user-facing entry", () => {
+    const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    for (const [name, cmd] of Object.entries(pkg.scripts)) {
+      expect(`${name} -> ${cmd}`).not.toContain("deep-research-loop.sh");
+    }
+    const decl = JSON.parse(
+      readFileSync(join(ROOT, "deploy", "declarations", "deep-research.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(JSON.stringify(decl.command)).toContain("bin/deep-research.sh");
+    expect(JSON.stringify(decl.command)).not.toContain("deep-research-loop.sh");
+    expect(JSON.stringify(decl.health)).toContain("bin/deep-research.sh");
+    expect(JSON.stringify(decl.health)).not.toContain("deep-research-loop.sh");
+    const agents = readFileSync(join(ROOT, "AGENTS.md"), "utf8");
+    expect(agents).not.toMatch(/驱动脚本.*deep-research-loop\.sh/);
+  });
 });
 
 // ── create-or-reuse 原语：对本地假 bus 的真集成 ────────────────────────
@@ -266,5 +304,60 @@ describe("C2 (b): ensureChannel create-or-reuse against a local fake bus", () =>
     expect(second.reused).toBe(true);
     const listed = (await listChannels()).map((c) => c.channel_id);
     expect(listed).toContain("research:c2-prep.index");
+  });
+});
+
+// ── 真实 CLI：heavy 路径驶过 --dry-run，topic 真进引擎 + create-or-reuse 真发生 ──
+
+describe("C2 (b): heavy path past --dry-run wires the caller's topic into the engine", () => {
+  let heavyPort = 0;
+  let heavyBus: ChildProcess | null = null;
+  let recordFile = "";
+
+  beforeAll(async () => {
+    heavyPort = await startFakeBus();
+    heavyBus = fakeBus;
+    recordFile = join(mkdtempSync(join(tmpdir(), "c2-heavy-")), "loop-env.txt");
+  });
+
+  afterAll(() => {
+    heavyBus?.kill("SIGKILL");
+  });
+
+  function heavyEnv(): NodeJS.ProcessEnv {
+    const env = cleanEnv();
+    env.AGENT_BUS_URL = `http://127.0.0.1:${heavyPort}`;
+    const tok = join(mkdtempSync(join(tmpdir(), "c2-heavy-tok-")), "token");
+    writeFileSync(tok, "test-token");
+    env.AGENT_BUS_TOKEN_FILE = tok;
+    env.DEEP_RESEARCH_LOOP_SCRIPT = join(ROOT, "test", "fixtures", "loop-recorder.sh");
+    env.LOOP_RECORD_FILE = recordFile;
+    return env;
+  }
+
+  it("creates/reuses channels through the entry and maps the topic to RESEARCH_QUESTION/RESEARCH_ORIGIN", () => {
+    const env = heavyEnv();
+    // ⛔ 自证子环境里没有相关 env（否则会掩盖「topic 映到引擎」这一层语义）。
+    for (const k of STRIP) expect(env).not.toHaveProperty(k);
+    const res = runEntry(["PPO vs SAC", "--sources", "5"], env);
+    expect(res.code).toBe(0);
+    const doc = JSON.parse(res.out) as Record<string, unknown>;
+    expect(doc.tier).toBe("heavy");
+    expect(doc.outcome).toBe("prepared");
+    const prep = doc.channels_prepared as Array<Record<string, unknown>>;
+    expect(prep.length).toBe(4);
+    expect(prep.some((p) => p.created === true)).toBe(true);
+    const rec = readFileSync(recordFile, "utf8");
+    const kv: Record<string, string> = {};
+    for (const line of rec.split("\n")) {
+      const i = line.indexOf("=");
+      if (i < 0) continue;
+      kv[line.slice(0, i)] = line.slice(i + 1);
+    }
+    expect(kv.research_question).toBe("PPO vs SAC");
+    expect(kv.research_origin).toBe(deriveResearchOrigin("agent-harness", "PPO vs SAC"));
+    expect(kv.tick_channel).toBe(deriveTopicChannels("agent-harness", "PPO vs SAC").index);
+    expect(kv.evidence_channel).toBe(deriveTopicChannels("agent-harness", "PPO vs SAC").evidence);
+    expect(kv.doc_channel).toBe(deriveTopicChannels("agent-harness", "PPO vs SAC").docs);
   });
 });

@@ -7,9 +7,7 @@
   },
   "command": [
     "bash",
-    "bin/deep-research-loop.sh",
-    "--profile",
-    "agent-harness"
+    "bin/deep-research.sh"
   ],
   "working_directory": ".",
   "required_environment": [
@@ -27,10 +25,8 @@
   "health": {
     "command": [
       "bash",
-      "bin/deep-research-loop.sh",
-      "--profile",
-      "agent-harness",
-      "--dry-run"
+      "bin/deep-research.sh",
+      "--help"
     ]
   },
   "rollback": {

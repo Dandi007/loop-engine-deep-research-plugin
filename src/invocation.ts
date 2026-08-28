@@ -126,6 +126,33 @@ export function deriveTopicChannels(
   };
 }
 
+/**
+ * heavy tier 的研究 origin（report 的 origin 字段）派生：
+ *   同一 profile + 同一 topic ⇒ 同一 origin（可复现、可复用）；不同 topic ⇒ 不同 origin。
+ * 形如 `dr-<profileName>-<topicHash>`；`<topicHash>` 是 sha256(`<profileName>\n<topic>`) 的前 12 hex。
+ *
+ * 入口据此把调用方 topic 映射到 RESEARCH_ORIGIN，避免沿用 profile 里 stale 的 origin
+ * （否则一次研究把 topic 写进新 channel 名、却用旧 origin 出报告，bus append-only 不可回退）。
+ *
+ * 纯函数：不触 IO，只做命名推导。供入口与测试复用。
+ */
+export function deriveResearchOrigin(
+  profileName: string,
+  topic: string,
+): string {
+  if (!profileName) {
+    throw new Error("deriveResearchOrigin requires a non-empty profile name");
+  }
+  if (!topic || !topic.trim()) {
+    throw new Error("deriveResearchOrigin requires a non-empty topic");
+  }
+  const hash = createHash("sha256")
+    .update(`${profileName}\n${topic}`)
+    .digest("hex")
+    .slice(0, 12);
+  return `dr-${profileName}-${hash}`;
+}
+
 export interface ChannelPrepPlan {
   /** 需要在 bus 上新建的 channel。 */
   create: string[];

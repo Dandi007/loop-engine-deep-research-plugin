@@ -23,7 +23,7 @@
  * 输出恒为单个机器可解析 JSON（stdout）。--help 打印用法 exit 0。
  */
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPreflight } from "./preflight";
 import { ensureChannel, listChannels } from "./bus";
@@ -31,6 +31,7 @@ import { RUNS_CHANNEL_ID } from "./run-channels";
 import {
   decideTier,
   deriveTopicChannels,
+  deriveResearchOrigin,
   loadProfileEnv,
   HEAVY_TIER_MIN_SOURCES,
   DEFAULT_PROFILE,
@@ -40,7 +41,14 @@ import {
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PROFILES_DIR = join(REPO_ROOT, "profiles", "deploy");
-const LOOP_SCRIPT = join(REPO_ROOT, "bin", "deep-research-loop.sh");
+// C2 —— heavy tier 的 loop 落地脚本（内部实现细节）。可用 DEEP_RESEARCH_LOOP_SCRIPT 覆盖
+// （测试注入用，观察 loop 收到的 env/argv，不启动真实 loop-engine；生产路径不变）。
+const LOOP_SCRIPT_OVERRIDE = process.env.DEEP_RESEARCH_LOOP_SCRIPT;
+const LOOP_SCRIPT = LOOP_SCRIPT_OVERRIDE
+  ? (isAbsolute(LOOP_SCRIPT_OVERRIDE)
+      ? LOOP_SCRIPT_OVERRIDE
+      : resolve(REPO_ROOT, LOOP_SCRIPT_OVERRIDE))
+  : join(REPO_ROOT, "bin", "deep-research-loop.sh");
 
 const USAGE = `deep-research unified entry (single entry, light/heavy routing)
 
@@ -181,6 +189,11 @@ export async function main(argv: string[]): Promise<number> {
   env.TICK_CHANNEL = channels.index;
   env.EVIDENCE_CHANNEL = channels.evidence;
   env.DOC_CHANNEL = channels.docs;
+  // C2 —— 把调用方 research topic 映到引擎主问题与 origin：否则 loop 会用 profile 里硬编码的
+  // stale question/origin 研究错题（topic 只进了 channel 名、没进引擎语义，bus append-only 不可回退）。
+  const researchOrigin = deriveResearchOrigin(profile, parsed.topic);
+  env.RESEARCH_QUESTION = parsed.topic;
+  env.RESEARCH_ORIGIN = researchOrigin;
 
   // preflight 闸门（fail-closed）：非 PASS 即拒绝起 heavy loop。
   const preflight = runPreflight({ app: "deep-research", preflightOnly: true, env });
@@ -193,6 +206,8 @@ export async function main(argv: string[]): Promise<number> {
     reason: decision.reason,
     profile,
     channels,
+    research_question: parsed.topic,
+    research_origin: researchOrigin,
     dry_run: parsed.dryRun,
     preflight: preflight.result,
   };

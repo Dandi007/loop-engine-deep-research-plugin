@@ -6,7 +6,7 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 
 - **插件入口**：`src/tick-entry.ts`（`package.json` 的 `main` / `exports`）。
 - **常用命令**：`npm run tick`、`tick:help`、`tick:selfcheck`、`tick:seed`（均为 `vite-node src/tick-entry.ts -- ...`）。
-- **驱动脚本**：`bin/deep-research-loop.sh`。**workflow 与模板**：`workflows/deep-research/`。**profile**：`profiles/`。
+- **统一入口**：`bin/deep-research.sh`（single entry，路由 light/heavy）。**heavy tier loop 落地（内部实现细节，非用户入口）**：`bin/deep-research-loop.sh`。**workflow 与模板**：`workflows/deep-research/`。**profile**：`profiles/`。
 - **验收**：`npm test`（vitest）、`npm run typecheck`、**`npm run smoke:cas`**（CAS 认领专测，`vitest.smoke.config.ts`）。
 - **协议**：`research.clue.v2`（线索，有版本链）、`research.evidence.v2`(证据，leaf 不可变)、`research.doc.v2`（长文本，leaf 不可变）。
 - **依赖的既有基建**：agent-bus（板面读写与协议校验）、agent-runtime / subagent-mcp（worker 派发）、loop-engine（`superviseDrain`、lock、node）。本仓不自造这三样。

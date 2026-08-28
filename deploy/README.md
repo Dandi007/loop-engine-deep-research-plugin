@@ -88,3 +88,41 @@ preflight 输出恒为 `phase:"preflight"`，**从不出现在部署动作发生
 
 原始 stdout/stderr 快照见 `test/fixtures/preflight/green-deep-research.stdout.txt` 等
 （由 `test/c1-preflight.test.ts` 确定性重写出，是验收证据而非散文示例）。
+
+## 8　C1 验收边界与全仓 `npm test` 的既有失败
+
+C1 的验收面是 preflight 契约本身，对应 scoped 测试 **`test/c1-preflight.test.ts`**
+（GREEN/RED 两条 + fail-closed 各错误码），辅以 `npm run typecheck` 与 `npm run smoke:cas`；
+验收命令为 `npm test -- test/c1-preflight.test.ts`。全仓 `npm test`（`vitest run`，无 scoping）
+当前有 **2 个与 C1 无关的既有失败**：
+
+- `test/a10b-convergence.test.ts` —— **B1**「empty terminal board through the real driver drains with reason=drained」
+- `test/a10b-convergence.test.ts` —— **B2**「drains and leaves research.evidence.v2 in the evidence channel」
+
+根因是**外部 loop-engine 构建与外部 model-registry 的版本错配**，与部署契约/preflight 无关：
+
+- 该用例硬编码 `LOOP_ENGINE_CLI=/data/worktrees/loop-engine-v1build/dist/cli.js`
+  （`test/a10b-convergence.test.ts:51`）；该 worktree 的 `dist` 构建于 2026-08-04，
+  其 `lib/model-registry.js` 仍要求 selector 的 `route` 为**非空字符串**；
+- 外部 `/data/loop-engine/config/model-registry.json` 已含 `kind="chain"` 且**无 `route`**
+  的新格式条目（如 `claude-opus-4-8@claude/chain`），旧 CLI 校验时抛
+  `model-registry: selector "claude-opus-4-8@claude/chain" 缺/空字段 "route"`，`drain` 退出 1，
+  故 B1 的 `expect(code).toBe(0)` 与 B2 的 `expect(res.out).toContain("drained")` 都拿不到 drained 终局。
+
+既有性证据（可复现）：B1/B2 依赖的整条 E2E 链路——`test/a10b-convergence.test.ts`、
+`bin/deep-research-loop.sh`、`test/fixtures/fake-bus.mjs`、`scripts/render-template.mjs`、
+`src/tick.ts`、`src/tick-run.ts`、`src/harvest.ts`、`workflows/deep-research/**`、`profiles/**`——
+全部继承自冻结基线 `c76594d5`，C1 提交 `447aced` 的 diff 不触及其中任何文件
+（只新增 `deploy/**`、`src/preflight*`、`test/c1-preflight.test.ts`、`test/fixtures/preflight/**`
+并给 `package.json` 加两条脚本）：
+
+```bash
+git diff c76594d5f9e45a557b56044d585419a30a3113a8 447acede49334c780ae728fdf3d7de3a1bae7691 \
+  -- test/a10b-convergence.test.ts bin/deep-research-loop.sh test/fixtures/fake-bus.mjs \
+     scripts/render-template.mjs src/tick.ts src/tick-run.ts src/harvest.ts \
+     workflows/deep-research profiles
+```
+
+输出为空（无 C1 改动），故这 2 个失败在基线即已存在、与 C1 无关。待该 loop-engine
+worktree 更新/重建（或改用已支持 `chain` 格式的构建）后，B1/B2 恢复绿色，属部署环境维保，
+不在 C1 交付范围内。

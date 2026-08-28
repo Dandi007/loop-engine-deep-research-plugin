@@ -23,6 +23,7 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 **`docs/specs/`** —— 设计与规格。
 
 - [001 统一调用面](docs/specs/001-unified-invocation-surface.md) —— single entry（`bin/deep-research.sh`），light/heavy 路由、one-command heavy、MCP tool + skill + CLI 三条调用面、legacy direct-run 降级（C2）。
+- [002 单一真相源协议契约](docs/specs/002-protocol-contract-single-source.md) —— 消费侧 schema 从 agent-bus 注册表（按 `contract_digest`）推导/校验，no hand-copied allowlist（C4）。
 
 **其他（被测试按路径钉死，明确不迁、不适用 `NNN-` 命名）**
 

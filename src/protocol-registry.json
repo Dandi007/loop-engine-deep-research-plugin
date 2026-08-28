@@ -1,0 +1,85 @@
+{
+  "contract_version": "research-protocols.v2",
+  "source": "agent-bus registry GET /v1/protocols/<kind> (committed snapshot; refetchable and re-verifiable live)",
+  "protocols": {
+    "research.clue.v2": {
+      "kind": "research.clue.v2",
+      "entity_role": "root",
+      "refs_required": false,
+      "description": "线索——唯一有状态机的东西。root entity，版本链。",
+      "payload_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "assignee": { "description": "in_flight 时填 role 名", "type": "string" },
+          "depth": { "description": "种子=0，每层派生 +1", "type": "integer" },
+          "parent": { "description": "派生自哪条 clue 的 entity_id", "type": "string" },
+          "rationale": { "description": "dropped / blocked 的理由", "type": "string" },
+          "run_id": { "description": "in_flight 时填 agent-run 的 run_id", "type": "string" },
+          "sources": {
+            "description": "封闭枚举的子集",
+            "items": { "type": "string" },
+            "type": "array"
+          },
+          "status": {
+            "description": "proposed|open|in_flight|explored|dropped|blocked",
+            "type": "string"
+          },
+          "text": { "description": "一个可独立探索的问题面", "type": "string" }
+        },
+        "required": ["text", "status", "depth", "sources"],
+        "type": "object"
+      },
+      "schema_digest": "sha256:145b54d8122b6d59f4c03e7811cf03afde0f0d2180e37c1a8156e177d6dd5362",
+      "contract_digest": "sha256:d58cf0b220dab6e5e7676b641ab7c23128d26dd5f6c5adc8f98a8591498e62f1"
+    },
+    "research.evidence.v2": {
+      "kind": "research.evidence.v2",
+      "entity_role": "leaf",
+      "refs_required": false,
+      "description": "证据——锚定原文+一句话结论的原子单位。合并了旧的 finding 与 excerpt。",
+      "payload_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "anchor": { "description": "带版本 URI，见 spec §5.2", "type": "string" },
+          "claim": { "description": "这处原文支持的一句话结论", "type": "string" },
+          "clue_id": { "description": "所属 clue 的 entity_id", "type": "string" },
+          "quote": { "description": "逐字原文，一条一处", "type": "string" }
+        },
+        "required": ["clue_id", "anchor", "quote", "claim"],
+        "type": "object"
+      },
+      "schema_digest": "sha256:280b51e984c1bfd8b4b55c5ef55b889ce28a64138f01cda3ae07039e366635a8",
+      "contract_digest": "sha256:4ce469eb28b1de2351355cd41c062c955cb4205ad6d1990b4d03a8e664c6154e"
+    },
+    "research.doc.v2": {
+      "kind": "research.doc.v2",
+      "entity_role": "leaf",
+      "refs_required": false,
+      "description": "长文本——转写件/报告/论辩稿。对调度器不透明，只按 id 引用。",
+      "payload_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "body": { "description": "正文即消息体，≤ 4MB", "type": "string" },
+          "digest": { "description": "内容摘要，transcript 用它做全局去重键", "type": "string" },
+          "doc_kind": { "description": "transcript|report|argument", "type": "string" },
+          "origin": { "description": "transcript=源 URI；report/argument=研究 id", "type": "string" }
+        },
+        "required": ["doc_kind", "digest", "body", "origin"],
+        "type": "object"
+      },
+      "schema_digest": "sha256:dbae905682f638d0b58c5a7cc90b1a7e2ac1d4de7b641823bb8cf8e2d6a7b311",
+      "contract_digest": "sha256:3e437690ecee071ddd543475e2423148b866253293ca7810803f7e5b4b1fb62e"
+    }
+  },
+  "clue_state_machine": {
+    "source": "plugin-owned extension layered on top of the agent-bus contract. agent-bus's contract (kind + payload_schema + entity_role + refs_required + description) captures the shapes and the status VALUE allowlist, not the transition graph. The status values below are verified equal to the research.clue.v2 status enum derived from the registered schema.",
+    "transitions": {
+      "proposed": ["open", "dropped"],
+      "open": ["in_flight", "blocked"],
+      "in_flight": ["explored", "open", "blocked"],
+      "explored": [],
+      "dropped": [],
+      "blocked": []
+    }
+  }
+}

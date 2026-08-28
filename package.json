@@ -18,7 +18,9 @@
     "tick:seed": "vite-node src/tick-entry.ts -- --seed",
     "deep-research:dry-run": "bash bin/deep-research.sh 'smoke dry-run' --sources 5 --dry-run",
     "preflight": "vite-node src/preflight-entry.ts",
-    "preflight:only": "vite-node src/preflight-entry.ts --preflight-only"
+    "preflight:only": "vite-node src/preflight-entry.ts --preflight-only",
+    "generate:protocol": "vite-node scripts/generate-protocol.ts",
+    "verify:protocol": "vite-node scripts/verify-protocol.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.2",

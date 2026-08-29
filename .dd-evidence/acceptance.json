@@ -1,0 +1,45 @@
+{
+ "development_id": "dev-fg-d87f51a4cb25",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "npm",
+    "ci"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\nadded 49 packages, and audited 50 packages in 2s\n\n13 packages are looking for funding\n  run `npm fund` for details\n\n6 vulnerabilities (3 moderate, 2 high, 1 critical)\n\nTo address issues that do not require attention, run:\n  npm audit fix\n\nTo address all issues (including breaking changes), run:\n  npm audit fix --force\n\nRun `npm audit` for details.\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\n> loop-engine-deep-research-plugin@0.1.0 typecheck\n> tsc --noEmit\n\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "npm",
+    "test"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "er non-zero exit code (e.g. 3) ⇒ immediate failure, non-zero exit, does not retry 5515ms\n   ✓ 判据 6b (GT-6): max_rounds exit 1 classification (executing e0-regression.sh) > unparseable drain output ⇒ immediate failure, non-zero exit, does not retry 4283ms\n   ✓ 判据 4 (GT-4): empty board with null termination ⇒ still triggers continuation > hasPendingWork=false, state=null, capHit=false ⇒ continuation triggered 962ms\n   ✓ 判据 4 (GT-4): empty board with null termination ⇒ still triggers continuation > discriminant: changing gate to hw-only stops continuation when hasPendingWork=false 938ms\n   ✓ 判据 5 (GT-3): cross-drain loop until convergence (executing e0-regression.sh) > first drain null, second drain converged ⇒ runs both, exits 0 7047ms\n   ✓ 判据 5 (GT-3): cross-drain loop until convergence (executing e0-regression.sh) > discriminant: if the implementation only ran one drain, null termination would NOT exit 0 7475ms\n   ✓ 判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh) > always null ⇒ both budget and backstop exhausted ⇒ non-zero exit naming the backstop (D3) 3450ms\n   ✓ 判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh) > E0c10 D2: wall clock sufficient but attempts exhausted ⇒ entry keeps running (wall-clock-primary) 7225ms\n   ✓ 判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh) > always null ⇒ hits wall clock limit, non-zero exit naming the limit 3276ms\n   ✓ 判据 6 (GT-3 limits): always null termination hits limit (executing e0-regression.sh) > discriminant: never infinite loops (test completes in finite time) 5843ms\n   ✓ E0c3b 判据 4: board composition and triage deadlock naming on limit hit > limit hit with proposed>0 prints board composition and TRIAGE THRESHOLD DEADLOCK 5664ms\n\n Test Files  46 passed (46)\n      Tests  846 passed (846)\n   Start at  18:54:37\n   Duration  82.81s (transform 5.38s, setup 0ms, collect 16.34s, tests 233.28s, environment 18ms, prepare 8.83s)\n\n",
+   "stderr_tail": "NT_SPOOL_ROOT（tmpdir 下兜底）。⛔ D7：不得落 vault 根 / .dev-dispatch/**。\n                     G4b——--prev-coverage/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经\n                             本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；\n                             JSON 输出含 termination（与 hasPendingWork 并列）。\n                     G4c——--origin 与 --doc-channel 由 tick.md 从 {{research_origin}}/{{doc_channel}} 传入；\n                             --origin 已配置且 termination.state !== null ⇒ runGenerate 被调用；\n                             --one-shot-dir 跨进程一次性标记目录（缺省 tmpdir/deep-research-generated）。\n... --parse-trigger-body <body_json>\n                      G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：\n                      tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为\n                      统一调用 parseTerminationFromBody，单源真相）。\n                      输出（stdout，换行分隔）：首轮 body（{\"seed\":true}）⇒ 空串（调用方不传 --prev-*）；\n                      续投 body（含 coverage/zeroGrowthRounds）⇒ \"--prev-coverage\n<n>\n--prev-zero-growth\n<m>\n\"。\n                      body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。\n\n--help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。\n--inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。\n--run 对显式传入的 channel 执行 CAS 认领/回收 + spawn + 收割（接线判别）：先 CAS 成功才按 role spawn，\n      spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；\n       --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 DEFAULT_MAX_WRITES（--max-writes，A10c 起足以收割一张真实卡）；\n       --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；\n       --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；\n       --prev-coverage/--prev-zero-growth 上一 tick 的覆盖度/零增长轮数（跨 tick 终止计数，由续投 trigger body 承载）；\n        拒绝写 v1 冻结 channel。\n  JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。\n  JSON 输出含 termination：本轮终态判定（G4b，用本轮真实板面调用 decideTermination；coverage/zeroGrowthRounds 续投时写入下一条 trigger body）。\n"
+  },
+  {
+   "command": [
+    "npm",
+    "run",
+    "smoke:cas"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\n> loop-engine-deep-research-plugin@0.1.0 smoke:cas\n> vitest run --config vitest.smoke.config.ts\n\n\n RUN  v2.1.9 /data/worktrees/ledr-c6-sentinel-loud-h0-20260829\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ① publish message_id=msg_01KZ6FT90ZH11S18KH3FQZ4CE3 channel_seq=4 entity_id=msg_01KZ6FT90ZH11S18KH3FQZ4CE3 deduplicated=true\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ② claim success=false messageId=n/a error=conflict\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ③ claim success=false messageId=n/a error=conflict\n\n ✓ scripts/smoke-cas.ts (1 test) 86ms\n\n Test Files  1 passed (1)\n      Tests  1 passed (1)\n   Start at  18:56:01\n   Duration  796ms (transform 107ms, setup 0ms, collect 83ms, tests 86ms, environment 0ms, prepare 96ms)\n\n",
+   "stderr_tail": ""
+  }
+ ]
+}

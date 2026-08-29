@@ -10,6 +10,7 @@
  */
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
+import { SOURCE_ENUM } from "./tick";
 
 /** 调用面结果 schema 版本。 */
 export const INVOCATION_SCHEMA_VERSION = "deep-research-invocation.v1";
@@ -157,6 +158,52 @@ export function deriveResearchOrigin(
     .digest("hex")
     .slice(0, 12);
   return `dr-${profileName}-${hash}`;
+}
+
+/**
+ * C5 —— 一条由研究请求派生出的种子线索（fan-out 一一对应）。
+ * `text` 是真实研究子问题（非空、非占位）；`sources` 是这条线索要派发的 worker source 类型。
+ */
+export interface SeedClue {
+  text: string;
+  sources: string[];
+}
+
+/**
+ * C5 —— 把一次研究请求按 fan-out（`sourceCount`）确定性派生为一组种子线索。
+ *
+ * 规则（确定性、不交模型裁量）：
+ *   - sourceCount 条请求 source ⇒ 恰 sourceCount 条种子线索（一一对应，spec C5 §1）。
+ *   - 第 i 条线索的 worker source 类型 = `SOURCE_ENUM[i % SOURCE_ENUM.length]`（封闭枚举循环，
+ *     与 src/tick.ts 的 sources→role 映射同一真相源）；首条恒为 `code-local`（repo 可读、可派发）。
+ *   - 每条线索文本是**真实的研究子问题**（嵌入调用方 topic，非空、非占位字面量）：
+ *     sourceCount === 1 ⇒ 即 topic 本身（研究主问题）；
+ *     sourceCount  >  1 ⇒ `<topic> — research sub-question <i+1> of <sourceCount> (<sourceType>)`。
+ *
+ * ⛔ 不硬编码空的 runs / 不产出 text:"" 的卡（spec C5 review bar：空白线索会让 worker 拿不到
+ *    任何子问题，结构性零证据、零 spawn）。
+ * 纯函数：无 IO、无时钟、无随机。供 src/deep-research-entry.ts 与测试复用。
+ */
+export function deriveSeedClues(topic: string, sourceCount: number): SeedClue[] {
+  if (typeof topic !== "string" || topic.trim().length === 0) {
+    throw new Error("deriveSeedClues requires a non-empty research topic");
+  }
+  if (!Number.isInteger(sourceCount) || sourceCount < 1) {
+    throw new Error(
+      `deriveSeedClues requires a positive integer source count (got ${sourceCount})`,
+    );
+  }
+  const trimmed = topic.trim();
+  const clues: SeedClue[] = [];
+  for (let i = 0; i < sourceCount; i++) {
+    const sourceType = SOURCE_ENUM[i % SOURCE_ENUM.length];
+    const text =
+      sourceCount === 1
+        ? trimmed
+        : `${trimmed} — research sub-question ${i + 1} of ${sourceCount} (${sourceType})`;
+    clues.push({ text, sources: [sourceType] });
+  }
+  return clues;
 }
 
 export interface ChannelPrepPlan {

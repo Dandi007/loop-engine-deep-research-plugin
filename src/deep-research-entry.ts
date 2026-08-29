@@ -34,10 +34,12 @@ import { fileURLToPath } from "node:url";
 import { runPreflight } from "./preflight";
 import { ensureChannel, listChannels } from "./bus";
 import { RUNS_CHANNEL_ID } from "./run-channels";
+import { runSeedClues } from "./tick-seed";
 import {
   decideTier,
   deriveTopicChannels,
   deriveResearchOrigin,
+  deriveSeedClues,
   loadProfileEnv,
   HEAVY_TIER_MIN_SOURCES,
   DEFAULT_PROFILE,
@@ -268,8 +270,28 @@ export async function main(argv: string[]): Promise<number> {
   for (const id of desired) {
     prep.push(await ensureChannel(id, existing));
   }
+
+  // C5 —— 空板自播种：在起 loop 的 drain 之前，把研究请求按 fan-out 一一派生为非空
+  // research.clue.v2 卡并发布进 research index channel。此前统一 heavy entry 只往 trigger
+  // store 写 {"seed":true}、从未调用既有播种路径（src/tick-seed.ts / tick-entry --seed），
+  // 于是 loop 第一轮 tick 面对空板 ⇒ 零 spawn、零证据、自然 drain（spec C5 根因）。
+  // 现在复用同一条播种路径（runSeedClues → publishClue，idempotency key 确定性派生），
+  // 保证 loop 第一轮 tick 即有 >=1 张 open 卡可派 worker。⛔ 播种失败 ⇒ 响亮失败（main 的
+  // catch 映射为 outcome:"fail"），绝不静默起一个零 spawn 的 loop。
+  const seedClues = deriveSeedClues(parsed.topic, parsed.sources);
+  const seedResult = await runSeedClues(channels.index, seedClues);
+
   process.stdout.write(
-    JSON.stringify({ ...baseDoc, outcome: "prepared", channels_prepared: prep }, null, 2) + "\n",
+    JSON.stringify(
+      {
+        ...baseDoc,
+        outcome: "prepared",
+        channels_prepared: prep,
+        seeded_clues: seedResult.published,
+      },
+      null,
+      2,
+    ) + "\n",
   );
 
   const child = spawn(

@@ -311,6 +311,31 @@ export function anchorForEvidence(
   return composeAnchor(source, locator, revision, item.range);
 }
 
+/**
+ * C5 ⭐⭐⭐ —— 一条 worker evidence 缺 anchor 三件套中的哪些字段（空串按缺失算）。
+ *
+ * 这是「单 worker 退化证据不得令整 tick 崩」的**单条隔离**判据（C5 spec 判据 1/2）：
+ * `dr-worker-code-remote` 读 stale 非 git 目录时按 persona「无 revision 则留空」契约，
+ * 产出一条 `revision=""` 的退化 evidence。旧的 `anchorForEvidence` 对该形态**抛错**，
+ * 抛错经 `harvestCard` 存活到 tick 顶 ⇒ exit2 ⇒ generate 段永不执行。
+ *
+ * ⛔ 本函数只**检测**不抛错：命中 ⇒ 调用方把该条记入 `degenerateRejections`（条目级拒发，
+ *    绝不以 `://@` 空锚发布）、并把该卡隔离为 blocked（绝不 CAS 到 explored，spec 判据 3）。
+ * ⛔ 只作用于**非 content 卡**（content 卡的锚点由调度器侧权威 `<uri>@<digest>` 拼装，
+ *    worker 的 source/locator/revision 不参与，缺了不产生退化锚）。
+ *
+ * @returns 缺失（或为空串）的字段名数组；三件套齐全 ⇒ 空数组。
+ */
+export function missingAnchorFields(
+  item: WorkerEvidenceItem,
+): Array<"source" | "locator" | "revision"> {
+  const missing: Array<"source" | "locator" | "revision"> = [];
+  if (!(item.source ?? "").trim()) missing.push("source");
+  if (!(item.locator ?? "").trim()) missing.push("locator");
+  if (!(item.revision ?? "").trim()) missing.push("revision");
+  return missing;
+}
+
 /** 校验 evidence 四必填字段齐全且非空（spec §1.3 / H2）。缺任一 ⇒ 抛错（响亮，不静默落空）。 */
 export function assertEvidenceComplete(evidence: EvidenceV2): void {
   if (
@@ -697,8 +722,45 @@ export interface HarvestReport {
    * ⛔ 也不得静默丢弃这个不一致（那是持续观察 worker 行为的唯一窗口）。
    */
   anchorMismatches: AnchorAuthorityMismatch[];
+  /**
+   * C5 ⭐⭐⭐ —— 被隔离的**退化 evidence** 记录（条目级，spec 判据 4 对齐既有
+   * `evidenceRejections` 的条目级拒发纪律）。与 `evidenceRejections` 的区别是**后果**：
+   * 普通拒发（活 URL / 凭证形态）不改变卡的终态；退化 evidence 命中 ⇒ **该卡隔离为
+   * blocked、绝不 CAS 到 explored**（判据 3），但退化条目本身不发布、也不连坐同卡其余
+   * 合规 evidence 的照常发布（判据 4）。每条点名缺失字段、run_id、clue_id（判据 3）。
+   */
+  degenerateRejections: DegenerateEvidenceRejection[];
+  /**
+   * C5 ⭐⭐⭐ —— 该卡是否因含退化 evidence 而被隔离（blocked 而非 explored）。
+   * true ⇒ `runWrite` 把该卡 CAS 到 blocked（绝不 explored），其余 harvest 卡照常收割。
+   */
+  isolated: boolean;
+  /**
+   * C5 ⭐⭐⭐ —— 隔离的命名 rationale（判据 3）：点名缺失的 source/locator/revision
+   * 与 run_id/clue_id；⛔ 不回抄 quote 全文（与 `EvidenceRejection` 同纪律）。
+   */
+  isolationRationale: string;
   /** true ⇒ 上层应在所有发布完成后 CAS 到 explored（§1.1 / H6）。 */
   casExplored: boolean;
+}
+
+/**
+ * C5 ⭐⭐⭐ —— 一条被隔离的退化 evidence 的观测记录（写进运行记录，便于排障）。
+ *
+ * ⛔ 不得回抄 `quote` 全文（与 `EvidenceRejection` / `SecretPatternRejection` 同纪律：
+ * 不把未经核验的内容再落一遍）。只记 clue_id / run_id / 稳定序号 / 缺失字段 / 固定判据。
+ */
+export interface DegenerateEvidenceRejection {
+  /** 被隔离的 evidence 所属的卡（点名 clue_id，spec 判据 3）。 */
+  clueId: string;
+  /** 该卡所属的 run（点名 run_id，spec 判据 3）。 */
+  runId: string;
+  /** 该条 evidence 在 worker.result.v1.evidences 中的稳定序号（便于回查）。 */
+  index: number;
+  /** 缺失（或为空串）的锚点三件套字段（source / locator / revision）。 */
+  missing: Array<"source" | "locator" | "revision">;
+  /** 拒发原因（点名缺失字段与「不塞空串」纪律；⛔ 不含 quote 全文）。 */
+  reason: string;
 }
 
 /**
@@ -732,6 +794,9 @@ export async function harvestCard(
       evidenceRejections: [],
       secretRejections: [],
       anchorMismatches: [],
+      degenerateRejections: [],
+      isolated: false,
+      isolationRationale: "",
       casExplored: false,
     };
   }
@@ -787,6 +852,9 @@ export async function harvestCard(
       evidenceRejections: [],
       secretRejections: [],
       anchorMismatches: [],
+      degenerateRejections: [],
+      isolated: false,
+      isolationRationale: "",
       casExplored: false,
     };
   }
@@ -800,6 +868,12 @@ export async function harvestCard(
   const evidenceRejections: EvidenceRejection[] = [];
   const secretRejections: SecretPatternRejection[] = [];
   const anchorMismatches: AnchorAuthorityMismatch[] = [];
+  // C5 ⭐⭐⭐——退化 evidence 的条目级隔离记录；命中 ⇒ 该条不发布、该卡隔离为 blocked。
+  const degenerateRejections: DegenerateEvidenceRejection[] = [];
+  // C5——本卡是否因含退化 evidence 被隔离（true ⇒ 绝不 CAS 到 explored）。
+  let isolated = false;
+  // C5——隔离 rationale 里点名的缺失字段集合（跨多条去重）。
+  const isolatedMissingFields = new Set<"source" | "locator" | "revision">();
   // E1d D1 ⭐⭐⭐——本卡的锚点策略（是不是 content 卡 + 调度器侧权威 `<uri>@<digest>`）。
   //   ⛔ 在循环外算一次，且**只**由卡算出：它是本卡所有 evidence 的路由信号，
   //      与逐条 worker evidence 的字段布局无关（GT-3：worker 的字段布局每跑都在变）。
@@ -895,6 +969,26 @@ export async function harvestCard(
       });
       continue;
     }
+    // C5 ⭐⭐⭐——退化 evidence 的**单条隔离**（spec 判据 1/2/4）：
+    //   非 content 卡上 worker 缺 source/locator/revision 任一项（或为空串）时，
+    //   ⛔ 不再让 `anchorForEvidence` 抛错存活到 tick 顶（旧实现 ⇒ exit2 ⇒ generate 永不执行），
+    //   ⛔ 也不以退化空锚（`://@` / `code://@`）发布到无 DELETE 的证据 channel。
+    //   命中 ⇒ 该条**不发布**、记入 `degenerateRejections`（条目级，点名缺失字段与 run/clue_id），
+    //   并把**本卡**标记为隔离（blocked、绝不 CAS 到 explored；判据 3）。
+    //   ⛔ 不连坐同卡其余合规 evidence：循环继续，其余条目照常发布（判据 4）。
+    const missing = missingAnchorFields(item);
+    if (missing.length > 0) {
+      degenerateRejections.push({
+        clueId: card.clueId,
+        runId,
+        index: i,
+        missing,
+        reason: `A8e: worker evidence missing ${missing.join("/")} for anchor; refusing to derive a degenerate empty anchor (no silent empty-string fallback).`,
+      });
+      isolated = true;
+      for (const f of missing) isolatedMissingFields.add(f);
+      continue;
+    }
     const evidence = evidenceFromWorker(card.clueId, item);
     // E1k2 D4 ⭐⭐——凭证形态闸门（非 content 路径，与上方 content 路径同一道闸）。
     //   ⛔ 在 publishEvidence 之前；命中 ⇒ 条目级拒发，不连坐整卡。
@@ -955,6 +1049,11 @@ export async function harvestCard(
   }
 
   // 全部发布成功 ⇒ 由上层执行最后的 CAS 到 explored（此处仅预留其预算，§1.7）。
+  // C5——若本卡含退化 evidence ⇒ 不 CAS 到 explored（isolated=true），改由上层的
+  // `case "harvest":` 把该卡 CAS 到 blocked（judgment 3：绝不 CAS 到 explored）。
+  const isolationRationale = isolated
+    ? `A8e: worker evidence missing ${[...isolatedMissingFields].join("/")} for anchor on run ${runId} (clue ${card.clueId}); card isolated as blocked, degenerate evidence not published (no silent empty-string fallback).`
+    : "";
   return {
     clueId: card.clueId,
     runId,
@@ -968,6 +1067,9 @@ export async function harvestCard(
     evidenceRejections,
     secretRejections,
     anchorMismatches,
-    casExplored: true,
+    degenerateRejections,
+    isolated,
+    isolationRationale,
+    casExplored: !isolated,
   };
 }

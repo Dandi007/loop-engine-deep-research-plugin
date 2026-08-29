@@ -2800,3 +2800,149 @@ describe("E1d D1/D2 ⭐⭐⭐ (production assembly): the anchors that actually l
     expect(JSON.stringify(mismatches)).not.toContain(GT1_LAYOUTS[3].report.quote);
   });
 });
+
+// ── C5 ⭐⭐⭐：单 worker 退化证据（缺 source/locator/revision）不得令整 tick 崩 ──
+// 本组直接驱动 runWrite/harvestCard（真实收割链，非纯函数直调），钉死 C5 spec 判据 1-4：
+//   (1) 单条退化 evidence ⇒ A8e 收割步不抛（不再 exit2）；
+//   (2) 退化 evidence 不发布为退化空锚；
+//   (3) 该卡隔离为 blocked（绝不 CAS explored）+ 命名 rationale 点名缺失字段与 run/clue_id；
+//   (4) 同卡其余合规 evidence 照常发布、同 tick 其余卡照常收割/explored。
+
+describe("C5 ⭐⭐⭐ (runWrite): single degenerate evidence isolates its card, not the tick", () => {
+  it("card with missing-revision evidence + normal card ⇒ degenerate card blocked (rationale names revision + run/clue), normal card published + explored", async () => {
+    // 卡 A：worker 结果含一条**缺 revision** 的 evidence（真机形态：code-remote 读 stale 非 git
+    //   目录按 persona「无 revision 则留空」产出）。卡 B：完全合规（code:// 全三件套）。
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async (runId: string) => {
+        if (runId === "run-degen") {
+          return validWorkerResult({
+            run_id: "run-degen",
+            evidences: [
+              { quote: "dq", claim: "dc", source: "code", locator: "src/x.ts" }, // ⛔ 缺 revision
+            ],
+            proposed_clues: [{ clue: "idea-degen" }],
+            materials: [],
+          });
+        }
+        return validWorkerResult({
+          run_id: "run-ok",
+          evidences: [
+            { quote: "nq", claim: "nc", source: "code", locator: "src/y.ts", revision: "abc123" },
+          ],
+          proposed_clues: [{ clue: "idea-ok" }],
+          materials: [],
+        });
+      }),
+    });
+    const casInputs: WriteCasInput[] = [];
+    const deps = writeDeps(hd);
+    deps.cas = vi.fn(async (input: WriteCasInput) => {
+      casInputs.push(input);
+      return { success: true };
+    });
+    const degenDecision: Decision = {
+      ...HARVEST_DECISION,
+      clueId: "card_degen",
+      runId: "run-degen",
+      sources: ["code-remote"],
+    };
+    const okDecision: Decision = {
+      ...HARVEST_DECISION,
+      clueId: "card_ok",
+      runId: "run-ok",
+      sources: ["code-remote"],
+    };
+
+    // 判据 1：runWrite 正常返回，不抛 A8e（修复前此处抛错 ⇒ exit2）。
+    const result = await runWrite(deps, [degenDecision, okDecision], 20);
+
+    // 判据 3a：退化卡被 CAS 到 blocked（而非 explored）。
+    const degenCas = casInputs.find((c) => c.clueId === "card_degen");
+    expect(degenCas).toBeDefined();
+    expect(degenCas!.to).toBe("blocked");
+    expect(degenCas!.from).toBe("in_flight");
+    expect(degenCas!.rationale).toMatch(/missing revision/);
+    expect(degenCas!.rationale).toMatch(/run-degen/);
+    expect(degenCas!.rationale).toMatch(/card_degen/);
+
+    // 判据 3b：退化卡绝不 CAS 到 explored。
+    expect(result.casResults.filter((c) => c.clueId === "card_degen" && c.to === "explored")).toHaveLength(0);
+
+    // 判据 3c/2：退化 evidence 不上 bus（空锚绝不上 append-only evidence channel）。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(1); // 只有合规卡 B 的 1 条被发布
+    const published = (hd.publishEvidence as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => c[1] as EvidenceV2,
+    );
+    for (const ev of published) {
+      expect(ev.anchor).not.toBe("://@");
+      expect(ev.anchor).not.toMatch(/^[a-z]+:\/\/@/);
+    }
+    expect(published.some((ev) => ev.clue_id === "card_degen")).toBe(false);
+
+    // 判据 3d：退化卡的报告隔离语义（degenerateRejections 点名缺失字段、isolated、不 casExplored）。
+    const degenReport = result.harvestReports.find((r) => r.clueId === "card_degen")!;
+    expect(degenReport.isolated).toBe(true);
+    expect(degenReport.casExplored).toBe(false);
+    expect(degenReport.degenerateRejections).toHaveLength(1);
+    expect(degenReport.degenerateRejections[0].missing).toContain("revision");
+    expect(degenReport.degenerateRejections[0].runId).toBe("run-degen");
+    expect(degenReport.degenerateRejections[0].clueId).toBe("card_degen");
+    expect(degenReport.isolationRationale).toMatch(/revision/);
+
+    // 判据 4：同 tick 其余合规卡照常收割（evidence 发布 + CAS explored）。
+    const okCas = casInputs.find((c) => c.clueId === "card_ok");
+    expect(okCas).toBeDefined();
+    expect(okCas!.to).toBe("explored");
+    const okReport = result.harvestReports.find((r) => r.clueId === "card_ok")!;
+    expect(okReport.isolated).toBe(false);
+    expect(okReport.casExplored).toBe(true);
+    expect(okReport.evidencePublished).toBe(1);
+  });
+
+  it("degenerate evidence is single-entry isolation (judgment 4): same-card compliant evidence still published, card still blocked", async () => {
+    // 卡 A 同时含：1 条缺 revision 的退化 evidence + 1 条合规 evidence。
+    // ⛔ 退化单条不发布，但同卡合规 evidence 照常发布；卡仍被隔离为 blocked（判据 3 优先）。
+    const hd = harvestDeps({
+      readWorkerResult: vi.fn(async () =>
+        validWorkerResult({
+          run_id: "run-mixed",
+          evidences: [
+            { quote: "dq", claim: "dc", source: "code", locator: "src/a.ts" }, // ⛔ 缺 revision
+            { quote: "okq", claim: "okc", source: "code", locator: "src/b.ts", revision: "abc" },
+          ],
+          proposed_clues: [],
+          materials: [],
+        }),
+      ),
+    });
+    const casInputs: WriteCasInput[] = [];
+    const deps = writeDeps(hd);
+    deps.cas = vi.fn(async (input: WriteCasInput) => {
+      casInputs.push(input);
+      return { success: true };
+    });
+    const decision: Decision = {
+      ...HARVEST_DECISION,
+      clueId: "card_mixed",
+      runId: "run-mixed",
+      sources: ["code-remote"],
+    };
+    const result = await runWrite(deps, [decision], 20);
+
+    // 同卡合规 evidence 仍发布（1 条），退化那条（index 0）不发布。
+    expect(hd.publishEvidence).toHaveBeenCalledTimes(1);
+    const published = (hd.publishEvidence as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => c[1] as EvidenceV2,
+    );
+    expect(published[0].clue_id).toBe("card_mixed");
+    expect(published[0].anchor).toBe("code://src/b.ts@abc");
+
+    // 卡仍被隔离为 blocked（判据 3：绝不 CAS explored），报告同时记录退化拒绝 + 合规发布。
+    const cas = casInputs.find((c) => c.clueId === "card_mixed")!;
+    expect(cas.to).toBe("blocked");
+    expect(result.harvestReports[0].isolated).toBe(true);
+    expect(result.harvestReports[0].degenerateRejections).toHaveLength(1);
+    expect(result.harvestReports[0].evidencePublished).toBe(1);
+  });
+});
+

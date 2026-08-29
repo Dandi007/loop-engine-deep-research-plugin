@@ -1013,6 +1013,25 @@ export async function runWrite(
           budget,
         );
         harvestReports.push(report);
+        if (report.isolated) {
+          // C5 ⭐⭐⭐——本卡含退化 evidence（缺 source/locator/revision 的条目已被单条隔离、
+          //   不发布）：**该卡**隔离为 blocked（判据 3），绝不 CAS 到 explored。
+          //   rationale 点名缺失字段与 run_id/clue_id（harvestCard 已装配好）。
+          //   ⛔ 单卡语义：只 CAS 本卡到 blocked，同 tick 其余 harvest 卡照常收割/explored。
+          const result = await perform({
+            clueId: decision.clueId,
+            to: "blocked",
+            from: "in_flight",
+            rationale: report.isolationRationale,
+          });
+          casResults.push({
+            clueId: decision.clueId,
+            to: "blocked",
+            success: result.success,
+            error: result.error,
+          });
+          break;
+        }
         if (report.casExplored) {
           // 全部发布成功 ⇒ 最后 CAS 到 explored（§1.1 / H6）。
           const result = await perform({

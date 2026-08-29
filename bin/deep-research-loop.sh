@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ⛔ C2 —— 内部实现细节（不是 user-facing entry）。
+# 用户/agent/人 一律走统一入口 bin/deep-research.sh（single entry，路由 light/heavy）。
+# 本脚本只承载 heavy tier（V2 全编排）的 loop 落地，直接调用视为「legacy direct-run path」
+# —— 已降级为内部实现，不再作为第二个面向用户的入口。
+
 # A7 —— deep-research loop 驱动脚本。
 # 渲染 workflows/deep-research/fleet.yaml.tpl → 调 loop-engine CLI。
 # --dry-run 只渲染并打印渲染结果（spec G1/G2）：不依赖 loop-engine CLI 可执行，
@@ -210,10 +215,15 @@ TRIGGER_ID="a9-$(date +%s%N)-$$"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"
-# G15: drain 后检查 tick 失败 —— 捕获 drain 输出，解析 drain_id，
+# G15/C3: drain 后检查 —— 捕获 drain 输出，解析 drain_id，
 # 遍历 index.jsonl → journal.jsonl 查找 [bash 非零退出 EXIT:<n>]（G15）或
 # 引擎级 node_timeout/wall_clock 杀掉的 [外部调用失败 status=TIMEOUT] + error:"exec"（E0c10 D7 / GT-A），
 # 命中任一则响亮失败并点名 run_dir。
+# C3（判别核心）: ⛔ 哨兵判定必须在 drain 进程**任何**退出/死亡路径后都读取 drain registry
+# （drain.json status/outstanding/last_heartbeat + index.jsonl run.start/run.end 配对 +
+# loop-events.jsonl 轮次配对）。存在未收割 in_flight/open 卡（outstanding>0）或 drain 未写
+# run.end 时产出响亮 sentinel_lost 终态（非零退出 + 点名 drain_id/outstanding/未收割计数），
+# 绝不静默 exit 0，绝不把「带活儿猝死」伪装成 done。
 DRAIN_TMP=$(mktemp)
 trap 'rm -f "$DRAIN_TMP"' EXIT
 set +e
@@ -223,8 +233,16 @@ set -e
 
 cat "$DRAIN_TMP"
 
+# C3 —— 任何退出/死亡路径（含 SIGKILL 无摘要）后都执行哨兵判定。
+set +e
+node "$PLUGIN_ROOT/scripts/check-drain-failures.mjs" < "$DRAIN_TMP"
+CHECK_EXIT_CODE=$?
+set -e
+
+if [ "$CHECK_EXIT_CODE" -ne 0 ]; then
+  exit "$CHECK_EXIT_CODE"
+fi
 if [ "$DRAIN_EXIT_CODE" -ne 0 ]; then
   exit "$DRAIN_EXIT_CODE"
 fi
-
-node "$PLUGIN_ROOT/scripts/check-drain-failures.mjs" < "$DRAIN_TMP"
+exit 0

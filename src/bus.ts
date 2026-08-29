@@ -503,6 +503,39 @@ export async function getEntity(entityId: string): Promise<BusMessage | null> {
 
 // ── 写 ──
 
+/**
+ * C2 —— create-or-reuse channel 原语：POST /v1/channels。
+ *
+ * 幂等（fake/真机 bus 对已存在的 channel 返回已存在而非报错）；但调用方仍应先用
+ * `listChannels()` 判复用，避免无谓写调用（见 ensureChannel）。
+ * ⛔ 不删除/清空已有 channel（bus append-only 无 DELETE）。
+ */
+export async function createChannel(channelId: string): Promise<void> {
+  await busFetch(`/v1/channels`, {
+    method: "POST",
+    body: JSON.stringify({ channel_id: channelId }),
+  });
+}
+
+/**
+ * C2 —— create-or-reuse：channel 已存在 ⇒ 复用（不写）；不存在 ⇒ 创建。
+ *
+ * `knownIds` 可选：调用方若已持有 list 结果可传入（省一次 GET）；否则读 `listChannels()`。
+ * 返回本次实际动作，供入口/测试断言「无手工 channel 步骤、且 create-or-reuse 真发生」。
+ */
+export async function ensureChannel(
+  channelId: string,
+  knownIds?: readonly string[],
+): Promise<{ channelId: string; created: boolean; reused: boolean }> {
+  const existing =
+    knownIds ?? (await listChannels()).map((c) => c.channel_id);
+  if (existing.includes(channelId)) {
+    return { channelId, created: false, reused: true };
+  }
+  await createChannel(channelId);
+  return { channelId, created: true, reused: false };
+}
+
 /** 发布消息到 channel */
 export async function publish(
   channelId: string,

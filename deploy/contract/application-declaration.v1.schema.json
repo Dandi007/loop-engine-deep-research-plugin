@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-engine-deep-research-plugin/application-declaration.v1",
+  "title": "Application Deployment Declaration (v1)",
+  "description": "版本化的应用部署声明契约。一份声明描述一个应用的部署所需：身份、制品 ref 与不可变 commit、运行命令、工作目录、必需环境键、健康检查命令、回滚 ref。preflight 只读并校验本契约，绝不执行任何部署副作用。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "application",
+    "artifact",
+    "command",
+    "working_directory",
+    "required_environment",
+    "health",
+    "rollback"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "application-declaration.v1"
+    },
+    "application": {
+      "type": "string",
+      "description": "已声明应用名，必须出现在 deploy/applications.json 的 known application 集合。"
+    },
+    "artifact": {
+      "description": "要部署的制品：ref 是制品引用（相对本仓根的路径或制品名），commit 是 40 位小写十六进制的不可变提交。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "commit"],
+      "properties": {
+        "ref": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "command": {
+      "description": "部署运行命令的 argv 数组，首元素是可执行文件。",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "working_directory": {
+      "type": "string",
+      "description": "运行命令的工作目录；相对路径按本仓根解析。"
+    },
+    "required_environment": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "部署前必须存在且非空的环境变量键。"
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": {
+          "description": "健康检查命令的 argv 数组（语法校验，不执行）。",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      }
+    },
+    "rollback": {
+      "description": "回滚 ref：部署失败时回退到的制品 ref 与不可变 commit。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "commit"],
+      "properties": {
+        "ref": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    }
+  }
+}

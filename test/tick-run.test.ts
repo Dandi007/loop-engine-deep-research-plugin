@@ -536,8 +536,13 @@ function wiringStub(
   );
 }
 
-describe("N1: W1 — bus has agent.run.started ⇒ no reclaim, no CAS", () => {
+describe("N1: W1 — bus has agent.run.started ⇒ tick blocks, times out, reclaims per-worker", () => {
   it("only difference from N2 is board:agent-runs containing a started event", async () => {
+    // C5-fix2 + C5-fix3：started（未 exited）的在飞卡会阻塞等待结果（不立即 reclaim）。
+    // 本例 worker 永不产出结果、永不 exited ⇒ 声明超时后**逐 worker** 回收（CAS in_flight→open）、
+    // 响亮诊断，tick 仍 0 退出（⛔ 不再是整 tick 非零退出的旧行为）。
+    process.env.AGENT_RESULT_TIMEOUT_MS = "50";
+    process.env.AGENT_RESULT_POLL_MS = "5";
     const publishes: Array<Record<string, unknown>> = [];
     const runsResponses: number[] = [];
     wiringStub(
@@ -556,13 +561,22 @@ describe("N1: W1 — bus has agent.run.started ⇒ no reclaim, no CAS", () => {
       publishes,
       runsResponses,
     );
-    const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
-    // 板上有 started ⇒ 不 reclaim、不发 CAS（N1：assert CAS 调用 0 次）。
-    expect(publishes).toHaveLength(0);
-    expect(outcome.writes).toBe(0);
-    expect(outcome.spawns).toHaveLength(0);
-    // 判别性核验：runs 读确实返回了 1 条（非空），与 N2 不同。
-    expect(runsResponses[0]).toBe(1);
+    try {
+      const outcome = await runChannelWrite({ channelId: WIRE_CLUE_CHANNEL });
+      // tick 以 0 退出（未抛错）：声明超时只回收该 worker，不毙整 tick。
+      const openCas = publishes.find(
+        (p) => (p.payload as Record<string, unknown>).status === "open",
+      );
+      expect(openCas).toBeDefined();
+      expect(outcome.writes).toBe(1);
+      // 响亮诊断：phase=worker、reason=result-timeout。
+      expect(outcome.diagnostics.some((d) => d.phase === "worker" && d.reason === "result-timeout")).toBe(true);
+      // 判别性核验：runs 读确实返回了 1 条（非空），与 N2（空）不同。
+      expect(runsResponses[0]).toBe(1);
+    } finally {
+      delete process.env.AGENT_RESULT_TIMEOUT_MS;
+      delete process.env.AGENT_RESULT_POLL_MS;
+    }
   });
 });
 

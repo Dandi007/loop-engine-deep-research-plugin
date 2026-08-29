@@ -3,20 +3,21 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const stdin = readFileSync(0, "utf8").trim();
-if (!stdin) {
-  process.exit(0);
-}
 
-let drainJson;
-try {
-  drainJson = JSON.parse(stdin);
-} catch {
-  process.exit(0);
-}
-
-const drainId = drainJson.drain_id;
-if (!drainId || typeof drainId !== "string") {
-  process.exit(0);
+// drain 摘要（loop-engine CLI 打印的单行 JSON）——drain 正常/带错退出时必含 drain_id。
+let summary = null;
+if (stdin) {
+  try {
+    const j = JSON.parse(stdin);
+    if (j && typeof j.drain_id === "string") {
+      summary = {
+        drain_id: j.drain_id,
+        runs_root: typeof j.runs_root === "string" ? j.runs_root : null,
+      };
+    }
+  } catch {
+    // 非 JSON 摘要 —— 落到 registry 兜底判定（C3：drain 进程死亡路径无摘要）。
+  }
 }
 
 function runtimeRoot() {
@@ -37,20 +38,146 @@ let indexContent;
 try {
   indexContent = readFileSync(indexFile, "utf8");
 } catch {
+  // ⛔ 痕迹不可读 ⇒ 响亮失败（G15 Y4a 契约）：不静默 exit 0。
   process.stderr.write(`[deep-research-loop] index.jsonl not found or unreadable at ${indexFile}\n`);
   process.exit(3);
 }
 
-const laneEntries = [];
+const records = [];
 for (const line of indexContent.trim().split("\n")) {
   if (!line) continue;
   try {
-    const rec = JSON.parse(line);
-    if (rec.drain_id === drainId && rec.lane && rec.run_dir) {
-      laneEntries.push({ run_dir: rec.run_dir, lane: rec.lane });
-    }
+    records.push(JSON.parse(line));
   } catch {}
 }
+
+function hasRunEnd(runId) {
+  return records.some((r) => r.kind === "run.end" && r.run_id === runId);
+}
+
+// ── C3 —— 定位本 drain 的 registry 身份 ─────────────────────────────
+// 主路径：drain 摘要给出 drain_id / runs_root（drain 正常退出或带错退出）。
+// 兜底路径：drain 进程被杀死（无摘要）时，按本驱动自己的 RUNTIME_FLEET 在 index.jsonl
+//   找 drain 自身的 run.start（其 fleet 字段 == RUNTIME_FLEET，tick 子 run 的 fleet
+//   指向 workflow 而非 fleet.yaml，天然区分）且无 run.end —— 精确命中本 drain，不误判并发 drain。
+let drainId = summary ? summary.drain_id : null;
+let runsRoot = summary ? summary.runs_root : null;
+
+if (!drainId) {
+  const fleet = process.env.RUNTIME_FLEET;
+  if (fleet) {
+    const fleetStarts = records.filter(
+      (r) => r.kind === "run.start" && r.fleet === fleet && r.run_id,
+    );
+    for (let i = fleetStarts.length - 1; i >= 0; i--) {
+      const c = fleetStarts[i];
+      if (!hasRunEnd(c.run_id)) {
+        drainId = c.run_id;
+        if (typeof c.run_dir === "string") runsRoot = c.run_dir;
+        break;
+      }
+    }
+  }
+  if (!drainId) {
+    // 无可判定对象（无摘要且无本 drain 的 registry 痕迹）⇒ 维持原有空输入语义 exit 0。
+    process.exit(0);
+  }
+}
+
+// 摘要未给 runs_root 时，从 drain 自身 run.start 反查 run_dir。
+if (!runsRoot) {
+  const own = records.find((r) => r.kind === "run.start" && r.run_id === drainId);
+  if (own && typeof own.run_dir === "string") runsRoot = own.run_dir;
+}
+// 再兜底：runtimeRoot()/drains/<drainId>.json 指针。
+if (!runsRoot) {
+  try {
+    const ptr = JSON.parse(readFileSync(join(root, "drains", `${drainId}.json`), "utf8"));
+    if (typeof ptr.runs_root === "string") runsRoot = ptr.runs_root;
+  } catch {}
+}
+
+// ── C3 —— 读 drain registry 哨兵终态 ────────────────────────────────
+// 读取 loop-engine 基座**已导出**的哨兵 registry（drain.json status/outstanding/last_heartbeat
+// + index.jsonl 的 run.start/run.end 配对 + loop-events.jsonl 轮次配对）。best-effort：
+// 任一文件缺失/不可读时依赖其余信号判定，绝不静默跳过「响亮终态」这一整体。
+let drainState = null;
+let loopRoundUnbalanced = false;
+if (runsRoot) {
+  try {
+    const d = JSON.parse(readFileSync(join(runsRoot, "drain.json"), "utf8"));
+    if (d && typeof d === "object") {
+      drainState = {
+        status: typeof d.status === "string" ? d.status : null,
+        outstanding: typeof d.outstanding === "number" ? d.outstanding : null,
+        lastHeartbeat: typeof d.last_heartbeat === "number" ? d.last_heartbeat : null,
+      };
+    }
+  } catch {
+    // best-effort：drain.json 缺失时靠 run.end 配对与 loop-events 轮次配对判定。
+  }
+  try {
+    const evLines = readFileSync(join(runsRoot, "loop-events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    let starts = 0;
+    let ends = 0;
+    for (const l of evLines) {
+      try {
+        const e = JSON.parse(l);
+        if (e.kind === "round_start") starts += 1;
+        else if (e.kind === "round_end") ends += 1;
+      } catch {}
+    }
+    loopRoundUnbalanced = starts > ends;
+  } catch {
+    // best-effort：loop-events.jsonl 缺失时忽略该信号。
+  }
+}
+
+const drainStarted = records.some((r) => r.kind === "run.start" && r.run_id === drainId);
+const drainEnded = hasRunEnd(drainId);
+
+// 判别核心（C3 spec §2）：
+//   drain 未写 run.end，或 drain.json.status 仍非终态（running）且 outstanding>0
+//   （存在未收割 in_flight/open 卡）⇒ 响亮终态；loop-events 轮次未闭合（死于轮中）为补充信号。
+const sentinelLost =
+  (drainStarted && !drainEnded) ||
+  (drainState !== null && drainState.status === "running" && (drainState.outstanding ?? 0) > 0) ||
+  loopRoundUnbalanced;
+
+if (sentinelLost) {
+  const laneRuns = records.filter(
+    (r) => r.kind === "run.start" && r.drain_id === drainId && r.lane && r.run_dir,
+  );
+  const outstanding =
+    drainState && drainState.outstanding != null ? drainState.outstanding : laneRuns.length;
+  const unharvestedSeq = laneRuns
+    .map((r) => (typeof r.run_id === "string" ? r.run_id : ""))
+    .filter(Boolean)
+    .join(",");
+  const statusLabel = drainState && drainState.status ? drainState.status : "unknown";
+  const heartbeatLabel =
+    drainState && drainState.lastHeartbeat != null ? String(drainState.lastHeartbeat) : "n/a";
+  // ⛔ 机器可读稳定 token：sentinel_lost 与 outstanding=<n>（供巡检/看门狗直接抓取）。
+  process.stderr.write(
+    `[deep-research-loop] SENTINEL LOST: sentinel_lost drain_id=${drainId} outstanding=${outstanding}\n`,
+  );
+  process.stderr.write(
+    `[deep-research-loop]   drain registry: status=${statusLabel} last_heartbeat=${heartbeatLabel} drain_run_end=${drainEnded ? "yes" : "no"} loop_round_unbalanced=${loopRoundUnbalanced ? "yes" : "no"}\n`,
+  );
+  process.stderr.write(
+    `[deep-research-loop]   unharvested in_flight/open count=${laneRuns.length} run_id=${unharvestedSeq || "n/a"}\n`,
+  );
+  process.exit(3);
+}
+
+// ── 既有 G15 / D7 逻辑：tick 失败检测（行为逐字不变）────────────────
+
+const laneEntries = records.filter(
+  (r) => r.drain_id === drainId && r.lane && r.run_dir,
+);
 
 if (laneEntries.length === 0) {
   process.stderr.write(`[deep-research-loop] no lane entries found in index.jsonl for drain_id=${drainId}\n`);

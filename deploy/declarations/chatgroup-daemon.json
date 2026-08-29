@@ -1,0 +1,23 @@
+{
+  "schema_version": "application-declaration.v1",
+  "application": "chatgroup-daemon",
+  "artifact": {
+    "ref": "chatgroup-daemon",
+    "commit": "0000000000000000000000000000000000000000"
+  },
+  "command": [
+    "bash",
+    "bin/chatgroup-daemon.sh"
+  ],
+  "working_directory": ".",
+  "required_environment": [],
+  "health": {
+    "command": [
+      "true"
+    ]
+  },
+  "rollback": {
+    "ref": "chatgroup-daemon",
+    "commit": "0000000000000000000000000000000000000000"
+  }
+}

@@ -23,6 +23,7 @@ import {
   decideTick,
   decideTermination,
   hasPendingWork,
+  roleForSources,
   DEFAULT_TICK_CONFIG,
   type BoardCard,
   type BoardState,
@@ -39,6 +40,7 @@ import {
   readChannelMessages,
   readGenerateResult,
   readTriageResult,
+  readWorkerResult,
   type InspectMessage,
   type TriageResultDecision,
 } from "./tick-inspect";
@@ -48,6 +50,7 @@ import {
   type HarvestDeps,
   type HarvestReport,
   type WorkerMaterialItem,
+  type WorkerResultV1,
 } from "./harvest";
 import { casUpdateClue, getEntity, getMessages, publishClue, publishEvidence, publishDoc } from "./bus";
 import {
@@ -61,6 +64,9 @@ import {
 import { fileParse } from "./mineru";
 import {
   RunExitedWithoutResultError,
+  RunResultTimeoutError,
+  isRunExitedWithoutResultError,
+  isRunResultTimeoutError,
   type RunExitWithoutResultDiagnostic,
 } from "./run-exit-diagnostic";
 import {
@@ -176,10 +182,90 @@ export async function pollForResultOrExit<T>(
       throw new RunExitedWithoutResultError(runId, role, now - start);
     }
     if (now - start >= opts.timeoutMs) {
-      // 判据 4 反向：bus 不可达 / 真挂起（run 未 exited，纯超时）⇒ tick 非零退出。
-      throw new Error(opts.buildTimeoutMessage(runId, opts.timeoutMs));
+      // 判据 4 反向：bus 不可达 / 真挂起（run 未 exited，纯超时）⇒ 强类型超时错误。
+      //    triage / generate 路径捕获到非 RunExitedWithoutResultError 一律 rethrow ⇒ tick 非零退出；
+      //    worker（C5-fix3）路径捕获 RunResultTimeoutError 后逐 worker 回收并继续（tick 仍 0 退出）。
+      throw new RunResultTimeoutError(
+        runId,
+        role,
+        now - start,
+        opts.buildTimeoutMessage(runId, opts.timeoutMs),
+      );
     }
     await new Promise((r) => setTimeout(r, opts.pollMs));
+  }
+}
+
+/**
+ * C5-fix2 —— 识别「已 started 但尚未 exited」的在飞卡：板面持有 in_flight 卡、
+ * runs 上观察到 `agent.run.started` 却还没有 `agent.run.exited` ⇒ 该 worker 仍在跑，
+ * 其结果尚不可收割。若 tick 对这些卡直接返回（旧行为），round budget 会在 worker
+ * （分钟级）出结果前耗尽，coverage 恒 0。纯函数：不碰 IO（spec B1）。
+ */
+function startedInFlightCards(state: BoardState): BoardCard[] {
+  return state.cards.filter((c) => {
+    if (c.status !== "in_flight") return false;
+    if (!c.runId) return false;
+    const run = state.runs[c.runId];
+    return run !== undefined && run.state === "started";
+  });
+}
+
+/**
+ * C5-fix2 —— 对一张「已 started 未 exited」的在飞卡，复用既有 `pollForResultOrExit`/
+ * 超时机制阻塞等待其 `worker.result.v1` 可读（bounded by 声明的结果超时），
+ * 使本轮 tick 就能在结果落定后收割，而不是返回空手并触发下一轮。
+ *
+ * ⛔ 无忙等、无无限等待：由 `resolveAgentResultTimeout` / `resolveRunExitGraceMs` 约束。
+ * ⛔ 结果到达 ⇒ 正常返回（上层据此置 exited(0) 并收割）。
+ * ⛔ run 已 exited 但宽限后仍无 result ⇒ 抛 `RunExitedWithoutResultError`（上层诊断，tick 仍 0 退出）。
+ * ⛔ run 未 exited、纯超时（bus 不可达 / 真挂起）⇒ 抛 timeout 错误（tick 非零退出，响亮失败）。
+ */
+async function waitForStartedWorker(card: BoardCard): Promise<void> {
+  const runId = card.runId!;
+  const role = roleForSources(card.sources) ?? "dr-worker";
+  const { timeoutMs, pollMs } = resolveAgentResultTimeout();
+  const exitGraceMs = resolveRunExitGraceMs();
+  await pollForResultOrExit<WorkerResultV1>(runId, role, {
+    readResult: () => readWorkerResult(runId),
+    readExited: () => hasRunExited(runId),
+    timeoutMs,
+    pollMs,
+    exitGraceMs,
+    buildTimeoutMessage: (rid, tms) =>
+      `C5-fix2: timed out waiting for worker result for run ${rid} — no worker.result.v1 found on board:agent-runs after ${tms}ms`,
+  });
+}
+
+/**
+ * C5-fix3 —— 一张 started 在飞 worker 的**逐 worker 结局**。与 C5-fix2 的
+ * `waitForStartedWorker`（抛错形态）不同，本函数把三类结局折叠成值类型，**绝不因单个
+ * worker 的 exit-without-result 或超时而抛出**，从而使 `runChannelWrite` 能以
+ * `Promise.all` 并行轮询所有在飞 worker 且不互相连坐：
+ *   - `ready`               —— worker.result.v1 已可读 ⇒ 上层标记 exited(0) 并收割；
+ *   - `exited-without-result` —— run 已 exited、宽限后仍无 result ⇒ 上层记录诊断（响亮）；
+ *   - `timed-out`           —— run 未 exited、超声明结果超时 ⇒ 上层记录诊断 + 回收该 clue。
+ * ⛔ 其它意外错误（bus 不可达等）仍**原样抛出**（响亮失败、tick 非零退出），不会被吞成超时。
+ */
+type StartedWorkerOutcome =
+  | { kind: "ready" }
+  | { kind: "exited-without-result"; role: string; elapsedMs: number }
+  | { kind: "timed-out"; role: string; elapsedMs: number };
+
+async function pollStartedWorker(card: BoardCard): Promise<StartedWorkerOutcome> {
+  const runId = card.runId!;
+  const role = roleForSources(card.sources) ?? "dr-worker";
+  try {
+    await waitForStartedWorker(card);
+    return { kind: "ready" };
+  } catch (e) {
+    if (isRunExitedWithoutResultError(e)) {
+      return { kind: "exited-without-result", role: e.role, elapsedMs: e.elapsedMs };
+    }
+    if (isRunResultTimeoutError(e)) {
+      return { kind: "timed-out", role: e.role, elapsedMs: e.elapsedMs };
+    }
+    throw e;
   }
 }
 
@@ -1827,8 +1913,8 @@ export async function runChannelWrite(
   // A8e——`board:agent-runs` 只分页读一次，同时喂给 runs 归集与每张卡的 worker.result
   //   查询（评审 note：readWorkerResult 原先每张 harvest 卡把整个 channel 再分页一遍，
   //   这是 O(cards x channel) 的读放大；这里复用同一份已读消息列表）。
-  const runsMessages = await readChannelMessages(runsChannelId);
-  const runs = buildRunsFromMessages(runsMessages);
+  let runsMessages = await readChannelMessages(runsChannelId);
+  let runs = buildRunsFromMessages(runsMessages);
   const assembled = assembleBoard(messages, runs);
   // ⛔（attempt 2 major finding）coverage 的原料 coveredClueIds 必须取自**证据真正发布到的
   //   channel**。生产 harvest 把 research.evidence.v2 发到独立的 EVIDENCE_CHANNEL
@@ -1849,6 +1935,62 @@ export async function runChannelWrite(
     }
   }
   const state = assembled.state;
+
+  // C5-fix2 —— 对「已 started 未 exited」的在飞卡阻塞等待其结果，使本轮 tick 就能收割，
+  // 而不是返回空手再触发下一轮（旧行为 ⇒ round budget 耗尽、coverage 恒 0、max_rounds 死锁）。
+  // C5-fix3 —— 逐 worker 独立收割：并行轮询每张在飞卡，任一 worker 的 exit-without-result
+  // 或声明超时**只回收/标败它自己**，绝不毙掉整 tick 或阻塞其它 worker 的收割（根因：
+  // 一个慢 worker 超时曾让整 tick 以 exit=2 失败，连带丢失已就绪 worker 的结果）。
+  const startedCards = startedInFlightCards(state);
+  if (startedCards.length > 0) {
+    const exited0 = new Set<string>();
+    const timedOut = new Set<string>();
+    const outcomes = await Promise.all(
+      startedCards.map((card) => pollStartedWorker(card)),
+    );
+    for (let i = 0; i < outcomes.length; i += 1) {
+      const card = startedCards[i];
+      const runId = card.runId!;
+      const outcome = outcomes[i];
+      if (outcome.kind === "ready") {
+        exited0.add(runId);
+      } else if (outcome.kind === "exited-without-result") {
+        // run 已 exited 但宽限后仍无 result ⇒ 诊断并继续（tick 仍 0 退出，GT-D 同构）。
+        diagnostics.push({
+          runId,
+          role: outcome.role,
+          elapsedMs: outcome.elapsedMs,
+          phase: "worker",
+          reason: "exited-without-result",
+        });
+      } else {
+        // 声明结果超时（run 未 exited）⇒ 响亮诊断 + 逐 worker 回收（标记为 exited(1)，
+        //    使 decideTick 走既有 reclaim 路径把它 CAS 回 open），tick 继续收割其它就绪结果。
+        diagnostics.push({
+          runId,
+          role: outcome.role,
+          elapsedMs: outcome.elapsedMs,
+          phase: "worker",
+          reason: "result-timeout",
+        });
+        timedOut.add(runId);
+      }
+    }
+    // 结果 / exited 事件是异步落 channel 的：重新读一次 runs channel，拿到等待期间抵达的
+    // worker.result.v1 与 agent.run.exited；并对「已拿到结果的卡」权威补 exited(0)
+    // （worker 可能先发 result 再发 exited，此竞态下由我们先补齐，decideTick 才发 harvest）、
+    // 对「声明超时的卡」标记 exited(1)（使 decideTick 逐 worker 回收其 clue）。
+    runsMessages = await readChannelMessages(runsChannelId);
+    runs = buildRunsFromMessages(runsMessages);
+    for (const id of exited0) {
+      runs[id] = { state: "exited", exitCode: 0 };
+    }
+    for (const id of timedOut) {
+      runs[id] = { state: "exited", exitCode: 1 };
+    }
+    state.runs = runs;
+  }
+
   _tReadBoard = Date.now() - _t0;
   // E0c10 D5 —— maxClues 也进 tickConfig（不仅喂 harvest 的封顶），否则 decideTermination
   //   的 capHit 判定（count >= cfg.maxClues）永远用缺省 64，--max-clues 对终态毫无影响，

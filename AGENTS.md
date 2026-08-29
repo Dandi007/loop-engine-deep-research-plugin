@@ -6,7 +6,7 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 
 - **插件入口**：`src/tick-entry.ts`（`package.json` 的 `main` / `exports`）。
 - **常用命令**：`npm run tick`、`tick:help`、`tick:selfcheck`、`tick:seed`（均为 `vite-node src/tick-entry.ts -- ...`）。
-- **驱动脚本**：`bin/deep-research-loop.sh`。**workflow 与模板**：`workflows/deep-research/`。**profile**：`profiles/`。
+- **统一入口**：`bin/deep-research.sh`（single entry，路由 light/heavy）。**heavy tier loop 落地（内部实现细节，非用户入口）**：`bin/deep-research-loop.sh`。**workflow 与模板**：`workflows/deep-research/`。**profile**：`profiles/`。
 - **验收**：`npm test`（vitest）、`npm run typecheck`、**`npm run smoke:cas`**（CAS 认领专测，`vitest.smoke.config.ts`）。
 - **协议**：`research.clue.v2`（线索，有版本链）、`research.evidence.v2`(证据，leaf 不可变)、`research.doc.v2`（长文本，leaf 不可变）。
 - **依赖的既有基建**：agent-bus（板面读写与协议校验）、agent-runtime / subagent-mcp（worker 派发）、loop-engine（`superviseDrain`、lock、node）。本仓不自造这三样。
@@ -20,13 +20,17 @@ deep-research 的**确定性调度引擎插件**（loop-engine plugin）：clue 
 
 - [001 开发纪律](docs/constitution/001-development-discipline.md) —— 开发走 dd、不自造基建、**协议与 CAS 不变量**、**被测试钉死的文档**、验收面、文档纪律
 
-**`docs/specs/`** —— 设计与规格。**当前无条目**：设计 SSoT 在 work folder `wf-dc0c15`。
+**`docs/specs/`** —— 设计与规格。
+
+- [001 统一调用面](docs/specs/001-unified-invocation-surface.md) —— single entry（`bin/deep-research.sh`），light/heavy 路由、one-command heavy、MCP tool + skill + CLI 三条调用面、legacy direct-run 降级（C2）。
+- [002 单一真相源协议契约](docs/specs/002-protocol-contract-single-source.md) —— 消费侧 schema 从 agent-bus 注册表（按 `contract_digest`）推导/校验，no hand-copied allowlist（C4）。
 
 **其他（被测试按路径钉死，明确不迁、不适用 `NNN-` 命名）**
 
 - [docs/deploy.md](docs/deploy.md) —— 部署四步。`test/d1-deploy-config.test.ts:247-249` 读它并**断言正文内容**，改它等于改验收面。
 - [`docs/dev-notes/`](docs/dev-notes/) —— 32 份 dd 单实施笔记。其中 `dev_ledr_a7_plugin_wiring_01.md` 与 `dev_ledr_a8e_harvest_01.md` 被 `test/plugin-wiring.test.ts:163`、`test/harvest.test.ts:415` 断言存在。
 - `workflows/deep-research/tick/templates/tick.md` —— 产品内容（注入 pipeline 的模板），被 `bin/deep-research-loop.sh` 依赖。
+- [`deploy/README.md`](deploy/README.md) —— 声明式部署契约（C1）：schema、声明、`preflight` 命令、失败即关断错误码、部署对齐证明。产物在 `deploy/contract/`（schema）、`deploy/declarations/`（声明）、`deploy/applications.json`（注册表）。
 
 ## 开发纪律
 

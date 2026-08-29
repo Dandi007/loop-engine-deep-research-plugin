@@ -132,7 +132,10 @@ if (req.method === "GET" && /^\/v1\/channels\/[^/]+$/.test(path)) {
           l.push(msg);
         }
         channels.set(id, l);
-        if (p.entity_id) entities.set(p.entity_id, msg);
+        // 真机 bus 对「不带 entity_id 的首次发布」（如播种 research.clue.v2）会注册一个实体，
+        // 后续 CAS 经 getEntity(entity_id) 才能读到它。这里镜像该行为：无论显式还是自动生成的
+        // entity_id 都注册，否则 getEntity(自动生成的 id) 会 404 ⇒ CAS 恒 entity_not_found。
+        if (msg.entity_id) entities.set(msg.entity_id, msg);
         return send(200, { message_id: msg.message_id, channel_seq: msg.channel_seq, deduplicated: false });
       });
       return;

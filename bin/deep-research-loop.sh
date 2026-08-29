@@ -215,10 +215,15 @@ TRIGGER_ID="a9-$(date +%s%N)-$$"
 
 render
 echo "[deep-research-loop] mode=$MODE run_root=$RUN_ROOT"
-# G15: drain 后检查 tick 失败 —— 捕获 drain 输出，解析 drain_id，
+# G15/C3: drain 后检查 —— 捕获 drain 输出，解析 drain_id，
 # 遍历 index.jsonl → journal.jsonl 查找 [bash 非零退出 EXIT:<n>]（G15）或
 # 引擎级 node_timeout/wall_clock 杀掉的 [外部调用失败 status=TIMEOUT] + error:"exec"（E0c10 D7 / GT-A），
 # 命中任一则响亮失败并点名 run_dir。
+# C3（判别核心）: ⛔ 哨兵判定必须在 drain 进程**任何**退出/死亡路径后都读取 drain registry
+# （drain.json status/outstanding/last_heartbeat + index.jsonl run.start/run.end 配对 +
+# loop-events.jsonl 轮次配对）。存在未收割 in_flight/open 卡（outstanding>0）或 drain 未写
+# run.end 时产出响亮 sentinel_lost 终态（非零退出 + 点名 drain_id/outstanding/未收割计数），
+# 绝不静默 exit 0，绝不把「带活儿猝死」伪装成 done。
 DRAIN_TMP=$(mktemp)
 trap 'rm -f "$DRAIN_TMP"' EXIT
 set +e
@@ -228,8 +233,16 @@ set -e
 
 cat "$DRAIN_TMP"
 
+# C3 —— 任何退出/死亡路径（含 SIGKILL 无摘要）后都执行哨兵判定。
+set +e
+node "$PLUGIN_ROOT/scripts/check-drain-failures.mjs" < "$DRAIN_TMP"
+CHECK_EXIT_CODE=$?
+set -e
+
+if [ "$CHECK_EXIT_CODE" -ne 0 ]; then
+  exit "$CHECK_EXIT_CODE"
+fi
 if [ "$DRAIN_EXIT_CODE" -ne 0 ]; then
   exit "$DRAIN_EXIT_CODE"
 fi
-
-node "$PLUGIN_ROOT/scripts/check-drain-failures.mjs" < "$DRAIN_TMP"
+exit 0

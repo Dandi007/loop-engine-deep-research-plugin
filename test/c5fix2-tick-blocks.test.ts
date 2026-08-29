@@ -205,21 +205,37 @@ describe("C5-fix2 (b): a tick that returns immediately (old behavior) is detecte
   });
 });
 
-// ── (c) 永不 exited ⇒ 声明超时响亮失败，不是静默零增长 ──────────────────────
+// ── (c) 永不 exited ⇒ 声明超时回收该 clue、响亮诊断、tick 仍 0 退出 ─────────
 
-describe("C5-fix2 (c): never-exiting worker ⇒ loud timeout (not silent zero-growth)", () => {
-  it("started but never exits/never produces result ⇒ throws declared-timeout error", async () => {
+describe("C5-fix2 (c): never-exiting worker ⇒ per-worker timeout reclaim (not silent zero-growth)", () => {
+  it("started but never exits/never produces result ⇒ clue reclaimed to open + diagnostic, tick exit 0", async () => {
     process.env.AGENT_RESULT_POLL_MS = "5";
     process.env.AGENT_RESULT_TIMEOUT_MS = "60";
+    const captures: CapturedPublish[] = [];
     // result 永不出现（resultAfterReads 极大），run 也永不 exited ⇒ 纯超时。
-    const { runsPage1Calls } = stubTick({ resultAfterReads: 1_000_000 });
+    const { runsPage1Calls } = stubTick({ resultAfterReads: 1_000_000, captures });
 
-    await expect(
-      runChannelWrite({ channelId: CHANNEL, evidenceChannelId: EVIDENCE_CHANNEL, maxWrites: 20 }),
-    ).rejects.toThrow(/C5-fix2: timed out waiting for worker result for run run-1/);
+    const outcome = await runChannelWrite({
+      channelId: CHANNEL,
+      evidenceChannelId: EVIDENCE_CHANNEL,
+      maxWrites: 20,
+    });
 
-    // 确实是「阻塞等待」到超时（轮询多次），而非静默返回零增长。
+    // tick 以 0 退出（没有抛错）：声明超时只回收该 worker 自己，不毙整 tick（C5-fix3）。
     expect(runsPage1Calls()).toBeGreaterThanOrEqual(2);
+
+    // 响亮诊断：phase=worker、reason=result-timeout，点名 run_id 与 role。
+    const diag = outcome.diagnostics.find((d) => d.phase === "worker");
+    expect(diag).toBeDefined();
+    expect(diag!.runId).toBe(RUN_ID);
+    expect(diag!.reason).toBe("result-timeout");
+    expect(diag!.elapsedMs).toBeGreaterThan(0);
+
+    // 该 clue 被逐 worker 回收（CAS in_flight → open），而不是静默留在 in_flight。
+    const openCas = captures.find(
+      (c) => c.kind === "research.clue.v2" && (c.payload as { status?: string }).status === "open",
+    );
+    expect(openCas).toBeDefined();
   });
 });
 

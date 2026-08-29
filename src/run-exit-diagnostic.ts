@@ -40,6 +40,41 @@ export class RunExitedWithoutResultError extends Error {
 }
 
 /**
+ * C5-fix3 —— 「run 未 exited、超过声明结果超时仍未产出 result」的强类型错误。
+ *
+ * 与 `RunExitedWithoutResultError`（run 已 exited 无 result）区分：本类是**纯超时**
+ * （bus 可达、run 仍未 exited、无 result）。此前超时抛的是普通 `Error`，worker 路径
+ * 无法可靠区分「声明结果超时」与「其它意外错误」（如 bus 不可达），只得整体非零退出——
+ * 这正是根因（一个慢 worker 超时毙掉整 tick、连带丢失其它 worker 已就绪的结果）。
+ *
+ * C5-fix3 契约：worker 声明结果超时 ⇒ **逐 worker** 标记并回收其 clue（CAS 回 open）、
+ * tick 继续收割其它就绪结果、仍以 0 退出。triage / generate 路径的超时语义不变
+ * （仍是响亮失败，非零退出），故保留消息由 `buildTimeoutMessage` 构造。
+ */
+export class RunResultTimeoutError extends Error {
+  /** run_id（诊断必含）。 */
+  readonly runId: string;
+  /** 角色（dr-worker-*）。诊断必含。 */
+  readonly role: string;
+  /** 已等待时长（ms），从开始轮询到超时。 */
+  readonly elapsedMs: number;
+  constructor(runId: string, role: string, elapsedMs: number, message: string) {
+    super(message);
+    this.name = "RunResultTimeoutError";
+    this.runId = runId;
+    this.role = role;
+    this.elapsedMs = elapsedMs;
+  }
+}
+
+/**
+ * 类型守卫：判定一个未知值是否为 `RunResultTimeoutError`（避免循环 import 时的 instanceof）。
+ */
+export function isRunResultTimeoutError(e: unknown): e is RunResultTimeoutError {
+  return e instanceof RunResultTimeoutError;
+}
+
+/**
  * E0c10 D4（GT-D）—— 一次「run exited 无 result」的诊断记录（进入 tick 输出的 diagnostics）。
  * 字段逐字对齐 GT-D：run_id / role / 已等时长。
  */
@@ -52,6 +87,11 @@ export interface RunExitWithoutResultDiagnostic {
    * 或 worker（C5-fix2 在飞卡阻塞等待结果）。诊断与判别性测试据此区分两条路径都覆盖（判据 4）。
    */
   phase: "triage" | "generate" | "worker";
+  /**
+   * C5-fix3 —— worker 路径的失败原因细分：`exited-without-result`（run 已 exited 无 result）
+   * 或 `result-timeout`（run 未 exited、超声明结果超时）。缺省（旧路径）视同 exited-without-result。
+   */
+  reason?: "exited-without-result" | "result-timeout";
 }
 
 /** 类型守卫：判定一个未知值是否为 RunExitedWithoutResultError（避免循环 import 时的 instanceof）。 */

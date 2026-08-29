@@ -48,10 +48,10 @@ export interface RunExitWithoutResultDiagnostic {
   role: string;
   elapsedMs: number;
   /**
-   * 哪条装配路径观察到的：triage（dr-triage 派发）或 generate（dr-debater / dr-synthesizer）。
-   * 诊断与判别性测试据此区分两条路径都覆盖（判据 4）。
+   * 哪条装配路径观察到的：triage（dr-triage 派发）、generate（dr-debater / dr-synthesizer）
+   * 或 worker（C5-fix2 在飞卡阻塞等待结果）。诊断与判别性测试据此区分两条路径都覆盖（判据 4）。
    */
-  phase: "triage" | "generate";
+  phase: "triage" | "generate" | "worker";
 }
 
 /** 类型守卫：判定一个未知值是否为 RunExitedWithoutResultError（避免循环 import 时的 instanceof）。 */

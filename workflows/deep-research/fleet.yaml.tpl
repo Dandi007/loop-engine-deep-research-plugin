@@ -1,4 +1,9 @@
-max_passes: 16
+# C5（再暴露）—— round 预算**有界但充分**（非固定 16）：由 tick 配置确定性推导，
+#   保证「终止 tick/generate 必在预算内可达」。推导见 src/max-passes.ts（deriveMaxPasses），
+#   由 bin/deep-research-loop.sh 导出 MAX_PASSES 后经 render-template.mjs 替换。
+#   固定 16 会让收敛所需轮数 > 16 的 heavy run 在终态 generate tick 前被截断
+#   （report 永不落盘、哨兵又只认 running+outstanding>0 ⇒ done+outstanding>0 静默 exit 0）。
+max_passes: ${MAX_PASSES}
 pipelines:
   - label: tick
     config_dir: ${PLUGIN_ROOT}/workflows/deep-research/tick

@@ -140,6 +140,24 @@ export RESEARCH_ORIGIN="${RESEARCH_ORIGIN:-}"
 export DOC_CHANNEL="${DOC_CHANNEL:-}"
 # E0c3b §1.1 —— triage 触发阈值（profile 声明，缺省 3；⛔ 不得改 DEFAULT_TICK_CONFIG 缺省）。
 export TRIAGE_THRESHOLD="${TRIAGE_THRESHOLD:-3}"
+# C5（再暴露）—— round 预算**有界但充分**（非固定 16）：由 tick 配置确定性推导（src/max-passes.ts
+#   deriveMaxPasses：maxClues + zeroGrowthThreshold + margin），保证「终止 tick/generate 必在预算内可达」。
+# ⛔ 单一真相源：走 vite-node 调 src/max-passes.ts（与 bin/e0-regression.sh 解析 RUNS_CHANNEL_ID 同款范式），
+#    推导失败 ⇒ 响亮失败（绝不静默回退固定 16，那会让 heavy run 在终态 tick 前被截断）。
+# 显式 MAX_PASSES 覆盖语义保留（测试/部署可注入小值模拟预算耗尽场景）。
+if [ -z "${MAX_PASSES:-}" ]; then
+  if ! MAX_PASSES="$(MAX_PASSES_CLI=1 "$PLUGIN_ROOT/node_modules/.bin/vite-node" "$PLUGIN_ROOT/src/max-passes.ts" 2>/dev/null)"; then
+    echo "[deep-research-loop] failed to derive MAX_PASSES (round budget) from src/max-passes.ts; refusing to fall back to a fixed 16." >&2
+    exit 3
+  fi
+fi
+case "$MAX_PASSES" in
+  ''|*[!0-9]*)
+    echo "[deep-research-loop] derived MAX_PASSES is not a positive integer: '$MAX_PASSES'. Refusing to render an invalid round budget." >&2
+    exit 3
+    ;;
+esac
+export MAX_PASSES
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

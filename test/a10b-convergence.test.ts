@@ -273,8 +273,11 @@ function state(over: Partial<BoardState> = {}): BoardState {
 // ── B1 + B1-guard：真实端到端 drain 必须收敛为 drained ─────────────
 // E0c2 GT-10：续投门放宽后（hasPendingWork==true OR (termination.state==null && !capHit)），
 // 板面排空后仍需继续 tick 直到终态或 max_rounds，B1/B2 必然变慢（实测 B1≈2.5s, B2≈4.4s）。
-// vitest 缺省 testTimeout 5s 在并发负载下不足，此处放宽到 30s 并注明理由；
-// ⛔ 不得全局调大 testTimeout 掩盖别处卡死，⛔ 不得改回续投门或 skip/删用例。
+// vitest 缺省 testTimeout 5s 在并发负载下不足。attempt 2 final_review 判 BLOCKER：
+// 全量 `npm test`（vitest 并行、12 核、同批含 e0c2 等 50s+ 重负载用例）下 B2 曾 30000ms
+// 超时 ⇒ 验收证据 exit 1。本用例是真实端到端（真实驱动脚本 + 真实 loop-engine CLI + 本地
+// 受控 agent-bus，子进程 spawn 多），串行下 ~5s，并行满载下最坏远超 30s —— 故放宽到 90s
+// 并注明理由；⛔ 不得全局调大 testTimeout 掩盖别处卡死，⛔ 不得改回续投门或 skip/删用例。
 
 describe("B1: real end-to-end drain converges to reason='drained'", () => {
   const guard = (fn: () => void) => {
@@ -289,7 +292,7 @@ describe("B1: real end-to-end drain converges to reason='drained'", () => {
       );
       return;
     }
-    it("empty terminal board through the real driver drains with reason=drained", { timeout: 30000 }, async () => {
+    it("empty terminal board through the real driver drains with reason=drained", { timeout: 90000 }, async () => {
       const { code, out } = await runRealE2E({});
       expect(code).toBe(0);
       const result = drainResult(out) as { reason?: string };
@@ -328,7 +331,7 @@ describe("B2: real end-to-end harvest publishes evidence readable back from the 
       );
       return;
     }
-    it("drains and leaves research.evidence.v2 in the evidence channel", { timeout: 30000 }, async () => {
+    it("drains and leaves research.evidence.v2 in the evidence channel", { timeout: 90000 }, async () => {
       const dir = mkdtempSync(join(tmpdir(), "a10b-b2-"));
       const seed = join(dir, "seed.json");
       writeFileSync(

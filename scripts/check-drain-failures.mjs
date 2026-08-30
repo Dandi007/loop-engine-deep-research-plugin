@@ -176,21 +176,35 @@ if (sentinelLost) {
   process.exit(3);
 }
 
-// ── C5（再暴露）——「干净 exit 0 零报告」新失败签名（判别性规格 1/3）─────────────────
-// 根因（spec §根因链 3/4）：round 预算（max_passes）在终态 generate tick 前被截断 ⇒
-//   report 永不落盘；drain.json.status 被 markDrainDone 置成 done（含 max_rounds），
-//   而旧哨兵只把 `running + outstanding>0`、drain 无 run.end、轮次未闭合判为 sentinel_lost，
-//   于是「done + outstanding=1 + run.end 有 + 轮次全闭合」被误当成功 ⇒ 静默 exit 0。
+// ── C5（第三暴露）——「撞派生预算 max_passes 不收敛仍静默 exit 0 零报告」响亮化（判别性规格 1-3）──
+// 根因（spec §根因链）：round 预算（max_passes）实际收敛所需轮次超出 deriveMaxPasses 派生的
+//   max_passes ⇒ coverage 冻结、proposed/inFlight 未排空 ⇒ runGenerate 从未触发 ⇒ 零报告；
+//   drain.json.status 被 markDrainDone 置成 done（含 max_rounds），而旧哨兵把 `max_rounds` 排除在
+//   零报告判定外（旧 line 190：summaryReason !== "max_rounds"）⇒ done + outstanding≥1 +
+//   零报告被误当成功 ⇒ 静默 exit 0。这正是 C3「哨兵静默失效必响亮」的违约。
 //
-// ⛔ 排除 reason=max_rounds：e0-regression 的多 drain 收敛把 `max_rounds + exit 1` 当作
-//   「还没收敛、退避重来」的合法中间态（GT-6），不是本签名；本签名特指**干净收尾
-//   （reason=drained / exit 0）却 outstanding>0（存在未消费续投 trigger）或 docs channel 空**。
-//   若让 max_rounds 也在这里响亮，会推翻 e0-regression 的多 drain 收敛设计。
+// ⛔ 判别性规格 2：零报告哨兵不得再以 `summaryReason !== "max_rounds"`（或以 max_passes 撞顶）
+//   排除撞预算终局。drain 以「status=done 且 (outstanding≥1 或 报告未生成)」结束时，无论原由是
+//   drained 还是 max_rounds/max_passes，都必须响亮（非零退出 + 点名 drain_id/outstanding/缺报告），
+//   reason 使用稳定 token：budget_exhausted_no_report（撞预算）/ zero_report（其余）。
+//
+// ⛔ 判别性规格 3（e0-regression 不推翻）：GT-6 的「max_rounds + 非零退出 ⇒ 退避重来」合法中间态
+//   只适用于**非最终、可重试的 drain 尝试**；对**最终一次 drain**（无后续重试包装），撞预算 +
+//   零报告必须响亮失败。判别依据：由**调用方显式声明重试包装**（DR_DRAIN_RETRY_WRAPPED=1，
+//   e0-regression.sh 的多 drain 循环声明）；生产 deep-research-loop.sh 的单 drain 即最终 drain
+//   （不声明）⇒ max_rounds/max_passes 不排除、必须响亮。
+const retryWrapped = process.env.DR_DRAIN_RETRY_WRAPPED === "1";
+const budgetHit = summaryReason === "max_rounds" || summaryReason === "max_passes";
+// 可重试中间尝试（调用方声明重试包装）且撞预算 ⇒ 保持旧排除（GT-6 退避重来交给外层循环分类）；
+// 其余（含最终 drain 撞预算）⇒ 全部纳入零报告判定。
+const excludedBudgetHit = retryWrapped && budgetHit;
 let zeroReportReason = null;
-if (drainState !== null && drainState.status === "done" && summaryReason !== "max_rounds") {
+let zeroReportToken = "zero_report";
+if (drainState !== null && drainState.status === "done" && !excludedBudgetHit) {
   const outstanding = drainState.outstanding ?? 0;
   if (outstanding > 0) {
     zeroReportReason = `unconsumed continuation trigger outstanding=${outstanding}`;
+    if (budgetHit) zeroReportToken = "budget_exhausted_no_report";
   } else {
     // docs channel 空：RESEARCH_ORIGIN 已配置（报告预期）而 generate 一次性标记缺失
     // （未生成/未落盘）。标记路径与 src/tick-run.ts runChannelWrite 的 one-shot 标记逐字对齐：
@@ -208,13 +222,14 @@ if (drainState !== null && drainState.status === "done" && summaryReason !== "ma
       const markerPath = join(oneShotDir, `generated-${markerHash}`);
       if (!existsSync(markerPath)) {
         zeroReportReason = `report not generated (docs channel empty): missing ${markerPath}`;
+        if (budgetHit) zeroReportToken = "budget_exhausted_no_report";
       }
     }
   }
 }
 if (zeroReportReason) {
   process.stderr.write(
-    `[deep-research-loop] ZERO REPORT: zero_report drain_id=${drainId} ${zeroReportReason}\n`,
+    `[deep-research-loop] ZERO REPORT: ${zeroReportToken} drain_id=${drainId} ${zeroReportReason}\n`,
   );
   process.stderr.write(
     `[deep-research-loop]   drain registry: status=done outstanding=${drainState.outstanding ?? 0}\n`,

@@ -64,6 +64,11 @@ if [ -n "$tick_channel" ]; then
   if [ -n "$doc_channel" ]; then tick_args+=(--doc-channel "$doc_channel"); fi
   # E0c3b §1.1 —— triage 触发阈值：由 pipeline input 注入（缺省 3），与 MAX_WRITES 同款装配链。
   if [ -n "$triage_threshold" ]; then tick_args+=(--triage-threshold "${triage_threshold}"); fi
+  # C5 —— round 预算耗尽标记（末轮响亮收口）：由 pipeline input 注入 BUDGET_EXHAUSTED
+  # （bin/deep-research-loop.sh 在撞预算时导出 1）。为 1 时 tick 把 started-超预算在飞卡
+  # bounded-terminalize 到 blocked、decideTermination 在未排空时产出响亮非收敛 reason，
+  # 使板面可排空、generate 可点燃，或由 drain 哨兵按退出契约响亮非零退出（判别性规格 §四）。
+  if [ "${budget_exhausted:-}" = "1" ]; then tick_args+=(--budget-exhausted); fi
   # G4b —— 从 trigger_body 解析上一轮的 coverage / zeroGrowthRounds 并传给 tick-entry。
   #   ⛔ body 一旦非空就必须是合法 JSON。首轮判定基于 **seed 标记**（{"seed":true}）：
   #      seed body ⇒ 不传 --prev-*（tick-entry --run 缺省 0 = 首轮语义）。

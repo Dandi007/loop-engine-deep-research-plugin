@@ -37,6 +37,10 @@ pipelines:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），
       # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
       triage_threshold: ${TRIAGE_THRESHOLD}
+      # C5 —— round 预算耗尽标记（末轮响亮收口）：由 bin 导出 BUDGET_EXHAUSTED（缺省空）。
+      # 为 1 时 tick.md 传 --budget-exhausted ⇒ tick 把 started-超预算在飞卡 bounded-terminalize
+      # 到 blocked、decideTermination 在未排空时产出响亮非收敛 reason（判别性规格 §四）。
+      budget_exhausted: ${BUDGET_EXHAUSTED}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

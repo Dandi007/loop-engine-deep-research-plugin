@@ -66,8 +66,10 @@ import { fileParse } from "./mineru";
 import {
   RunExitedWithoutResultError,
   RunResultTimeoutError,
+  decideDrainExit,
   isRunExitedWithoutResultError,
   isRunResultTimeoutError,
+  type DrainExitContractResult,
   type RunExitWithoutResultDiagnostic,
 } from "./run-exit-diagnostic";
 import {
@@ -1411,6 +1413,16 @@ export interface RunWriteOptions {
    * E0c3b §1.1 —— triage 触发阈值（--triage-threshold）；缺省 DEFAULT_TICK_CONFIG.triageThreshold。
    */
   triageThreshold?: number;
+  /**
+   * C5 —— 本轮是否为 round 预算耗尽（最后一轮，max_passes 推导预算已触顶）。
+   * 为 true 时：
+   *   - decideTick 把「started 但超预算仍未 exit」的在飞卡 bounded-terminalize 到 blocked；
+   *   - decideTermination 在板面未排空时产出响亮非收敛 reason（点名 in_flight/proposed/open）；
+   *   - 生成段依此收口（有报告则出口 0，无报告则 drain 层按退出契约响亮非零）。
+   * 生产由 bin/deep-research-loop.sh 在撞预算的最后一轮导出（BUDGET_EXHAUSTED=1 →
+   * tick.md → tick-entry --budget-exhausted）；测试直接注入。
+   */
+  budgetExhausted?: boolean;
 }
 
 /** runChannelWrite 的观察输出。 */
@@ -1436,6 +1448,12 @@ export interface RunWriteOutcome {
    * `termination.coverage` / `termination.zeroGrowthRounds` 写进下一条 trigger 的 body。
    */
   termination: TerminationState;
+  /**
+   * C5 —— 本轮生效的 drain 退出契约（预算耗尽 + 未排空 + 报告未生成 ⇒ 非零退出 + reason）。
+   * run 级响亮收口：预算耗尽的最后一轮产出，供 drain/哨兵据此写非零退出 + reason 落盘
+   * （判别性规格 §四.1；判别测试 3 直接驱动 decideDrainExit 断言三个计数 + exit_code!=0）。
+   */
+  drainExit: DrainExitContractResult;
   /**
    * E0c3b §1.1 —— 本轮生效的 triage 触发阈值（来自 profile 或缺省值）。
    */
@@ -2048,7 +2066,12 @@ export async function runChannelWrite(
     ...(opts.maxDepth !== undefined ? { maxDepth: opts.maxDepth } : {}),
   };
   const _tDecideStart = Date.now();
-  const decisions = decideTick(state, tickConfig);
+  // C5 —— round 预算耗尽时，把 started-超预算在飞卡 bounded-terminalize 到 blocked（判别性规格 §四.2）。
+  const decisions = decideTick(
+    state,
+    tickConfig,
+    opts.budgetExhausted === true ? { budgetExhausted: true } : undefined,
+  );
   _tDecide = Date.now() - _tDecideStart;
   // E1 D7——本 tick 内所有 material 的 MinerU 调用共享同一个 createMutex（spec §1 D7：
   //   「N 条 material 同时到达，任一时刻在飞 MinerU 调用 = 1」）。⚠️ 评审 major finding：
@@ -2312,10 +2335,31 @@ export async function runChannelWrite(
       coveredClueIds,
       prevCoverage: opts.prevCoverage ?? 0,
       prevZeroGrowthRounds: opts.prevZeroGrowthRounds ?? 0,
+      // C5 —— round 预算耗尽：板面未排空时产出响亮非收敛 reason（判别性规格 §四.1）。
+      budgetExhausted: opts.budgetExhausted === true,
     },
     tickConfig,
   );
   _tTerm = Date.now() - _tTermStart;
+
+  // C5 —— run 级响亮收口（判别性规格 §四.1/§四.3）：预算耗尽 + 板面未排空 +
+  // 报告未生成 ⇒ drain 退出契约非零。判别测试 3 直接驱动 decideDrainExit 断言
+  // reason 点名三个计数（outstanding/in_flight/proposed）且 exit_code != 0。
+  // reportGenerated 由 generate 一次性标记是否已落盘判定（与哨兵逐字对齐）：
+  //   <oneShotDir>/generated-<sha256(origin:channel)[:16]>；未配置 origin 视为无报告预期。
+  const reportGenerated = (() => {
+    if (!opts.origin) return false;
+    const oneShotDir = opts.oneShotDir ?? join(tmpdir(), "deep-research-generated");
+    const markerKey = `${opts.origin}:${opts.channelId}`;
+    const markerHash = createHash("sha256").update(markerKey).digest("hex").slice(0, 16);
+    return existsSync(join(oneShotDir, `generated-${markerHash}`));
+  })();
+  const drainExit = decideDrainExit({
+    budgetExhausted: opts.budgetExhausted === true,
+    boardComposition: termination.boardComposition,
+    outstanding: 0,
+    reportGenerated,
+  });
 
   // G4c —— 生成段接线：终态非 null + origin 已配置 ⇒ 调用 runGenerate。
   if (opts.origin) {
@@ -2354,6 +2398,7 @@ export async function runChannelWrite(
     triageReports: result.triageReports,
     hasPendingWork: hasPendingWork(postWriteState) || cluesPublished > 0,
     termination,
+    drainExit,
     triageThreshold: tickConfig.triageThreshold,
     // E1c D6——本轮生效的 spool 根进运行记录（tick 的 JSON 输出），使人能看出 transcript 落在哪。
     contentSpoolRoot,
@@ -2474,6 +2519,8 @@ export interface RunCliOptions {
   contentSpoolRoot?: string;
   /** E1b D1——content channel（--content-channel）；缺省 CONTENT_CHANNEL_ID（research:content）。 */
   contentChannelId?: string;
+  /** C5 —— round 预算耗尽（--budget-exhausted，末轮响亮收口）。缺省 false。 */
+  budgetExhausted?: boolean;
 }
 
 /**
@@ -2500,8 +2547,11 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
   let maxClues: number | undefined;
   let contentSpoolRoot: string | undefined;
   let contentChannelId: string | undefined;
+  let budgetExhausted: boolean | undefined;
   for (let i = 1; i < args.length; i += 1) {
-    if (args[i] === "--max-writes") {
+    if (args[i] === "--budget-exhausted") {
+      budgetExhausted = true;
+    } else if (args[i] === "--max-writes") {
       const value = Number(args[i + 1]);
       if (!Number.isInteger(value) || value <= 0) {
         throw new Error("A8b: invalid --max-writes (must be a positive integer).");
@@ -2626,6 +2676,7 @@ export function parseRunCliArgs(args: string[]): RunCliOptions {
     maxClues,
     contentSpoolRoot,
     contentChannelId,
+    budgetExhausted,
   };
   // G4b —— 仅在 CLI 显式传入时才放进结果（缺省 = 首轮无前值，runChannelWrite 内部用 0）。
   if (prevCoverage !== undefined) result.prevCoverage = prevCoverage;

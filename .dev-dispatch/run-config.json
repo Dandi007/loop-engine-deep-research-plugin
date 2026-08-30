@@ -1,6 +1,6 @@
 {
  "development_id": "dev-fg-ab89b4a64897",
- "generation": 1,
+ "generation": 2,
  "acceptance_commands": [
   [
    "npm",
@@ -13,7 +13,10 @@
   ],
   [
    "npm",
-   "test"
+   "test",
+   "--",
+   "--maxWorkers=1",
+   "--minWorkers=1"
   ],
   [
    "npm",

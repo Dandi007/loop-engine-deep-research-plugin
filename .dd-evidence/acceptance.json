@@ -1,0 +1,48 @@
+{
+ "development_id": "dev-fg-7411e814ef60",
+ "attempt": 1,
+ "passed": true,
+ "results": [
+  {
+   "command": [
+    "npm",
+    "ci"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\nadded 49 packages, and audited 50 packages in 1s\n\n13 packages are looking for funding\n  run `npm fund` for details\n\n6 vulnerabilities (3 moderate, 2 high, 1 critical)\n\nTo address issues that do not require attention, run:\n  npm audit fix\n\nTo address all issues (including breaking changes), run:\n  npm audit fix --force\n\nRun `npm audit` for details.\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\n> loop-engine-deep-research-plugin@0.1.0 typecheck\n> tsc --noEmit\n\n",
+   "stderr_tail": ""
+  },
+  {
+   "command": [
+    "npm",
+    "test",
+    "--",
+    "--maxWorkers=1",
+    "--minWorkers=1"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "ion：本轮终态判定（G4b，用本轮真实板面调用 decideTermination；coverage/zeroGrowthRounds 续投时写入下一条 trigger body）。\n ✓ test/g4e-seed.test.ts (20 tests) 13ms\n ✓ test/c1-preflight.test.ts (14 tests) 362ms\n   ✓ C1 fail-closed: unknown application exits nonzero with UNKNOWN_APPLICATION > --app does-not-exist ⇒ exit nonzero + error_code=UNKNOWN_APPLICATION 353ms\n ✓ test/s3.test.ts (19 tests) 6ms\n ✓ test/g10-per-role-runid.test.ts (8 tests) 10ms\n ✓ test/d2-profile.test.ts (6 tests) 460ms\n   ✓ Z5: --profile agent-harness --dry-run renders five items matching profile > only DEPLOY_PROFILE=agent-harness set (child env proven free of the five env) ⇒ all five equal profile 447ms\n ✓ test/tick-inspect.test.ts (11 tests) 9ms\n ✓ test/cas.test.ts (5 tests) 6ms\n ✓ test/c5-max-passes.test.ts (10 tests) 936ms\n   ✓ C5-MP-3（判别测试 3）: bash 侧与 TS 纯函数单一真相源（CLI 输出 == deriveMaxPasses） > vite-node main() 输出与 deriveMaxPasses(DEFAULT_TICK_CONFIG) 一致 305ms\n   ✓ C5-MP-3（判别测试 3）: bash 侧与 TS 纯函数单一真相源（CLI 输出 == deriveMaxPasses） > MAX_CLUES 显式覆盖改变推导（bash 渲染所用值由此而来） 332ms\n ✓ test/export.test.ts (13 tests) 12ms\n ✓ test/g12-profile-last-line.test.ts (4 tests) 1821ms\n   ✓ Z1: last-line key in a profile without trailing newline is loaded > profile without trailing newline: last-line key TICK_CHANNEL is loaded 475ms\n   ✓ Z2: space-containing unquoted value is preserved verbatim > RESEARCH_QUESTION=agent harness renders as 'agent harness' (no quotes, no truncation) 468ms\n   ✓ Z3: explicit env precedence over profile is preserved > explicit TICK_CHANNEL beats profile value 444ms\n   ✓ Z3: explicit env precedence over profile is preserved > without explicit env, profile value is used 431ms\n ✓ test/mineru.test.ts (9 tests) 17ms\n ✓ test/bus.test.ts (10 tests) 9ms\n ✓ test/protocol.test.ts (11 tests) 4ms\n ✓ test/g8-role-argv.test.ts (5 tests) 7ms\n\n Test Files  50 passed (50)\n      Tests  880 passed (880)\n   Start at  13:34:50\n   Duration  131.73s (transform 840ms, setup 0ms, collect 2.63s, tests 116.20s, environment 9ms, prepare 2.23s)\n\n",
+   "stderr_tail": "e/--prev-zero-growth 由 tick.md 从 {{trigger_body}} 经\n                             本入口 --parse-trigger-body 解析后传入，首轮无前值不传（runChannelWrite 缺省 0）；\n                             JSON 输出含 termination（与 hasPendingWork 并列）。\n                     G4c——--origin 与 --doc-channel 由 tick.md 从 {{research_origin}}/{{doc_channel}} 传入；\n                             --origin 已配置且 termination.state !== null ⇒ runGenerate 被调用；\n                             --one-shot-dir 跨进程一次性标记目录（缺省 tmpdir/deep-research-generated）。\n... --parse-trigger-body <body_json>\n                      G4b——把 trigger body 字符串解析成跨 tick 终止计数（attempt 2 评审 minor：\n                      tick.md 原先用内嵌 node 脚本另写一份解析，与本 TS 解析器可静默发散；现改为\n                      统一调用 parseTerminationFromBody，单源真相）。\n                      输出（stdout，换行分隔）：首轮 body（{\"seed\":true}）⇒ 空串（调用方不传 --prev-*）；\n                      续投 body（含 coverage/zeroGrowthRounds）⇒ \"--prev-coverage\n<n>\n--prev-zero-growth\n<m>\n\"。\n                      body 缺失/损坏/续投 body 丢计数器 ⇒ stderr 点名 trigger_body/G4b 并 exit 1（不得静默回落 0/0）。\n\n--help / --selfcheck 不 import ./bus、不发任何网络请求、不触碰 agent-bus / MinerU / vault。\n--inspect 只读真实 agent-bus（仅 GET 分页），零写入，不触碰 MinerU / vault。\n--run 对显式传入的 channel 执行 CAS 认领/回收 + spawn + 收割（接线判别）：先 CAS 成功才按 role spawn，\n      spawn 同步失败当场 CAS 回 open；exited(0) 卡先收割（evidence + 新 clue）再 CAS 到 explored；\n       --evidence-channel 显式传入（无默认值，缺失仅当有收割时才报错）；单次写入上限默认 DEFAULT_MAX_WRITES（--max-writes，A10c 起足以收割一张真实卡）；\n       --allowed-root 显式传入 worker 可读 repo 根（code-local 必需，经 --add-dir 授予读，缺失则响亮失败）；\n       --question 研究主问题（进入 triage 语料 question；缺省时遇 triage 决策即响亮失败）；\n       --prev-coverage/--prev-zero-growth 上一 tick 的覆盖度/零增长轮数（跨 tick 终止计数，由续投 trigger body 承载）；\n        拒绝写 v1 冻结 channel。\n  JSON 输出含 hasPendingWork：板面是否仍有非终态 clue（proposed/open/in_flight），由板面确定性推出（A9）。\n  JSON 输出含 termination：本轮终态判定（G4b，用本轮真实板面调用 decideTermination；coverage/zeroGrowthRounds 续投时写入下一条 trigger body）。\nmax-passes: invalid MAX_CLUES \"abc\" (must be a positive integer); refusing to derive an invalid budget\n"
+  },
+  {
+   "command": [
+    "npm",
+    "run",
+    "smoke:cas"
+   ],
+   "exit_code": 0,
+   "stdout_tail": "\n> loop-engine-deep-research-plugin@0.1.0 smoke:cas\n> vitest run --config vitest.smoke.config.ts\n\n\n RUN  v2.1.9 /data/worktrees/ledr-c5-budget-sentinel-h0-20260830T123514Z\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ① publish message_id=msg_01KZ6FT90ZH11S18KH3FQZ4CE3 channel_seq=4 entity_id=msg_01KZ6FT90ZH11S18KH3FQZ4CE3 deduplicated=true\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ② claim success=false messageId=n/a error=conflict\n\nstdout | scripts/smoke-cas.ts > smoke: CAS claim on real agent-bus > publish → claim → conflict (re-run safe)\n[smoke] ③ claim success=false messageId=n/a error=conflict\n\n ✓ scripts/smoke-cas.ts (1 test) 74ms\n\n Test Files  1 passed (1)\n      Tests  1 passed (1)\n   Start at  13:37:02\n   Duration  594ms (transform 58ms, setup 0ms, collect 52ms, tests 74ms, environment 0ms, prepare 68ms)\n\n",
+   "stderr_tail": ""
+  }
+ ]
+}

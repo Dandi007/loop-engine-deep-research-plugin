@@ -1,0 +1,29 @@
+{
+ "development_id": "dev-fg-7411e814ef60",
+ "generation": 1,
+ "acceptance_commands": [
+  [
+   "npm",
+   "ci"
+  ],
+  [
+   "npm",
+   "run",
+   "typecheck"
+  ],
+  [
+   "npm",
+   "test",
+   "--",
+   "--maxWorkers=1",
+   "--minWorkers=1"
+  ],
+  [
+   "npm",
+   "run",
+   "smoke:cas"
+  ]
+ ],
+ "setup_commands": [],
+ "acceptance_env": {}
+}

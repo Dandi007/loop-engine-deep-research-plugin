@@ -158,6 +158,11 @@ case "$MAX_PASSES" in
     ;;
 esac
 export MAX_PASSES
+# C5 —— round 预算耗尽标记（末轮响亮收口）：由部署/重试包装显式声明（DR_DRAIN_RETRY_WRAPPED 同款
+# 范式），或由巡检在撞预算的最后一轮注入 1。为 1 时 tick 把 started-超预算在飞卡 bounded-terminalize
+# 到 blocked、decideTermination 在未排空时产出响亮非收敛 reason；drain 哨兵按退出契约响亮非零退出
+# （判别性规格 §四）。⛔ 缺省空（不启用）：既有行为逐字不变。
+export BUDGET_EXHAUSTED="${BUDGET_EXHAUSTED:-}"
 # A8d——生产 spawn 的落地命令：真实 `agent-run`（不再是占位 worker-launcher）。
 # 解析不到时由 tick-run 的 resolveAgentRunBin 响亮失败（绝不回退占位 worker）；
 # 部署方可用 AGENT_RUN_BIN 覆盖。缺省若实测存在则补到已知位置，否则留给 PATH 解析。

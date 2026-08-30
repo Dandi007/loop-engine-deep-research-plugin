@@ -98,3 +98,46 @@ export interface RunExitWithoutResultDiagnostic {
 export function isRunExitedWithoutResultError(e: unknown): e is RunExitedWithoutResultError {
   return e instanceof RunExitedWithoutResultError;
 }
+
+/**
+ * C5 —— drain 退出契约的纯输入（判别性规格 §四.1/§四.3）。
+ * 预算耗尽（round budget max_passes 已耗尽）且板面仍未排空（in_flight>0 或 proposed>0）、
+ * 报告未生成 ⇒ drain 必须响亮非收敛退出（exit_code != 0 + 点名计数的 machine-readable reason），
+ * 绝不静默 exit 0。
+ */
+export interface DrainExitContractInput {
+  /** 预算耗尽标志（最后一轮 / max_passes 触顶）。 */
+  budgetExhausted: boolean;
+  /** 板面构成（in_flight/proposed/open 计数——判别测试 3 点名三个计数）。 */
+  boardComposition: { inFlight: number; proposed: number; open: number };
+  /** 未消费的续投 trigger 数（drain.json outstanding）。 */
+  outstanding: number;
+  /** 报告是否已生成（generate 一次性标记 / docs channel 有产出）。 */
+  reportGenerated: boolean;
+}
+
+/** drain 退出契约的纯输出：exit_code + machine-readable reason（无失败时为 null）。 */
+export interface DrainExitContractResult {
+  exitCode: number;
+  reason: string | null;
+}
+
+/**
+ * C5 —— drain 退出契约（纯函数）：预算耗尽 + 未排空 + 报告未生成 ⇒ 非零退出 +
+ * 点名 outstanding/in_flight/proposed/open 计数的响亮 reason；否则 exit 0、reason null。
+ * 判别性规格 §四.1：`status=done + outstanding>0 + 无 reason + exit 0` 必须被废止。
+ * 判别测试 3：本函数即「drain 写 reason 点名三个计数且 exit_code!=0」的 TS 侧单一真相源。
+ */
+export function decideDrainExit(input: DrainExitContractInput): DrainExitContractResult {
+  const undrained = input.boardComposition.inFlight > 0 || input.boardComposition.proposed > 0;
+  if (input.budgetExhausted && undrained && !input.reportGenerated) {
+    return {
+      exitCode: 3,
+      reason:
+        `budget_exhausted_no_report outstanding=${input.outstanding} ` +
+        `in_flight=${input.boardComposition.inFlight} ` +
+        `proposed=${input.boardComposition.proposed} open=${input.boardComposition.open}`,
+    };
+  }
+  return { exitCode: 0, reason: null };
+}

@@ -195,6 +195,51 @@ if (sentinelLost) {
 //   （不声明）⇒ max_rounds/max_passes 不排除、必须响亮。
 const retryWrapped = process.env.DR_DRAIN_RETRY_WRAPPED === "1";
 const budgetHit = summaryReason === "max_rounds" || summaryReason === "max_passes";
+
+// C5 —— 从本 drain 的 lane journal（tick 的 run 输出 JSON，journal.jsonl `result` 字段）
+// best-effort 解析 termination.boardComposition，供「预算耗尽 + 未排空」reason 点名
+// in_flight/proposed/open 计数（判别性规格 §四.1 / 判别测试 3）。解析不到 ⇒ 计数缺省 0，
+// 由 outstanding 兜底；绝不因解析失败跳过响亮判定。
+function readLastTickBoardComposition() {
+  const laneRuns = records.filter(
+    (r) => r.kind === "run.start" && r.drain_id === drainId && r.lane && r.run_dir,
+  );
+  for (let i = laneRuns.length - 1; i >= 0; i -= 1) {
+    const journalFile = join(laneRuns[i].run_dir, "journal.jsonl");
+    let journalContent;
+    try {
+      journalContent = readFileSync(journalFile, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of journalContent.trim().split("\n")) {
+      if (!line) continue;
+      let rec;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof rec.result !== "string") continue;
+      let runOut;
+      try {
+        runOut = JSON.parse(rec.result);
+      } catch {
+        continue;
+      }
+      const comp = runOut && runOut.termination && runOut.termination.boardComposition;
+      if (comp && typeof comp === "object") {
+        return {
+          inFlight: Number(comp.inFlight) || 0,
+          proposed: Number(comp.proposed) || 0,
+          open: Number(comp.open) || 0,
+        };
+      }
+    }
+  }
+  return null;
+}
+
 // 可重试中间尝试（调用方声明重试包装）且撞预算 ⇒ 保持旧排除（GT-6 退避重来交给外层循环分类）；
 // 其余（含最终 drain 撞预算）⇒ 全部纳入零报告判定。
 const excludedBudgetHit = retryWrapped && budgetHit;
@@ -205,6 +250,11 @@ if (drainState !== null && drainState.status === "done" && !excludedBudgetHit) {
   if (outstanding > 0) {
     zeroReportReason = `unconsumed continuation trigger outstanding=${outstanding}`;
     if (budgetHit) zeroReportToken = "budget_exhausted_no_report";
+    // C5 —— 预算耗尽 + 未排空：reason 追加点名 in_flight/proposed/open 计数（判别测试 3）。
+    const comp = readLastTickBoardComposition();
+    if (comp) {
+      zeroReportReason += ` in_flight=${comp.inFlight} proposed=${comp.proposed} open=${comp.open}`;
+    }
   } else {
     // docs channel 空：RESEARCH_ORIGIN 已配置（报告预期）而 generate 一次性标记缺失
     // （未生成/未落盘）。标记路径与 src/tick-run.ts runChannelWrite 的 one-shot 标记逐字对齐：

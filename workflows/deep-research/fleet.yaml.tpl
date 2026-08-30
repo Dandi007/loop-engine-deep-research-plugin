@@ -1,4 +1,9 @@
-max_passes: 16
+# C5（再暴露）—— round 预算**有界但充分**（非固定 16）：由 tick 配置确定性推导，
+#   保证「终止 tick/generate 必在预算内可达」。推导见 src/max-passes.ts（deriveMaxPasses），
+#   由 bin/deep-research-loop.sh 导出 MAX_PASSES 后经 render-template.mjs 替换。
+#   固定 16 会让收敛所需轮数 > 16 的 heavy run 在终态 generate tick 前被截断
+#   （report 永不落盘、哨兵又只认 running+outstanding>0 ⇒ done+outstanding>0 静默 exit 0）。
+max_passes: ${MAX_PASSES}
 pipelines:
   - label: tick
     config_dir: ${PLUGIN_ROOT}/workflows/deep-research/tick
@@ -32,6 +37,10 @@ pipelines:
       # E0c3b §1.1 —— triage 触发阈值（--triage-threshold）：由 bin 导出 TRIAGE_THRESHOLD（缺省 3），
       # 一路注入到 tick.md，再传给 tick-entry --run。与 MAX_WRITES 同款装配链。
       triage_threshold: ${TRIAGE_THRESHOLD}
+      # C5 —— round 预算耗尽标记（末轮响亮收口）：由 bin 导出 BUDGET_EXHAUSTED（缺省空）。
+      # 为 1 时 tick.md 传 --budget-exhausted ⇒ tick 把 started-超预算在飞卡 bounded-terminalize
+      # 到 blocked、decideTermination 在未排空时产出响亮非收敛 reason（判别性规格 §四）。
+      budget_exhausted: ${BUDGET_EXHAUSTED}
     claim:
       store_dir: ${TRIGGER_STORE_DIR}
       from: open

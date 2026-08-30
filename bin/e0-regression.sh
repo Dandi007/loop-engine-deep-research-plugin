@@ -365,6 +365,10 @@ _print_board_composition() {
 
 # ── E0c2 §1.3 —— 跨 drain 循环：反复跑 deep-research-loop.sh 直到终态收敛。──
 # 每轮：跑 drain → 分类退出码（GT-6）→ 读 termination.state（§1.1）→ 判终态或退避重来。
+# C5（第三暴露）—— 判别性规格 3：本入口是「可重试中间尝试」的重试包装，显式声明
+# DR_DRAIN_RETRY_WRAPPED=1，使哨兵对中间尝试的 max_rounds 保持 GT-6 排除（退避重来交给本循环）；
+# 生产 deep-research-loop.sh 的单 drain 即最终 drain（不声明）⇒ 撞预算 + 零报告必须响亮。
+export DR_DRAIN_RETRY_WRAPPED=1
 WALL_START=$(date +%s)
 DRAIN_ATTEMPT=0
 TERMINATION_STATE="null"

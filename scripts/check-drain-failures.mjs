@@ -1,11 +1,13 @@
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const stdin = readFileSync(0, "utf8").trim();
 
 // drain 摘要（loop-engine CLI 打印的单行 JSON）——drain 正常/带错退出时必含 drain_id。
 let summary = null;
+let summaryReason = null;
 if (stdin) {
   try {
     const j = JSON.parse(stdin);
@@ -14,6 +16,7 @@ if (stdin) {
         drain_id: j.drain_id,
         runs_root: typeof j.runs_root === "string" ? j.runs_root : null,
       };
+      summaryReason = typeof j.reason === "string" ? j.reason : null;
     }
   } catch {
     // 非 JSON 摘要 —— 落到 registry 兜底判定（C3：drain 进程死亡路径无摘要）。
@@ -169,6 +172,117 @@ if (sentinelLost) {
   );
   process.stderr.write(
     `[deep-research-loop]   unharvested in_flight/open count=${laneRuns.length} run_id=${unharvestedSeq || "n/a"}\n`,
+  );
+  process.exit(3);
+}
+
+// ── C5（第三暴露）——「撞派生预算 max_passes 不收敛仍静默 exit 0 零报告」响亮化（判别性规格 1-3）──
+// 根因（spec §根因链）：round 预算（max_passes）实际收敛所需轮次超出 deriveMaxPasses 派生的
+//   max_passes ⇒ coverage 冻结、proposed/inFlight 未排空 ⇒ runGenerate 从未触发 ⇒ 零报告；
+//   drain.json.status 被 markDrainDone 置成 done（含 max_rounds），而旧哨兵把 `max_rounds` 排除在
+//   零报告判定外（旧 line 190：summaryReason !== "max_rounds"）⇒ done + outstanding≥1 +
+//   零报告被误当成功 ⇒ 静默 exit 0。这正是 C3「哨兵静默失效必响亮」的违约。
+//
+// ⛔ 判别性规格 2：零报告哨兵不得再以 `summaryReason !== "max_rounds"`（或以 max_passes 撞顶）
+//   排除撞预算终局。drain 以「status=done 且 (outstanding≥1 或 报告未生成)」结束时，无论原由是
+//   drained 还是 max_rounds/max_passes，都必须响亮（非零退出 + 点名 drain_id/outstanding/缺报告），
+//   reason 使用稳定 token：budget_exhausted_no_report（撞预算）/ zero_report（其余）。
+//
+// ⛔ 判别性规格 3（e0-regression 不推翻）：GT-6 的「max_rounds + 非零退出 ⇒ 退避重来」合法中间态
+//   只适用于**非最终、可重试的 drain 尝试**；对**最终一次 drain**（无后续重试包装），撞预算 +
+//   零报告必须响亮失败。判别依据：由**调用方显式声明重试包装**（DR_DRAIN_RETRY_WRAPPED=1，
+//   e0-regression.sh 的多 drain 循环声明）；生产 deep-research-loop.sh 的单 drain 即最终 drain
+//   （不声明）⇒ max_rounds/max_passes 不排除、必须响亮。
+const retryWrapped = process.env.DR_DRAIN_RETRY_WRAPPED === "1";
+const budgetHit = summaryReason === "max_rounds" || summaryReason === "max_passes";
+
+// C5 —— 从本 drain 的 lane journal（tick 的 run 输出 JSON，journal.jsonl `result` 字段）
+// best-effort 解析 termination.boardComposition，供「预算耗尽 + 未排空」reason 点名
+// in_flight/proposed/open 计数（判别性规格 §四.1 / 判别测试 3）。解析不到 ⇒ 计数缺省 0，
+// 由 outstanding 兜底；绝不因解析失败跳过响亮判定。
+function readLastTickBoardComposition() {
+  const laneRuns = records.filter(
+    (r) => r.kind === "run.start" && r.drain_id === drainId && r.lane && r.run_dir,
+  );
+  for (let i = laneRuns.length - 1; i >= 0; i -= 1) {
+    const journalFile = join(laneRuns[i].run_dir, "journal.jsonl");
+    let journalContent;
+    try {
+      journalContent = readFileSync(journalFile, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of journalContent.trim().split("\n")) {
+      if (!line) continue;
+      let rec;
+      try {
+        rec = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof rec.result !== "string") continue;
+      let runOut;
+      try {
+        runOut = JSON.parse(rec.result);
+      } catch {
+        continue;
+      }
+      const comp = runOut && runOut.termination && runOut.termination.boardComposition;
+      if (comp && typeof comp === "object") {
+        return {
+          inFlight: Number(comp.inFlight) || 0,
+          proposed: Number(comp.proposed) || 0,
+          open: Number(comp.open) || 0,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// 可重试中间尝试（调用方声明重试包装）且撞预算 ⇒ 保持旧排除（GT-6 退避重来交给外层循环分类）；
+// 其余（含最终 drain 撞预算）⇒ 全部纳入零报告判定。
+const excludedBudgetHit = retryWrapped && budgetHit;
+let zeroReportReason = null;
+let zeroReportToken = "zero_report";
+if (drainState !== null && drainState.status === "done" && !excludedBudgetHit) {
+  const outstanding = drainState.outstanding ?? 0;
+  if (outstanding > 0) {
+    zeroReportReason = `unconsumed continuation trigger outstanding=${outstanding}`;
+    if (budgetHit) zeroReportToken = "budget_exhausted_no_report";
+    // C5 —— 预算耗尽 + 未排空：reason 追加点名 in_flight/proposed/open 计数（判别测试 3）。
+    const comp = readLastTickBoardComposition();
+    if (comp) {
+      zeroReportReason += ` in_flight=${comp.inFlight} proposed=${comp.proposed} open=${comp.open}`;
+    }
+  } else {
+    // docs channel 空：RESEARCH_ORIGIN 已配置（报告预期）而 generate 一次性标记缺失
+    // （未生成/未落盘）。标记路径与 src/tick-run.ts runChannelWrite 的 one-shot 标记逐字对齐：
+    //   <oneShotDir>/generated-<sha256(origin:channel)[:16]>，oneShotDir 缺省
+    //   join(tmpdir(), "deep-research-generated")（可用 DR_ONE_SHOT_DIR 覆盖）。
+    const origin = process.env.RESEARCH_ORIGIN;
+    const channel = process.env.TICK_CHANNEL;
+    if (origin && channel) {
+      const oneShotDir =
+        process.env.DR_ONE_SHOT_DIR || join(tmpdir(), "deep-research-generated");
+      const markerHash = createHash("sha256")
+        .update(`${origin}:${channel}`)
+        .digest("hex")
+        .slice(0, 16);
+      const markerPath = join(oneShotDir, `generated-${markerHash}`);
+      if (!existsSync(markerPath)) {
+        zeroReportReason = `report not generated (docs channel empty): missing ${markerPath}`;
+        if (budgetHit) zeroReportToken = "budget_exhausted_no_report";
+      }
+    }
+  }
+}
+if (zeroReportReason) {
+  process.stderr.write(
+    `[deep-research-loop] ZERO REPORT: ${zeroReportToken} drain_id=${drainId} ${zeroReportReason}\n`,
+  );
+  process.stderr.write(
+    `[deep-research-loop]   drain registry: status=done outstanding=${drainState.outstanding ?? 0}\n`,
   );
   process.exit(3);
 }

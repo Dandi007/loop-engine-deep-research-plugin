@@ -120,7 +120,18 @@ export interface TriageProposedClue {
 
 /** 决策——纯函数输出，副作用执行权归 runTick。 */
 export type Decision =
-  | { kind: "reclaim"; clueId: string; to: ClueV2["status"]; retries: number }
+  | {
+      kind: "reclaim";
+      clueId: string;
+      to: ClueV2["status"];
+      retries: number;
+      /**
+       * C5 —— 可选的机器可读 rationale（bounded-terminalize 把 started-永不-exit 的在飞卡
+       * 终态化为 blocked 时，点名 run_id / 缺 result / 超预算，判别性规格 §四.1）。
+       * 缺省（旧路径）不写。
+       */
+      rationale?: string;
+    }
   | {
       kind: "dispatch";
       clueId: string;
@@ -206,10 +217,26 @@ export function isValidSources(sources: string[]): boolean {
 }
 
 /**
+ * C5 —— decideTick 的额外上下文（判别性规格 §四.1/§四.2）。
+ * `budgetExhausted`：round 预算（max_passes 推导预算）已耗尽（本轮为最后一轮）。
+ * 为 true 时，decideTick 把「started 但超预算仍未 exit」的在飞卡 bounded-terminalize
+ * （终态化到 blocked，带点名 run_id / 缺 result / 超预算的 rationale），绝不无限 in_flight；
+ * 使板面可排空、decideTermination 可评估、generate 可点燃（判别性规格 §四.2）。
+ * 缺省 false：行为逐字不变。
+ */
+export interface DecideTickOptions {
+  budgetExhausted?: boolean;
+}
+
+/**
  * 纯决策函数：决定一个 tick 要执行的动作序列。
  * 不碰 IO：无网络 / 无时钟 / 无随机 / 不 import ./bus（spec B1）。
  */
-export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
+export function decideTick(
+  state: BoardState,
+  cfg: TickConfig,
+  opts?: DecideTickOptions,
+): Decision[] {
   const decisions: Decision[] = [];
 
   // §3 回收：遍历 status === "in_flight" 的卡。
@@ -223,6 +250,19 @@ export function decideTick(state: BoardState, cfg: TickConfig): Decision[] {
       continue;
     }
     if (run.state === "started") {
+      // C5 —— bounded-terminalize：started 且超预算仍未 exit 的卡不得无限 in_flight。
+      // 预算耗尽时终态化为 blocked（响亮态，带点名 run_id/缺 result/超预算的 rationale），
+      // 否则 decideTermination 被 inFlight>0 永久卡死、generate 永不触发（判别性规格 §四.2）。
+      if (opts?.budgetExhausted === true) {
+        decisions.push({
+          kind: "reclaim",
+          clueId: card.clueId,
+          to: "blocked",
+          retries: card.retries,
+          rationale: `bounded-terminalize: run ${card.runId ?? "n/a"} started but never exited within the round budget (budget exhausted); card ${card.clueId} terminalized as blocked — no infinite in_flight (C5 termination deadlock prevention).`,
+        });
+        continue;
+      }
       // 仍在跑，无事可做。
       continue;
     }
@@ -314,6 +354,14 @@ export interface TerminationInput {
   prevCoverage: number;
   /** 上一 tick 结束时的零增长轮数。 */
   prevZeroGrowthRounds: number;
+  /**
+   * C5 —— round 预算（max_passes 推导预算）是否已耗尽（本轮为最后一轮）。
+   * 为 true 且板面仍未排空（in_flight>0 或 proposed>0）时，decideTermination 必须产出
+   * 响亮非收敛终态（`reason` 非空、点名 in_flight/proposed/open 计数；state 维持 null，
+   * 诚实表达「未收敛」），由 drain 层转成非零退出 + reason 落盘（判别性规格 §四.1）。
+   * 缺省 false：行为逐字不变。
+   */
+  budgetExhausted?: boolean;
 }
 
 /** 终止判定的纯输出。state 为 null 表示继续，未终止。 */
@@ -327,6 +375,12 @@ export interface TerminationState {
    * （spec §3 line 37），待全部排空后才正式报 capped。
    */
   capHit: boolean;
+  /**
+   * C5 —— 响亮非收敛 reason（machine-readable，点名 in_flight/proposed/open 计数）。
+   * 预算耗尽（budgetExhausted=true）且板面仍未排空、报告未生成时非空；其余为 null。
+   * drain 层据此写非零退出 + reason 落盘，绝不静默 exit 0（判别性规格 §四.1/§四.3）。
+   */
+  reason?: string | null;
   /**
    * E0c3b §1.2 —— 板面构成（proposed/open/in_flight/explored/blocked 各状态计数）。
    * 供撞上限时打印板面构成、诊断 triage 门限死锁。
@@ -375,6 +429,7 @@ export function decideTermination(
   const drained = inFlight === 0 && open === 0 && proposed === 0;
 
   let state: TerminalState | null = null;
+  let reason: string | null = null;
   if (capHit) {
     if (drained) {
       state = "capped";
@@ -388,7 +443,26 @@ export function decideTermination(
     state = blocked > 0 ? "partial" : "converged";
   }
 
-  return { state, coverage, zeroGrowthRounds, capHit, boardComposition: { proposed, open, inFlight, explored, blocked } };
+  // C5 —— 预算耗尽 + 板面未排空 + 报告未生成 ⇒ 响亮非收敛终态（判别性规格 §四.1）：
+  //   `state` 维持 null（诚实表达「未收敛」），但 `reason` 非空、machine-readable、
+  //   点名 in_flight/proposed/open 计数，drain 层据此写非零退出 + reason 落盘，绝不静默 exit 0。
+  //   ⛔ 只有 bounded-terminalize 已把板面排空（state 非空）才算收敛；这里仅兜底响亮失败。
+  if (
+    input.budgetExhausted === true &&
+    state === null &&
+    (inFlight > 0 || proposed > 0)
+  ) {
+    reason = `budget_exhausted_undrained in_flight=${inFlight} proposed=${proposed} open=${open} blocked=${blocked}`;
+  }
+
+  return {
+    state,
+    coverage,
+    zeroGrowthRounds,
+    capHit,
+    boardComposition: { proposed, open, inFlight, explored, blocked },
+    reason,
+  };
 }
 
 /**

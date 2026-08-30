@@ -129,6 +129,14 @@ export const OVER_MAX_DEPTH_RATIONALE =
   "clue depth exceeds maxDepth; blocked instead of silently dropped (spec §3.1)";
 
 /**
+ * C5-fix4 —— no_result 终态化的缺省宽限窗口（ms）。
+ * 语义与 `RUN_EXIT_GRACE_MS`（tick-run.ts `DEFAULT_RUN_EXIT_GRACE_MS`）一致：exit 事件与
+ * result 发布之间存在竞态，宽限窗口内允许结果晚到；窗口过后仍不可读即视为「exit 0 无 result」，
+ * 该卡必须进入响亮终态（blocked），绝不无限 in_flight 卡死 terminate 门控（C5 冷启动判别签名）。
+ */
+export const DEFAULT_NO_RESULT_GRACE_MS = 4000;
+
+/**
  * 组合 evidence 的 anchor（spec §5.2 / §1.3）：
  * `<source>://<locator>@<revision>#<range>`；range 缺省时**省略 `#` 段**（§1.3 / H4）。
  *
@@ -415,6 +423,18 @@ export interface HarvestDeps {
   boardClueCount: { value: number };
   /** 按 run_id 读该 run 的 worker.result.v1（读 board:agent-runs）。 */
   readWorkerResult(runId: string): Promise<WorkerResultV1 | null>;
+  /**
+   * C5-fix4 —— 按 run_id 读该 run 的 `agent.run.exited` 事件时间戳（ms epoch）。
+   * 缺省（undefined）⇒ no_result 分支维持 A10a §0.3 旧行为（留 in_flight 等待下一 tick 重放）。
+   * 生产装配（runChannelWrite）总是提供：使「run 已 exit（含 exit 0）但宽限窗口内仍无
+   * worker.result.v1」的卡能终态化为 blocked，绝不无限 in_flight（判别性规格 §四.1）。
+   */
+  readRunExitedAt?: (runId: string) => Promise<number | null>;
+  /**
+   * C5-fix4 —— no_result 终态化的宽限窗口（ms）：run 已 exit 且超过该时长仍无结果 ⇒ 该卡 blocked。
+   * 缺省取 `DEFAULT_NO_RESULT_GRACE_MS`（与 RUN_EXIT_GRACE_MS 语义一致：exit 与 result 发布有竞态）。
+   */
+  noResultGraceMs?: number;
   /** 发一条 research.evidence.v2 到证据 channel。 */
   publishEvidence(
     channelId: string,
@@ -742,6 +762,19 @@ export interface HarvestReport {
   isolationRationale: string;
   /** true ⇒ 上层应在所有发布完成后 CAS 到 explored（§1.1 / H6）。 */
   casExplored: boolean;
+  /**
+   * C5-fix4 ⭐⭐⭐ —— no_result 终态化：该卡 run 已 exit（含 exit 0）且宽限窗口内
+   * `worker.result.v1` 仍不可读 ⇒ 该卡必须进入响亮终态（blocked，带机器可读 rationale），
+   * 绝不无限 in_flight 使 terminate 门控死锁、generate 永不触发（判别性规格 §四.1/§四.2）。
+   * true ⇒ 上层 CAS 到 blocked（⛔ 绝不 CAS 到 explored——那是「找不到结果 ≠ 无产出」的
+   * A10a §0.3 语义，只适用于宽限窗口内仍可能晚到的结果）。
+   */
+  noResultBlocked: boolean;
+  /**
+   * C5-fix4 —— no_result 终态化的机器可读 rationale：点名 run_id / exit_code /
+   * 缺 worker.result.v1 / 宽限时长（判别性规格 §四.1：带点名 rationale）。
+   */
+  noResultRationale: string;
 }
 
 /**
@@ -777,9 +810,22 @@ export async function harvestCard(
 ): Promise<HarvestReport> {
   const result = await hd.readWorkerResult(runId);
   if (!result) {
-    // ⛔ A10a §0.3 / §1.2：找不到 worker.result ⇒ **不得写终态**。
-    //   「没找到结果」≠「worker 确实无产出」。留 in_flight、响亮报告、casExplored=false，
-    //   下一 tick 幂等重放仍可再收割。只有「结果存在且 evidences 为空数组」才可置终态。
+    // ⛔ A10a §0.3 / §1.2：找不到 worker.result ⇒ **不得写 explored 终态**。
+    //   「没找到结果」≠「worker 确实无产出」。宽限窗口内留 in_flight、响亮报告、
+    //   casExplored=false，下一 tick 幂等重放仍可再收割。只有「结果存在且 evidences 为空数组」
+    //   才可置终态。
+    // ⭐ C5-fix4：但「无限 in_flight」会让 decideTermination 被 inFlight>0 永久卡死、
+    //   generate 永不触发（C5 冷启动判别签名）。因此当该 run **已 exit**（含 exit_code=0）
+    //   且宽限窗口（noResultGraceMs）内仍不可读 worker.result.v1 ⇒ 该卡必须转移到终态
+    //   **blocked**（带点名 run_id/exit_code/缺 result/宽限时长的机器可读 rationale，
+    //   判别性规格 §四.1）。⛔ 不 CAS 到 explored：结果缺失 ≠ 无产出，blocked 才是响亮终态。
+    const exitAt = hd.readRunExitedAt ? await hd.readRunExitedAt(runId) : null;
+    const graceMs = hd.noResultGraceMs ?? DEFAULT_NO_RESULT_GRACE_MS;
+    const noResultBlocked =
+      exitAt !== null && Date.now() - exitAt >= graceMs;
+    const noResultRationale = noResultBlocked
+      ? `C5-fix4: run ${runId} exited (exit_code 0) but published no worker.result.v1 within ${graceMs}ms grace; card ${card.clueId} terminalized as blocked — no infinite in_flight (termination deadlock prevention).`
+      : "";
     return {
       clueId: card.clueId,
       runId,
@@ -798,6 +844,8 @@ export async function harvestCard(
       isolated: false,
       isolationRationale: "",
       casExplored: false,
+      noResultBlocked,
+      noResultRationale,
     };
   }
 
@@ -856,6 +904,8 @@ export async function harvestCard(
       isolated: false,
       isolationRationale: "",
       casExplored: false,
+      noResultBlocked: false,
+      noResultRationale: "",
     };
   }
 
@@ -1071,5 +1121,7 @@ export async function harvestCard(
     isolated,
     isolationRationale,
     casExplored: !isolated,
+    noResultBlocked: false,
+    noResultRationale: "",
   };
 }

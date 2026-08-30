@@ -6,12 +6,14 @@
  * （存在未消费续投 trigger），进程已退出 —— 旧哨兵只认 running+outstanding>0 / 无 run.end /
  * 轮次未闭合，于是「done + outstanding=1 + run.end 有 + 轮次全闭合」被误当成功 ⇒ 静默 exit 0。
  *
- * 判别性规格（不可放宽）：
+ * C5（第三暴露）判别性规格（不可放宽）：
  *   - drain 后 status=done 且 outstanding>0（存在未消费续投 trigger）⇒ 响亮终态（非零退出 +
  *     机器可读命名 reason：zero_report + drain_id + outstanding）。
  *   - drain 干净收尾但 docs channel 无报告（generate 一次性标记缺失，未生成/未落盘）⇒ 同样响亮。
- *   - 排除 reason=max_rounds：e0-regression 的多 drain 收敛把 max_rounds+exit 1 当作合法中间态
- *     （GT-6），不得推翻该设计。
+ *   - ⛔ 零报告哨兵不得再以 reason=max_rounds / max_passes 排除撞预算终局：最终 drain（未声明
+ *     DR_DRAIN_RETRY_WRAPPED）撞预算 + 零报告 ⇒ 响亮 budget_exhausted_no_report（spec 判据 2/3）。
+ *   - 可重试中间尝试（调用方显式声明 DR_DRAIN_RETRY_WRAPPED=1）：max_rounds 排除保持
+ *     （e0-regression 多 drain 收敛 GT-6 不推翻）。
  *   - 反向：outstanding=0 且报告标记存在 ⇒ 维持 exit 0（防误报）。
  *
  * 修复前（max_passes=16 + 哨兵不捕获）本文件用例必须红（静默 exit 0）；修复后必须绿。
@@ -272,13 +274,38 @@ describe("C5-ZR-2: drain 干净收尾但 docs channel 无报告（generate 标�
   });
 });
 
-describe("C5-ZR-3: reason=max_rounds 排除（e0-regression 多 drain 收敛 GT-6 不推翻）", () => {
-  it("done + outstanding=1 但 summary reason=max_rounds ⇒ 不判 zero_report", () => {
-    const { env, summary, drainId } = setUpDoneOutstanding("maxr", 1);
+describe("C5-ZR-3（第三暴露）: 撞预算终局（max_rounds/max_passes）判别（判别性规格 2/3）", () => {
+  it("最终 drain（未声明 DR_DRAIN_RETRY_WRAPPED）：done + outstanding=1 + reason=max_rounds ⇒ 响亮 budget_exhausted_no_report + drain_id + outstanding", () => {
+    const { env, summary, drainId } = setUpDoneOutstanding("maxr-final", 1);
     const res = runChecker(env, { ...summary, reason: "max_rounds" });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("ZERO REPORT");
+    expect(res.err).toContain("budget_exhausted_no_report");
+    expect(res.err).toContain(drainId);
+    expect(res.err).toContain("outstanding=1");
+
+    rmSync(env.LOOP_ENGINE_RUNTIME_ROOT, { recursive: true, force: true });
+  });
+
+  it("判别性（规格 2 反向）：最终 drain（未声明重试包装）max_passes 同样响亮", () => {
+    const { env, summary, drainId } = setUpDoneOutstanding("maxp-final", 1);
+    const res = runChecker(env, { ...summary, reason: "max_passes" });
+
+    expect(res.code).not.toBe(0);
+    expect(res.err).toContain("budget_exhausted_no_report");
+    expect(res.err).toContain(drainId);
+
+    rmSync(env.LOOP_ENGINE_RUNTIME_ROOT, { recursive: true, force: true });
+  });
+
+  it("可重试中间尝试（声明 DR_DRAIN_RETRY_WRAPPED=1）：done + outstanding=1 + reason=max_rounds ⇒ 不判 zero_report（GT-6 退避重来不推翻）", () => {
+    const { env, summary } = setUpDoneOutstanding("maxr-wrapped", 1);
+    const res = runChecker({ ...env, DR_DRAIN_RETRY_WRAPPED: "1" }, { ...summary, reason: "max_rounds" });
 
     expect(res.err).not.toContain("zero_report");
     expect(res.err).not.toContain("ZERO REPORT");
+    expect(res.err).not.toContain("budget_exhausted_no_report");
     expect(res.err).not.toContain("sentinel_lost");
 
     rmSync(env.LOOP_ENGINE_RUNTIME_ROOT, { recursive: true, force: true });
@@ -461,6 +488,87 @@ describe("C5-ZR-4（判别测试 1）：预算耗尽后「干净收尾但零报�
 
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it(
+    "判别性（第三暴露）: drain CLI reason=max_rounds + status=done + outstanding=1 + 无 generate 标记 ⇒ 最终 drain 响亮 budget_exhausted_no_report + drain_id + outstanding（修复前 line 190 排除 max_rounds ⇒ exit 0 必红）",
+    { timeout: 60000 },
+    () => {
+      const drainId = "c5-zr-e2e-maxr";
+      const dir = mkdtempSync(join(tmpdir(), "c5-zr-e2e-maxr-"));
+      mkdirSync(join(dir, "dist", "lib"), { recursive: true });
+      const cli = join(dir, "dist", "cli.sh");
+      const storeCli = join(dir, "dist", "lib", "store-cli.sh");
+      const engineRoot = join(dir, "engine-root");
+      mkdirSync(engineRoot, { recursive: true });
+      const runsRoot = join(engineRoot, "runs", "run-e2e-maxr");
+      mkdirSync(runsRoot, { recursive: true });
+      const runDir = join(runsRoot, "tick-run-e2e-maxr");
+      mkdirSync(runDir, { recursive: true });
+
+      const summaryFile = join(dir, "summary.json");
+      writeFileSync(
+        summaryFile,
+        JSON.stringify({
+          reason: "max_rounds",
+          rounds: 68,
+          ticksByLabel: { tick: 68 },
+          runs_root: runsRoot,
+          drain_id: drainId,
+        }),
+      );
+      writeFileSync(cli, `#!/usr/bin/env bash\ncat '${summaryFile}'\nexit 1\n`);
+      chmodSync(cli, 0o755);
+      writeFileSync(storeCli, "#!/usr/bin/env bash\n# no-op\n");
+      chmodSync(storeCli, 0o755);
+
+      // 撞派生预算的 registry 形态：drain 干净收尾（done）、outstanding=1（未消费续投 trigger）、
+      // run.end 有、轮次闭合、无 generate 标记 —— 修复前被 line 190 的 max_rounds 排除 ⇒ 静默 exit 0。
+      writeDrainJson(runsRoot, drainId, { status: "done", outstanding: 1, ended: 1 });
+      const indexPath = join(engineRoot, "index.jsonl");
+      writeIndexEntry(indexPath, {
+        kind: "run.start",
+        run_id: drainId,
+        label: "deep-research",
+        fleet: "fleet.yaml",
+        run_dir: runsRoot,
+      });
+      writeIndexEntry(indexPath, {
+        kind: "run.end",
+        run_id: drainId,
+        label: "deep-research",
+        fleet: "fleet.yaml",
+      });
+      appendIndexEntry(indexPath, {
+        kind: "run.start",
+        run_id: "tick-e2e-maxr",
+        label: "tick",
+        fleet: "workflows/deep-research/tick",
+        run_dir: runDir,
+        drain_id: drainId,
+        lane: "tick",
+        tick: 1,
+      });
+      writeJournal(join(runDir, "journal.jsonl"), "OK: all fine");
+      writeFileSync(join(runsRoot, "loop-events.jsonl"), "");
+
+      const res = runLoopScript({
+        LOOP_ENGINE_CLI: cli,
+        LOOP_STORE_CLI: storeCli,
+        LOOP_ENGINE_RUNNER: "bash",
+        LOOP_ENGINE_RUNTIME_ROOT: engineRoot,
+        TICK_CHANNEL: "research:c5-zr-e2e-maxr",
+        RESEARCH_QUESTION: "test research question",
+      });
+
+      expect(res.code).not.toBe(0);
+      expect(res.err).toContain("ZERO REPORT");
+      expect(res.err).toContain("budget_exhausted_no_report");
+      expect(res.err).toContain(drainId);
+      expect(res.err).toContain("outstanding=1");
+
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 });
 
 // ── 判别性源码断言（防止哨兵分支被改回旧行为）────────────────────────

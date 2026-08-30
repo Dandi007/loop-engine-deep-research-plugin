@@ -357,6 +357,27 @@ export async function readTriageResult(
 }
 
 /**
+ * C5-fix4 —— 从已读的消息数组里，按 run_id 找该 run 的 `agent.run.exited` 事件时间戳（ms）。
+ * 取最后一条 exited 事件的 `created_at`；找不到（该 run 未 exited / 时间戳不可解析）⇒ null。
+ * 纯函数：供 harvest no_result 终态化的宽限判定复用同一份已读消息列表。
+ */
+export function findRunExitedAt(
+  runId: string,
+  messages: InspectMessage[],
+): number | null {
+  let found: number | null = null;
+  for (const msg of messages) {
+    const parsed = parseRunEvent(msg);
+    if (!parsed) continue;
+    if (parsed.runId !== runId) continue;
+    if (parsed.event.state !== "exited") continue;
+    const t = Date.parse(msg.created_at);
+    if (!Number.isNaN(t)) found = t;
+  }
+  return found;
+}
+
+/**
  * E0c10 D4（GT-D）—— 从已读的消息数组里，按 run_id 找该 run 是否已有 `agent.run.exited` 事件。
  * 用于 triage / generate 轮询路径判别「run 已 exited 但无 result」（GT-D 真机：
  * `run … exited without producing a dr-doc.result.v1 after 3159ms`）。

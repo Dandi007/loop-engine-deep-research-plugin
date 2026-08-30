@@ -34,6 +34,7 @@ import {
 import {
   assembleBoard,
   buildRunsFromMessages,
+  findRunExitedAt,
   findTriageResult,
   findWorkerResult,
   hasRunExited,
@@ -1013,6 +1014,26 @@ export async function runWrite(
           budget,
         );
         harvestReports.push(report);
+        if (report.noResultBlocked) {
+          // C5-fix4 ⭐⭐⭐——该卡 run 已 exit（exit 0）且宽限窗口内仍无 worker.result.v1：
+          //   no_result 必须终态化，绝不无限 in_flight（否则 decideTermination 被 inFlight>0
+          //   永久卡死、generate 永不触发 —— C5 冷启动判别签名）。CAS in_flight → blocked，
+          //   rationale 点名 run_id / exit_code / 缺 result / 宽限时长（机器可读，判别性规格 §四.1）。
+          //   ⛔ 不 CAS 到 explored（找不到结果 ≠ 无产出，A10a §0.3）：blocked 才是响亮终态。
+          const result = await perform({
+            clueId: decision.clueId,
+            to: "blocked",
+            from: "in_flight",
+            rationale: report.noResultRationale,
+          });
+          casResults.push({
+            clueId: decision.clueId,
+            to: "blocked",
+            success: result.success,
+            error: result.error,
+          });
+          break;
+        }
         if (report.isolated) {
           // C5 ⭐⭐⭐——本卡含退化 evidence（缺 source/locator/revision 的条目已被单条隔离、
           //   不发布）：**该卡**隔离为 blocked（判据 3），绝不 CAS 到 explored。
@@ -2121,6 +2142,11 @@ export async function runChannelWrite(
       //    累加 `.value`，从而多张卡在同一 tick 内累计后板面也不超 maxClues（§1.6）。
       boardClueCount: { value: assembled.clueEntities },
       readWorkerResult: async (runId) => findWorkerResult(runId, runsMessages),
+      // C5-fix4 —— no_result 终态化的 exit 时间戳 + 宽限窗口（生产装配恒提供）：
+      //   run 已 exit（含 exit 0）且宽限内仍无 worker.result.v1 ⇒ harvestCard 报
+      //   noResultBlocked，runWrite 把该卡 CAS 到 blocked（绝不无限 in_flight）。
+      readRunExitedAt: async (runId) => findRunExitedAt(runId, runsMessages),
+      noResultGraceMs: resolveRunExitGraceMs(),
       publishEvidence: (channelId, evidence, key) =>
         publishEvidence(channelId, evidence, key).then(() => undefined),
       publishClue: (channelId, clue, key) =>

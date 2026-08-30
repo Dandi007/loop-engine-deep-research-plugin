@@ -1,11 +1,13 @@
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const stdin = readFileSync(0, "utf8").trim();
 
 // drain 摘要（loop-engine CLI 打印的单行 JSON）——drain 正常/带错退出时必含 drain_id。
 let summary = null;
+let summaryReason = null;
 if (stdin) {
   try {
     const j = JSON.parse(stdin);
@@ -14,6 +16,7 @@ if (stdin) {
         drain_id: j.drain_id,
         runs_root: typeof j.runs_root === "string" ? j.runs_root : null,
       };
+      summaryReason = typeof j.reason === "string" ? j.reason : null;
     }
   } catch {
     // 非 JSON 摘要 —— 落到 registry 兜底判定（C3：drain 进程死亡路径无摘要）。
@@ -169,6 +172,52 @@ if (sentinelLost) {
   );
   process.stderr.write(
     `[deep-research-loop]   unharvested in_flight/open count=${laneRuns.length} run_id=${unharvestedSeq || "n/a"}\n`,
+  );
+  process.exit(3);
+}
+
+// ── C5（再暴露）——「干净 exit 0 零报告」新失败签名（判别性规格 1/3）─────────────────
+// 根因（spec §根因链 3/4）：round 预算（max_passes）在终态 generate tick 前被截断 ⇒
+//   report 永不落盘；drain.json.status 被 markDrainDone 置成 done（含 max_rounds），
+//   而旧哨兵只把 `running + outstanding>0`、drain 无 run.end、轮次未闭合判为 sentinel_lost，
+//   于是「done + outstanding=1 + run.end 有 + 轮次全闭合」被误当成功 ⇒ 静默 exit 0。
+//
+// ⛔ 排除 reason=max_rounds：e0-regression 的多 drain 收敛把 `max_rounds + exit 1` 当作
+//   「还没收敛、退避重来」的合法中间态（GT-6），不是本签名；本签名特指**干净收尾
+//   （reason=drained / exit 0）却 outstanding>0（存在未消费续投 trigger）或 docs channel 空**。
+//   若让 max_rounds 也在这里响亮，会推翻 e0-regression 的多 drain 收敛设计。
+let zeroReportReason = null;
+if (drainState !== null && drainState.status === "done" && summaryReason !== "max_rounds") {
+  const outstanding = drainState.outstanding ?? 0;
+  if (outstanding > 0) {
+    zeroReportReason = `unconsumed continuation trigger outstanding=${outstanding}`;
+  } else {
+    // docs channel 空：RESEARCH_ORIGIN 已配置（报告预期）而 generate 一次性标记缺失
+    // （未生成/未落盘）。标记路径与 src/tick-run.ts runChannelWrite 的 one-shot 标记逐字对齐：
+    //   <oneShotDir>/generated-<sha256(origin:channel)[:16]>，oneShotDir 缺省
+    //   join(tmpdir(), "deep-research-generated")（可用 DR_ONE_SHOT_DIR 覆盖）。
+    const origin = process.env.RESEARCH_ORIGIN;
+    const channel = process.env.TICK_CHANNEL;
+    if (origin && channel) {
+      const oneShotDir =
+        process.env.DR_ONE_SHOT_DIR || join(tmpdir(), "deep-research-generated");
+      const markerHash = createHash("sha256")
+        .update(`${origin}:${channel}`)
+        .digest("hex")
+        .slice(0, 16);
+      const markerPath = join(oneShotDir, `generated-${markerHash}`);
+      if (!existsSync(markerPath)) {
+        zeroReportReason = `report not generated (docs channel empty): missing ${markerPath}`;
+      }
+    }
+  }
+}
+if (zeroReportReason) {
+  process.stderr.write(
+    `[deep-research-loop] ZERO REPORT: zero_report drain_id=${drainId} ${zeroReportReason}\n`,
+  );
+  process.stderr.write(
+    `[deep-research-loop]   drain registry: status=done outstanding=${drainState.outstanding ?? 0}\n`,
   );
   process.exit(3);
 }
